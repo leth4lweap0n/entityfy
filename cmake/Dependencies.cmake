@@ -1,0 +1,81 @@
+# Third party dependencies for the entityfy monorepo.
+#
+# Everything is fetched once at the top level so that all modules share the
+# same SQLite build (core, migrations and the benchmark all link `sl3`).
+# This removes the duplicated vendored SQLite copy that used to live inside
+# the migration module.
+
+include(FetchContent)
+
+# --- SQLite (via sl3, embeds sqlite3) ---------------------------------------
+if(ENTITYFY_ENABLE_SQLITE)
+    FetchContent_Declare(
+        sl3
+        GIT_REPOSITORY https://github.com/a4z/libsl3.git
+        GIT_TAG v1.2.53003
+        GIT_SHALLOW TRUE
+        OVERRIDE_FIND_PACKAGE
+    )
+    set(sl3_USE_INTERNAL_SQLITE3 ON CACHE BOOL "Use bundled SQLite" FORCE)
+    set(sl3_USE_COMMON_COMPILER_WARNINGS OFF CACHE BOOL "Use common compiler warning preset target" FORCE)
+    FetchContent_MakeAvailable(sl3)
+
+    # Shared access point for the embedded SQLite: headers and symbols.
+    add_library(entityfy_sqlite INTERFACE)
+    target_link_libraries(entityfy_sqlite INTERFACE sl3)
+    add_library(entityfy::sqlite ALIAS entityfy_sqlite)
+endif()
+
+# --- PostgreSQL (header only, used by the core backend) --------------------
+if(ENTITYFY_ENABLE_POSTGRESQL)
+    find_package(PostgreSQL QUIET)
+
+    if(PostgreSQL_FOUND)
+        FetchContent_Declare(
+            taocpp-taopq
+            GIT_REPOSITORY https://github.com/taocpp/taopq.git
+            GIT_TAG main
+            GIT_SHALLOW TRUE
+            EXCLUDE_FROM_ALL
+            SYSTEM
+        )
+        FetchContent_MakeAvailable(taocpp-taopq)
+    else()
+        message(STATUS
+            "PostgreSQL client library not found: the PostgreSQL backend stays disabled. "
+            "Set PostgreSQL_ROOT, or PostgreSQL_INCLUDE_DIR and PostgreSQL_LIBRARY, to enable it.")
+        set(ENTITYFY_ENABLE_POSTGRESQL OFF CACHE BOOL "Build the PostgreSQL backend" FORCE)
+    endif()
+endif()
+
+# --- JSON (migration snapshots and scaffold) -------------------------------
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
+# --- Test framework --------------------------------------------------------
+if(ENTITYFY_BUILD_TESTS)
+    FetchContent_Declare(
+        Catch2
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG v3.14.0
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(Catch2)
+endif()
+
+# --- Logging for the core examples ----------------------------------------
+if(ENTITYFY_BUILD_EXAMPLES)
+    FetchContent_Declare(
+        spdlog
+        GIT_REPOSITORY https://github.com/gabime/spdlog.git
+        GIT_TAG v1.x
+        GIT_SHALLOW TRUE
+        EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(spdlog)
+endif()

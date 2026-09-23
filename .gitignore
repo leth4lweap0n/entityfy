@@ -1,0 +1,26 @@
+# Build trees
+build/
+build-*/
+out/
+cmake-build-*/
+_deps/
+
+# Dependency workspaces fetched by CMake
+deps/
+external/
+
+# Test and scratch artifacts
+*.db
+*.sqlite
+*.log
+tmp/
+
+# Editor / IDE state
+.idea/
+.vs/
+.vscode/
+*.swp
+
+# OS noise
+Thumbs.db
+.DS_Store

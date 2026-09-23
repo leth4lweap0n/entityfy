@@ -1,0 +1,78 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 30,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_STANDARD": "26",
+        "CMAKE_CXX_SCAN_FOR_MODULES": "OFF",
+        "ENTITYFY_ENABLE_SQLITE": "ON",
+        "ENTITYFY_ENABLE_POSTGRESQL": "ON",
+        "ENTITYFY_BUILD_TESTS": "ON",
+        "ENTITYFY_BUILD_EXAMPLES": "ON",
+        "ENTITYFY_BUILD_DEMO": "ON"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Debug build",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release build",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "release-no-pg",
+      "displayName": "Release build without PostgreSQL",
+      "inherits": "release",
+      "cacheVariables": {
+        "ENTITYFY_ENABLE_POSTGRESQL": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "release-no-pg",
+      "configurePreset": "release-no-pg"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
