@@ -139,6 +139,29 @@ const auto found = db.find_one<user>(entityfy::where(&user::email).eq("ada@examp
 The context is a consumer of this layer, not a replacement: `db_set` builds its SQL and runs it
 through `client::execute` / `client::query`.
 
+## Examples
+
+Every example is a complete, runnable program (built by default, output under
+`build/release/bin`). They are the shortest way to see a feature end to end:
+
+| Program | Shows |
+|---|---|
+| `entityfy_example_playground` | the core surface: annotated model, `migrate`, `insert` through `client` and `table<T>`, `find_many` with a typed filter |
+| `entityfy_example_production_blog` | a realistic model set: enums, optional and JSON fields, dates, foreign keys, `insert_many`, a transaction, an embedded migration |
+| `entityfy_example_migrations_sqlite` | a legacy table: drift report (`validate_schema`), additive vs destructive sync, `migrate_force`, applying a migration |
+| `entityfy_console` | CLI shell: `entityfy_console bench [n]`, `entityfy_console ddl`, `entityfy_console repl <uri>` |
+
+```bash
+cmake --preset release && cmake --build --preset release
+./build/release/bin/entityfy_example_playground
+./build/release/bin/entityfy_example_production_blog
+./build/release/bin/entityfy_example_migrations_sqlite
+```
+
+Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/examples) and
+[`modules/entityfy-demo/`](modules/entityfy-demo); disable them with
+`-DENTITYFY_BUILD_EXAMPLES=OFF -DENTITYFY_BUILD_DEMO=OFF`.
+
 ## Modules
 
 | Module | Responsibility | Documentation |
