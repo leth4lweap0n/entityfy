@@ -28,8 +28,18 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 # produced executables free of those three DLLs so they run on machines that
 # do not have MinGW installed. libpq stays a dynamic import, third-party SDK
 # DLLs are not part of this block.
+#
+# Debug is excluded on purpose: GCC 16.2 + MinGW fails to link Debug binaries
+# against the static libstdc++ (duplicate std::runtime_error definition from
+# the inline header copy and cow-stdexcept.o, only pulled in when the code is
+# not optimized). Release-like configurations keep the fully static runtime;
+# Debug uses the MinGW DLLs, which is what a development build wants anyway.
 if(MINGW)
-    add_link_options(-static-libgcc -static-libstdc++ -static)
+    add_link_options(
+        "$<$<NOT:$<CONFIG:Debug>>:-static-libgcc>"
+        "$<$<NOT:$<CONFIG:Debug>>:-static-libstdc++>"
+        "$<$<NOT:$<CONFIG:Debug>>:-static>"
+    )
 endif()
 
 # ---------------------------------------------------------------------------

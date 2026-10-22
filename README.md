@@ -297,12 +297,20 @@ module.
 
 | Toolchain | Status |
 |---|---|
-| **GCC 16.2** (winlibs MinGW-w64, Windows x64) | the verified toolchain: Debug and Release build, all 39 CTest entries, every benchmark number in this README and `docs/benchmarks.md` |
+| **GCC 16.2** (winlibs MinGW-w64, Windows x64) | the verified toolchain: Debug and Release build, all 39 CTest entries in both, every benchmark number in this README and `docs/benchmarks.md` |
 | Clang 21+ | implements P2996 behind `-freflection`, but this project has **not** been built or tested with it |
 | MSVC | no C++26 reflection yet, so it cannot build the project |
 
 Requirements: CMake 3.30+ (`CMakePresets.json` targets 3.30; 4.4 was used here). The PostgreSQL
-backend requires `libpq`; `--preset release-no-pg` builds without it.
+backend requires `libpq`; pass its location with
+`-DPostgreSQL_INCLUDE_DIR=<pgsql>/include -DPostgreSQL_LIBRARY=<pgsql>/lib/libpq.dll.a` (CMake
+finds it automatically when it is on `CMAKE_PREFIX_PATH`), or use `--preset release-no-pg`.
+
+On MinGW the runtime (`libstdc++`, `libgcc`, `libwinpthread`) is linked statically for
+Release-like configurations, so the shipped executables need no MinGW DLLs. **Debug is excluded**:
+GCC 16.2 fails to link Debug binaries against the static libstdc++ (a duplicate
+`std::runtime_error` definition that is only pulled in without optimization), so Debug binaries use
+the MinGW DLLs and need `<mingw>/bin` on `PATH` to run.
 
 There is no CI configuration yet, so "verified" above means the toolchain the maintainers build
 and test with locally.
