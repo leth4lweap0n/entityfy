@@ -92,8 +92,15 @@ relationships all come from the annotations through reflection.
 
 ### Reading without tracking
 
-`query().select(...)` returns plain tuples and never enters the identity map, so reports pay no
-tracking cost - the equivalent of EF Core's `Select(x => new { ... })`:
+Two paths avoid the tracker. `as_no_tracking()` returns full entities by value (EF Core's
+`AsNoTracking()`), while `query().select(...)` returns tuples (EF Core's `Select(x => new
+{ ... })`):
+
+```cpp
+const auto reports = ctx.users.as_no_tracking()
+                        .where(entityfy::where(&user::name).eq("Ada Lovelace"))
+                        .to_list();            // std::vector<user>, nothing attached
+```
 
 ```cpp
 for(const auto& [email, name]: ctx.users.query()
@@ -104,15 +111,18 @@ for(const auto& [email, name]: ctx.users.query()
 }
 ```
 
+Both are read-only: changing a value returned from either path compiles but never reaches the
+database (measured tracking overhead: 1,39x per loaded row, see
+[docs/benchmarks.md](docs/benchmarks.md)).
+
 ### When not to open a context
 
 `entityfy::client` is the layer the context itself is built on: statements, the query DSL and the
 DDL, with no unit of work around them. Reach for it when nothing has to be tracked:
 
 - bulk work and `insert_many` (one statement per batch, no per-row snapshot),
-- full-entity reads that will not be updated - no `original` copy and no identity map entry per
-  row (measured: the context spends 457-480 ns per loaded row, see
-  [docs/benchmarks.md](docs/benchmarks.md)),
+- batch jobs that never touch the context at all (inside a context, `as_no_tracking()` already
+  skips the per-row snapshot - see above),
 - one-shot tools and CLIs that should not construct a context at all.
 
 ```cpp
@@ -252,7 +262,7 @@ ctest --preset release
 ```
 
 39 CTest entries: 37 core Catch2 test executable entries (139 assertions) and the migrate/context
-test binaries — which contain 9 and 16 scenarios respectively.
+test binaries — which contain 9 and 17 scenarios respectively.
 PostgreSQL tests run when `ENTITYFY_PG_URI` is provided; with `ENTITYFY_REQUIRE_PG=1` a skipped
 test counts as a failure. Tests write to a temporary workspace and do not pollute the source tree.
 

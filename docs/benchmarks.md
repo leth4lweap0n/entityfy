@@ -144,14 +144,17 @@ attach instead of hitting the identity map.
 | `add` + `save_changes` (20.000 rows, one transaction) | 606.000 rows/s | typing + tracking + generated key write-back |
 | `find` (identity map hit) | 14 ns | hash lookup, no SQL |
 | `find` (database hit, cold) | 32 µs | SELECT + materialization + attach |
-| `to_list` (5.000 rows into a fresh context) | 457 ns/row | real load; the bench prints the measured ratio (70x cheaper per row than a cold `find`, 63-71x across runs) |
-| `save_changes` with 1 dirty row | grows with the tracked set | 244 µs @2k, 973 µs @8k, 2,62 ms @20k |
+| `to_list` (5.000 rows into a fresh context) | 460 ns/row | real load + attach; the bench prints the measured ratio (71x cheaper per row than a cold `find`, 63-71x across runs) |
+| `to_list` (same rows, `as_no_tracking()`) | 332 ns/row | materialize only: no snapshot, no identity map entry - tracking costs **1,39x** per loaded row |
+| `save_changes` with 1 dirty row | grows with the tracked set | 244 µs @2k, 973 µs @8k, 2,62-2,89 ms @20k |
+| `save_changes` **per tracked entity** | 141 ns | the snapshot scan, divided by the tracked set (20k) |
 
-Every number is a median over `repetitions`; the cold lookup and the bulk load open a **fresh
-context per repetition**, so the ratio compares two measured medians rather than single runs.
+Every number is a median over `repetitions`; the cold lookup and both bulk loads open a **fresh
+context per repetition**, so the ratios compare measured medians rather than single runs.
 Repeating the whole run moves the absolute values with machine load: three consecutive
-`20000 5` runs gave 576.000-606.000 rows/s, 457-521 ns/row for the bulk load and 2,62-2,89 ms for
-the one-row save. The printed ratio stayed between 63x and 71x.
+`20000 5` runs gave 576.000-606.000 rows/s, 457-521 ns/row for the tracked bulk load, 330-332 ns/row
+without tracking and 2,62-2,89 ms for the one-row save. The printed ratios stayed between 63x and
+71x (cold find / tracked load) and 1,38-1,39x (tracked / no-tracking).
 
 A one-row update is O(tracked entities) for two independent reasons, and only one of them
 remains:
@@ -215,8 +218,9 @@ ENTITYFY_PG_URI=postgresql://postgres:postgres@127.0.0.1:5432/entityfy_bench \
   ./build/release/bin/entityfy_bench 5000 3
 ```
 
-The benchmark creates its tables in the given database, so point `ENTITYFY_PG_URI` at a dedicated
-database (`entityfy_bench` above) - never at the database the migration tests assert on, otherwise
-their "schema matches snapshot" check sees the leftover `bench_users*` tables.
+The benchmark creates its tables in the given database and drops them again when the PostgreSQL
+section finishes. Still point `ENTITYFY_PG_URI` at a dedicated database (`entityfy_bench` above):
+a run that is interrupted mid-way can leave `bench_users*` behind, and the migration test would
+then report a schema that no longer matches its snapshot.
 
 Environment: Windows 10 x64, GCC 16.2, Release, SQLite 3.53.3, PostgreSQL 18.6.

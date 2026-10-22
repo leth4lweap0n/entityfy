@@ -99,10 +99,25 @@ for(const auto& model: ctx.model())
   changed columns (partial UPDATE).
 - `to_list()`, `find()`, `first()` and `include()` return pointers into the tracker: those rows
   are materialized *and* attached, so they pay for the `original` copy and the identity map entry.
-- `query().select(&T::a, &T::b)` is the untracked read path: it returns
-  `std::vector<std::tuple<...>>` of values and never touches the tracker (the equivalent of EF
-  Core's `Select(x => new { ... })`). It also never registers an entity, so values read this way
-  cannot be modified and saved.
+- `query().select(&T::a, &T::b)` returns `std::vector<std::tuple<...>>` of values and never
+  touches the tracker (the equivalent of EF Core's `Select(x => new { ... })`).
+- `as_no_tracking()` is the full-entity counterpart (EF Core's `AsNoTracking()`):
+
+  ```cpp
+  const auto users = ctx.users.as_no_tracking()
+                         .where(entityfy::where(&user::name).eq("Ada"))
+                         .order_by(&user::name)
+                         .to_list();   // std::vector<user>, nothing attached
+  ```
+
+  Rows are materialized into the vector and never registered: no `original` snapshot and no
+  identity map entry (measured: 332 ns/row against 460 ns/row tracked, see
+  [benchmarks.md](benchmarks.md)). `first()` and `count()` are available too.
+
+  **Caveat - this is a runtime property, not a type-level one.** `user` is a plain struct, so
+  `rows[0].name = "x"` compiles; the write simply never reaches the database, and
+  `save_changes()` has nothing to save for it. That matches EF Core's `AsNoTracking` footgun. A
+  compile-time guarantee would need a const-only view type (not implemented; see the roadmap).
 - state is read with `users.state(entity)`: `unchanged`, `added`, `modified`, `removed`,
   `detached`.
 - `users.refresh(entity)` reloads the entity from the database.

@@ -937,6 +937,59 @@ status run_column_alias_version_checks()
     return status::passed;
 }
 
+status run_no_tracking_checks()
+{
+    entityfy::db_context ctx{"sqlite://:memory:"};
+    ctx.migrate<rc_user>();
+
+    auto users = ctx.set<rc_user>();
+    for(int index = 1; index <= 3; ++index)
+    {
+        const auto suffix = std::to_string(index);
+        users.add(rc_user{.email = "user" + suffix + "@test.com", .name = "User " + suffix});
+    }
+    ctx.save_changes();
+
+    const auto tracked_before = users.size();
+    require(tracked_before == 3, "tracked set holds the inserted rows");
+
+    const auto filtered = users.as_no_tracking().where(entityfy::where(&rc_user::name).eq("User 2")).to_list();
+    require(filtered.size() == 1 && filtered.front().email == "user2@test.com", "no-tracking filter reads the row");
+    require(users.size() == tracked_before, "no-tracking filter did not grow the tracker");
+
+    const auto every = users.as_no_tracking().order_by(&rc_user::name).to_list();
+    require(every.size() == 3, "no-tracking to_list returns every row");
+    require(every.front().name == "User 1" && every.back().name == "User 3", "no-tracking ordering");
+    require(users.size() == tracked_before, "no-tracking to_list did not grow the tracker");
+
+    const auto last = users.as_no_tracking()
+                          .order_by(&rc_user::name, entityfy::sort_direction::descending)
+                          .first();
+    require(last.has_value() && last->name == "User 3", "no-tracking first honours ordering");
+
+    require(users.as_no_tracking().count() == 3, "no-tracking count");
+
+    // Documented caveat: the values belong to the caller, so changing them
+    // compiles but never reaches the database.
+    auto copy = users.as_no_tracking().where(entityfy::where(&rc_user::name).eq("User 1")).first();
+    require(copy.has_value(), "no-tracking first returns a value");
+
+    copy->name = "changed outside the tracker";
+    const auto saved = ctx.save_changes();
+    require(saved.updated == 0, "mutating a no-tracking value is not saved");
+    require(copy->name == "changed outside the tracker", "the caller owns its copy");
+
+    const auto rows = ctx.database().table<rc_user>().find_many();
+    bool untouched = true;
+    for(const auto& row: rows)
+    {
+        untouched = untouched && row.name.rfind("User ", 0) == 0;
+    }
+    require(untouched, "no-tracking mutation reached the database");
+
+    return status::passed;
+}
+
 status run_batch_checks()
 {
     entityfy::db_context ctx{"sqlite://:memory:"};
@@ -1347,6 +1400,7 @@ int main()
         {"retry", run_retry_checks},
         {"column_alias", run_column_alias_checks},
         {"column_alias_version", run_column_alias_version_checks},
+        {"no_tracking", run_no_tracking_checks},
         {"batch", run_batch_checks},
         {"dependency", run_dependency_checks},
         {"pool", run_pool_checks},

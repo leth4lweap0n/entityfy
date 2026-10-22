@@ -910,6 +910,9 @@ save_result set_state<T>::save(db_context& owner)
 template <typename T>
 class db_query_builder;
 
+template <typename T>
+class db_untracked_query_builder;
+
 // The db_set equivalent of EF Core's DbSet: a typed handle over one entity
 // type. It is a lazy view, so it can be declared as a member of a user
 // defined context:
@@ -1036,6 +1039,13 @@ public:
     }
 
     [[nodiscard]] db_query_builder<T> query();
+
+    // Full-entity reads that are materialized but never attached: the EF Core
+    // AsNoTracking() path. Rows come back by value, so they pay for neither the
+    // `original` snapshot nor an identity map entry. The flip side is that the
+    // values are the caller's copies - changing them does not reach the
+    // database, and saving them is not an error (see docs/context.md).
+    [[nodiscard]] db_untracked_query_builder<T> as_no_tracking();
 
     // Loads the rows produced by a raw SQL statement and tracks them.
     [[nodiscard]] std::vector<T*> from_sql(std::string_view sql)
@@ -1437,6 +1447,93 @@ private:
     }
 
     db_context* owner_;
+};
+
+// The value-returning counterpart of db_query_builder: same filters and paging,
+// but every row is materialized into a std::vector<T> and never attached to the
+// tracker. Reads only; there is no save path from here.
+template <typename T>
+class db_untracked_query_builder
+{
+public:
+    explicit db_untracked_query_builder(db_context& owner)
+        : owner_{&owner}
+    {
+    }
+
+    [[nodiscard]] db_untracked_query_builder where(entityfy::condition filter) const
+    {
+        auto copy = *this;
+        copy.options_.filter = std::move(filter);
+        return copy;
+    }
+
+    template <typename Member>
+    [[nodiscard]] db_untracked_query_builder order_by(
+        Member T::* member,
+        entityfy::sort_direction direction = entityfy::sort_direction::ascending) const
+    {
+        auto copy = *this;
+        copy.options_.orderings.push_back(entityfy::order_by(member, direction));
+        return copy;
+    }
+
+    [[nodiscard]] db_untracked_query_builder take(std::uint64_t count) const
+    {
+        auto copy = *this;
+        copy.options_.limit = count;
+        return copy;
+    }
+
+    [[nodiscard]] db_untracked_query_builder skip(std::uint64_t offset) const
+    {
+        auto copy = *this;
+        copy.options_.offset = offset;
+        return copy;
+    }
+
+    [[nodiscard]] std::vector<T> to_list() const
+    {
+        const auto model = entityfy::describe_model<T>(owner_->database().target_dialect());
+        const auto command = entityfy::select_statement(model, options_);
+
+        owner_->log(command.sql);
+
+        const auto rows = owner_->database().query(command);
+
+        std::vector<T> output;
+        output.reserve(rows.size());
+
+        for(const auto& row: rows)
+        {
+            output.push_back(entityfy::detail::materialize_row<T>(row));
+        }
+
+        return output;
+    }
+
+    [[nodiscard]] std::optional<T> first() const
+    {
+        auto copy = *this;
+        copy.options_.limit = 1;
+
+        auto rows = copy.to_list();
+        if(rows.empty())
+        {
+            return std::nullopt;
+        }
+
+        return std::move(rows.front());
+    }
+
+    [[nodiscard]] std::uint64_t count() const
+    {
+        return owner_->database().template count<T>(options_);
+    }
+
+private:
+    db_context*               owner_;
+    entityfy::query_options<T> options_;
 };
 
 template <typename T>
@@ -1897,6 +1994,12 @@ template <typename T>
 db_query_builder<T> db_set<T>::query()
 {
     return db_query_builder<T>{*owner_, state()};
+}
+
+template <typename T>
+db_untracked_query_builder<T> db_set<T>::as_no_tracking()
+{
+    return db_untracked_query_builder<T>{*owner_};
 }
 
 template <typename T>

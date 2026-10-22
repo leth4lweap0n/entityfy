@@ -264,6 +264,25 @@ void run_context_bench(const std::vector<std::string>& emails,
 
     load_ns = median_of(load_samples);
 
+    // Same query without the tracker: values only, no snapshot, no identity map.
+    std::vector<double> untracked_samples;
+    untracked_samples.reserve(repetitions);
+
+    for(std::size_t repetition = 0; repetition < repetitions; ++repetition)
+    {
+        entityfy::db_context loader{"sqlite://bench_context.db"};
+        auto loader_users = loader.set<bench_user>();
+
+        const auto started = clock_type::now();
+        const auto rows_without_tracking = loader_users.as_no_tracking().to_list();
+        const auto finished = clock_type::now();
+        untracked_samples.push_back(std::chrono::duration<double, std::nano>(finished - started).count() /
+                                    static_cast<double>(rows_without_tracking.size()));
+        g_sink += rows_without_tracking.size();
+    }
+
+    const double untracked_ns = median_of(untracked_samples);
+
     std::filesystem::remove(path);
 
     std::cout << "\n=== context layer benchmark (change tracking) ===\n";
@@ -275,16 +294,25 @@ void run_context_bench(const std::vector<std::string>& emails,
     std::cout << std::format("{:<34}{:>16.0f} ns\n", "find (identity map hit)", identity_ns);
     std::cout << std::format("{:<34}{:>16.0f} ns\n", "find (database hit, cold)", cold_ns);
     std::cout << std::format("{:<34}{:>16.0f} ns/row\n", "to_list (load + track)", load_ns);
+    std::cout << std::format("{:<34}{:>16.0f} ns/row\n", "to_list (no tracking)", untracked_ns);
     std::cout << std::format("{:<34}{:>16.0f} ns\n", "save_changes (1 dirty row)", update_ns);
+    std::cout << std::format("{:<34}{:>16.1f} ns\n",
+                             "save_changes per tracked entity",
+                             update_ns / static_cast<double>(rows));
 
     if(load_ns > 0.0)
     {
         std::cout << std::format("\ncold find / to_list per row: {:.0f}x\n", cold_ns / load_ns);
     }
 
-    std::cout << "\nNote: cold find and to_list use a file backed database and a fresh\n"
-                 "      context (real SELECT + materialize + attach); the other context\n"
-                 "      numbers are in-memory, like the core table above.\n";
+    if(untracked_ns > 0.0)
+    {
+        std::cout << std::format("tracked / no-tracking load per row: {:.2f}x\n", load_ns / untracked_ns);
+    }
+
+    std::cout << "\nNote: cold find and both to_list rows use a file backed database and a\n"
+                 "      fresh context per repetition; the other context numbers are\n"
+                 "      in-memory, like the core table above.\n";
 }
 
 void check_sqlite(int code, sqlite3* database, std::string_view what)
@@ -811,6 +839,13 @@ void run_postgres_bench(const std::string& uri, std::size_t rows, std::size_t re
 
     row("find (primary key)", entityfy_pk, raw_prepared_pk, raw_params_pk);
     row("find_one (unique email)", entityfy_email, raw_prepared_email, raw_params_pk);
+
+    // Leave the database as it was found: a leftover bench table makes the
+    // migration test report a schema that no longer matches its snapshot.
+    pg_check(connection,
+             PQexec(connection, "DROP TABLE IF EXISTS \"bench_users_explicit\""),
+             "cleanup explicit");
+    pg_check(connection, PQexec(connection, "DROP TABLE IF EXISTS \"bench_users\""), "cleanup tracked");
 
     PQfinish(connection);
     std::cout << "\nNote: PostgreSQL timings include network latency; the server runs on the same machine.\n";

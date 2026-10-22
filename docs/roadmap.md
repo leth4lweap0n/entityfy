@@ -16,6 +16,8 @@
 **Context**
 
 - Identity map, snapshot-based change tracking, partial UPDATE
+- **No-tracking reads**: `query().select(...)` (tuples) and `as_no_tracking()` (full entities by
+  value, EF Core `AsNoTracking`); measured 332 ns/row against 460 ns/row tracked
 - FK dependency order: INSERT parent-first, DELETE child-first (`ON DELETE RESTRICT` supported)
 - Nested transactions/savepoints, retry policy, batch splitting
 - EF Core style surface: `db_context` / `db_set<T>` with `save_changes()`, `add()`, `find()`,
@@ -55,10 +57,10 @@
    snapshot, so a one-row update is O(tracked entities) even though the undo log already records
    only what a save touches (see `docs/benchmarks.md`). Removing the remaining scan needs write
    hooks: an explicit `mark_modified(entity)` API or proxy-style setters.
-5. **No-tracking full-entity reads** — `query().select(...)` already returns untracked tuples
-   (the `Select(new {...})` equivalent), but a full entity always goes through the tracker.
-   `ctx.users.as_no_tracking().to_list()` should return `std::vector<T>` by value (materialize,
-   skip attach and skip the snapshot), which also removes the pointer-lifetime caveat.
+5. **Compile-time no-tracking view** — `as_no_tracking()` returns `std::vector<T>` by value, so
+   mutating a returned entity compiles and is silently ignored (the EF Core `AsNoTracking`
+   footgun). A const-only wrapper would make that a compile error; it needs a view type that
+   keeps the value movable, so it is a design decision, not a rename.
 6. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
    in practice covered by `entityfy::value_converter<T>` (a composite type is written to a single
    column), but owned types **split across** columns (as in EF, e.g. `address_city`) and a TPH
