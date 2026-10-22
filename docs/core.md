@@ -39,6 +39,7 @@ struct [[= entityfy::table{"users"}]] user
 | `entityfy::date`, `entityfy::time`, `entityfy::timestamp` | Time types |
 | `entityfy::created_at`, `entityfy::updated_at` | Automatic timestamp |
 | `entityfy::references{"table", "column", "ON DELETE", "ON UPDATE"}` | Foreign key |
+| `entityfy::column{"sql_name"}` | Explicit SQL column name (default: the member name); used by DDL and by every statement the core and context layers build |
 | `entityfy::ignore` / `entityfy::ignored` | Not a column, a transient field |
 
 Supported field types: `bool`, integral, floating point, enum, `std::string`,

@@ -213,7 +213,7 @@ ctest --preset release
 ```
 
 39 CTest entries: 37 core Catch2 test executable entries (139 assertions) and the migrate/context
-test binaries — which contain 9 and 13 scenarios respectively.
+test binaries — which contain 9 and 16 scenarios respectively.
 PostgreSQL tests run when `ENTITYFY_PG_URI` is provided; with `ENTITYFY_REQUIRE_PG=1` a skipped
 test counts as a failure. Tests write to a temporary workspace and do not pollute the source tree.
 
