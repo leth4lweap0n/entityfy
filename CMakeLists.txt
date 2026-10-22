@@ -21,6 +21,18 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 # ---------------------------------------------------------------------------
+# MinGW runtime
+# ---------------------------------------------------------------------------
+# The MinGW toolchain normally ships libstdc++-6.dll, libgcc_s_seh-1.dll and
+# libwinpthread-1.dll next to the compiler. Linking them statically keeps the
+# produced executables free of those three DLLs so they run on machines that
+# do not have MinGW installed. libpq stays a dynamic import, third-party SDK
+# DLLs are not part of this block.
+if(MINGW)
+    add_link_options(-static-libgcc -static-libstdc++ -static)
+endif()
+
+# ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
 option(ENTITYFY_BUILD_TESTS "Build entityfy test suites" ON)
