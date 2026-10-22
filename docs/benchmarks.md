@@ -141,11 +141,17 @@ attach instead of hitting the identity map.
 
 | Operation | Measured | Notes |
 |---|---|---|
-| `add` + `save_changes` (20.000 rows, one transaction) | 604.000 rows/s | typing + tracking + generated key write-back |
+| `add` + `save_changes` (20.000 rows, one transaction) | 606.000 rows/s | typing + tracking + generated key write-back |
 | `find` (identity map hit) | 14 ns | hash lookup, no SQL |
 | `find` (database hit, cold) | 32 µs | SELECT + materialization + attach |
-| `to_list` (5.000 rows into a fresh context) | 460 ns/row | real load; the bench prints the measured ratio (70x cheaper per row than a cold `find`) |
-| `save_changes` with 1 dirty row | grows with the tracked set | 244 µs @2k, 983 µs @8k, 2,60 ms @20k |
+| `to_list` (5.000 rows into a fresh context) | 457 ns/row | real load; the bench prints the measured ratio (70x cheaper per row than a cold `find`, 63-71x across runs) |
+| `save_changes` with 1 dirty row | grows with the tracked set | 244 µs @2k, 973 µs @8k, 2,62 ms @20k |
+
+Every number is a median over `repetitions`; the cold lookup and the bulk load open a **fresh
+context per repetition**, so the ratio compares two measured medians rather than single runs.
+Repeating the whole run moves the absolute values with machine load: three consecutive
+`20000 5` runs gave 576.000-606.000 rows/s, 457-521 ns/row for the bulk load and 2,62-2,89 ms for
+the one-row save. The printed ratio stayed between 63x and 71x.
 
 A one-row update is O(tracked entities) for two independent reasons, and only one of them
 remains:
@@ -160,7 +166,7 @@ remains:
    save actually touches, so an update of one row records one entry. The same change also moved
    the column list to compile time (`update_members<T>()`) and defers the `UPDATE` string and bind
    vector until a field really differs; together they cut the 20k measurement from 5,37 ms to
-   2,60 ms.
+   2,62 ms.
 
 The columns of the modified row are still the only ones written - the scan is CPU work, not extra
 SQL. Removing the remaining term needs write tracking (explicit `mark_modified()` or proxy

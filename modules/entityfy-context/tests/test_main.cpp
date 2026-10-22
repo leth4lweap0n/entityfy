@@ -118,6 +118,41 @@ struct [[= entityfy::table{"rc_children"}]] rc_child
     std::string label;
 };
 
+// Column aliases: every statement the context builds must use the name from
+// [[= entityfy::column{"..."}]], not the C++ identifier.
+struct [[= entityfy::table{"rc_alias_auto"}]] rc_alias_auto
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::column{"display_name"}, = entityfy::not_null, = entityfy::varchar{120}]]
+    std::string name;
+
+    [[= entityfy::column{"score_value"}]]
+    std::int64_t score = 0;
+};
+
+struct [[= entityfy::table{"rc_alias_key"}]] rc_alias_key
+{
+    [[= entityfy::primary_key, = entityfy::column{"alias_id"}]]
+    std::int64_t id = 0;
+
+    [[= entityfy::column{"body_text"}, = entityfy::not_null, = entityfy::varchar{200}]]
+    std::string body;
+};
+
+struct [[= entityfy::table{"rc_alias_version"}]] rc_alias_version
+{
+    [[= entityfy::primary_key, = entityfy::column{"alias_id"}]]
+    std::int64_t id = 0;
+
+    [[= entityfy::column{"body_text"}, = entityfy::not_null, = entityfy::varchar{120}]]
+    std::string body;
+
+    [[= entityfy::column{"row_version"}]]
+    std::int64_t version = 0;
+};
+
 // EF Core style context: the sets are declared once, the framework derives
 // everything else (table, columns, primary key, foreign keys) from reflection.
 struct ef_context : entityfy::db_context
@@ -780,6 +815,128 @@ status run_retry_checks()
     return status::passed;
 }
 
+status run_column_alias_checks()
+{
+    const char* path = "sqlite://rc_alias.db";
+    std::filesystem::remove("rc_alias.db");
+
+    {
+        entityfy::db_context ctx{path};
+        ctx.migrate<rc_alias_auto>();
+        ctx.migrate<rc_alias_key>();
+
+        // Single row INSERT goes through the per entity statement path.
+        auto aliases = ctx.set<rc_alias_auto>();
+        auto& single = aliases.add(rc_alias_auto{.name = "aliased", .score = 7});
+        const auto inserted = ctx.save_changes();
+        require(inserted.inserted == 1, "aliased single insert did not insert one row");
+        require(single.id != 0, "aliased single insert did not write back the generated key");
+
+        // Explicit primary keys take the batched INSERT path.
+        auto keys = ctx.set<rc_alias_key>();
+
+        std::vector<std::string> statements;
+        ctx.set_logger([&](std::string_view sql) { statements.emplace_back(sql); });
+
+        keys.add(rc_alias_key{.id = 1, .body = "one"});
+        keys.add(rc_alias_key{.id = 2, .body = "two"});
+        const auto batched = ctx.save_changes();
+        require(batched.inserted == 2, "aliased batch insert did not insert two rows");
+
+        const auto batch_statement = std::ranges::find_if(statements, [](const std::string& sql) {
+            return sql.find("INSERT INTO \"rc_alias_key\"") != std::string::npos;
+        });
+        require(batch_statement != statements.end(), "aliased batch insert is not a batched statement");
+        require(occurrences(*batch_statement, "), (") == 1, "aliased rows are not batched together");
+        require(batch_statement->find("\"alias_id\"") != std::string::npos,
+                "aliased batch insert ignores the aliased primary key");
+        require(batch_statement->find("\"body_text\"") != std::string::npos,
+                "aliased batch insert ignores the aliased column");
+        require(batch_statement->find("\"body\"") == std::string::npos,
+                "aliased batch insert leaks the C++ identifier");
+
+        // UPDATE compares the snapshot and must name display_name in the SET list.
+        single.name = "renamed";
+        single.score = 9;
+        const auto updated = ctx.save_changes();
+        require(updated.updated == 1, "aliased update did not update one row");
+    }
+
+    // A fresh context can only see the rows if SELECT mapped the aliased
+    // columns back onto the members.
+    {
+        entityfy::db_context verify{path};
+        auto aliases = verify.set<rc_alias_auto>();
+        const auto loaded = aliases.to_list();
+        require(loaded.size() == 1, "aliased select lost the row");
+        require(loaded.front()->name == "renamed", "aliased select did not map display_name");
+        require(loaded.front()->score == 9, "aliased select did not map score_value");
+
+        auto keys = verify.set<rc_alias_key>();
+        const auto batches = keys.to_list();
+        require(batches.size() == 2, "aliased batch insert rows are not readable");
+        require(batches.front()->body == "one" && batches.back()->body == "two",
+                "aliased batch insert wrote the wrong column");
+
+        auto* found = aliases.find(1);
+        require(found != nullptr && found->name == "renamed", "aliased find did not resolve the key");
+    }
+
+    std::filesystem::remove("rc_alias.db");
+
+    return status::passed;
+}
+
+status run_column_alias_version_checks()
+{
+    const char* path = "sqlite://rc_alias_version.db";
+    std::filesystem::remove("rc_alias_version.db");
+
+    {
+        entityfy::db_context writer{path};
+        writer.migrate<rc_alias_version>();
+
+        auto writer_set = writer.set<rc_alias_version>();
+        writer_set.add(rc_alias_version{.id = 1, .body = "v0"});
+        const auto inserted = writer.save_changes();
+        require(inserted.inserted == 1, "aliased version model did not insert");
+
+        // Loaded before the update, so this context holds version 0.
+        entityfy::db_context stale{path};
+        auto stale_set = stale.set<rc_alias_version>();
+        auto* stale_row = stale_set.find(1);
+        require(stale_row != nullptr && stale_row->version == 0, "stale context loads version 0");
+
+        auto* fresh_row = writer_set.find(1);
+        require(fresh_row != nullptr, "writer keeps the tracked row");
+        fresh_row->body = "v1";
+        const auto bumped = writer.save_changes();
+        require(bumped.updated == 1, "aliased version update did not update one row");
+        require(fresh_row->version == 1, "aliased version column was not incremented");
+
+        // The UPDATE names row_version, so the stale snapshot must be rejected.
+        stale_row->body = "v2";
+        bool conflicted = false;
+        try
+        {
+            stale.save_changes();
+        }
+        catch(const std::exception&)
+        {
+            conflicted = true;
+        }
+
+        require(conflicted, "aliased version column did not detect the stale write");
+
+        auto rows = writer.database().table<rc_alias_version>().find_many();
+        require(rows.size() == 1 && rows.front().body == "v1", "stale write overwrote the row");
+    }
+
+    std::filesystem::remove("rc_alias_version.db");
+
+    return status::passed;
+}
+
 status run_batch_checks()
 {
     entityfy::db_context ctx{"sqlite://:memory:"};
@@ -1188,6 +1345,8 @@ int main()
         {"transaction", run_transaction_checks},
         {"state", run_state_checks},
         {"retry", run_retry_checks},
+        {"column_alias", run_column_alias_checks},
+        {"column_alias_version", run_column_alias_version_checks},
         {"batch", run_batch_checks},
         {"dependency", run_dependency_checks},
         {"pool", run_pool_checks},

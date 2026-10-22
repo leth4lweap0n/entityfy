@@ -200,7 +200,7 @@ void run_context_bench(const std::vector<std::string>& emails,
         update_ns = median_of(update_samples);
     }
 
-    // ---- cold lookup: fresh context, every key touched once (file database) ----
+    // ---- cold lookup: fresh context per repetition, every key once (file database) ----
     const char* path = "bench_context.db";
     std::filesystem::remove(path);
 
@@ -221,7 +221,12 @@ void run_context_bench(const std::vector<std::string>& emails,
         });
     }
 
+    std::vector<double> cold_samples;
+    cold_samples.reserve(repetitions);
+
+    for(std::size_t repetition = 0; repetition < repetitions; ++repetition)
     {
+        // Fresh context, so nothing is in the identity map yet.
         entityfy::db_context cold{"sqlite://bench_context.db"};
         auto cold_users = cold.set<bench_user>();
 
@@ -233,12 +238,18 @@ void run_context_bench(const std::vector<std::string>& emails,
         }
         const auto cold_finished = clock_type::now();
 
-        cold_ns = std::chrono::duration<double, std::nano>(cold_finished - cold_started).count() /
-                  static_cast<double>(cold_rows);
+        cold_samples.push_back(std::chrono::duration<double, std::nano>(cold_finished - cold_started).count() /
+                               static_cast<double>(cold_rows));
     }
+
+    cold_ns = median_of(cold_samples);
 
     // Bulk load through the tracker from a context that tracks nothing yet,
     // so every row really is materialized and attached (not a hash hit).
+    std::vector<double> load_samples;
+    load_samples.reserve(repetitions);
+
+    for(std::size_t repetition = 0; repetition < repetitions; ++repetition)
     {
         entityfy::db_context loader{"sqlite://bench_context.db"};
         auto loader_users = loader.set<bench_user>();
@@ -246,10 +257,12 @@ void run_context_bench(const std::vector<std::string>& emails,
         const auto load_started = clock_type::now();
         const auto all_rows = loader_users.to_list();
         const auto load_finished = clock_type::now();
-        load_ns = std::chrono::duration<double, std::nano>(load_finished - load_started).count() /
-                  static_cast<double>(all_rows.size());
+        load_samples.push_back(std::chrono::duration<double, std::nano>(load_finished - load_started).count() /
+                               static_cast<double>(all_rows.size()));
         g_sink += all_rows.size();
     }
+
+    load_ns = median_of(load_samples);
 
     std::filesystem::remove(path);
 

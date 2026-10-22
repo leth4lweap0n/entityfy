@@ -50,11 +50,6 @@ consteval std::meta::info find_primary_key(std::meta::info type)
     throw "entityfy: model has no primary key";
 }
 
-consteval std::string_view member_column_name(std::meta::info member)
-{
-    return std::meta::identifier_of(member);
-}
-
 consteval std::meta::info find_member(std::meta::info type, std::string_view name)
 {
     for(const auto member: std::meta::nonstatic_data_members_of(type, std::meta::access_context::unchecked()))
@@ -424,7 +419,7 @@ struct set_state final : saveable
                     }
                 }
 
-                const std::string column{member_column_name(member)};
+                const std::string column{annotated_column_name<member>().view()};
                 if(!is_persisted_column(model, column))
                 {
                     continue;
@@ -553,11 +548,21 @@ save_result set_state<T>::save(db_context& owner)
     const auto model = entityfy::describe_model<T>(owner.database().target_dialect());
     const std::string table = entityfy::detail::quote_identifier(model.table_name);
     constexpr auto primary_key = find_primary_key(^^T);
-    const std::string primary_key_column{member_column_name(find_primary_key(^^T))};
+    const std::string primary_key_column{annotated_column_name<find_primary_key(^^T)>().view()};
 
     constexpr auto version_member = find_member(^^T, "version");
     constexpr bool has_version_member = version_member != std::meta::info{};
-    const bool has_version = has_version_member && is_persisted_column(model, "version");
+
+    // Resolved once: an aliased [[= entityfy::column{"..."}]] on the member
+    // named "version" must be used in the SET and WHERE clauses.
+    std::string version_column;
+    bool has_version = false;
+
+    if constexpr(find_member(^^T, "version") != std::meta::info{})
+    {
+        version_column = std::string{annotated_column_name<find_member(^^T, "version")>().view()};
+        has_version = is_persisted_column(model, version_column);
+    }
 
     bool generated_primary_key = false;
     for(const auto& column: model.columns)
@@ -585,7 +590,7 @@ save_result set_state<T>::save(db_context& owner)
     template for (constexpr auto member: std::define_static_array(
                       std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::unchecked())))
     {
-        const std::string column{member_column_name(member)};
+        const std::string column{annotated_column_name<member>().view()};
         if(!is_persisted_column(model, column) || generated_column(column))
         {
             continue;
@@ -661,7 +666,7 @@ save_result set_state<T>::save(db_context& owner)
                 {
                     if constexpr(!is_ignored_member(member))
                     {
-                        const std::string column{member_column_name(member)};
+                        const std::string column{annotated_column_name<member>().view()};
 
                         if(std::ranges::find(insert_columns, column) == insert_columns.end())
                         {
@@ -814,7 +819,7 @@ save_result set_state<T>::save(db_context& owner)
                 sql += ", ";
             }
 
-            sql += entityfy::detail::quote_identifier(member_column_name(member)) + " = ?";
+            sql += entityfy::detail::quote_identifier(annotated_column_name<member>().view()) + " = ?";
             binds.push_back(entityfy::to_sql_value(current));
         }
 
@@ -831,8 +836,8 @@ save_result set_state<T>::save(db_context& owner)
         {
             if(has_version)
             {
-                sql += ", " + entityfy::detail::quote_identifier("version") + " = " +
-                       entityfy::detail::quote_identifier("version") + " + 1";
+                sql += ", " + entityfy::detail::quote_identifier(version_column) + " = " +
+                       entityfy::detail::quote_identifier(version_column) + " + 1";
             }
         }
 
@@ -843,7 +848,7 @@ save_result set_state<T>::save(db_context& owner)
         {
             if(has_version)
             {
-                sql += " AND " + entityfy::detail::quote_identifier("version") + " = ?";
+                sql += " AND " + entityfy::detail::quote_identifier(version_column) + " = ?";
                 binds.push_back(entityfy::to_sql_value(item.original.[:version_member:]));
             }
         }
