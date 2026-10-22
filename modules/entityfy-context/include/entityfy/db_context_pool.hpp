@@ -1,9 +1,10 @@
 #pragma once
 
-#include <entityfy/context.hpp>
+#include <entityfy/db_context.hpp>
 
 #include <condition_variable>
 #include <cstddef>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -14,7 +15,7 @@ namespace entityfy
 
 // Similar to DbContextPool: reuses ready contexts and returns them to the pool
 // with the change tracker cleared when a lease ends. The pool outlives its leases.
-class context_pool
+class db_context_pool
 {
 public:
     class lease
@@ -47,25 +48,25 @@ public:
             release();
         }
 
-        [[nodiscard]] context& operator*() const noexcept
+        [[nodiscard]] db_context& operator*() const noexcept
         {
             return *context_;
         }
 
-        [[nodiscard]] context* operator->() const noexcept
+        [[nodiscard]] db_context* operator->() const noexcept
         {
             return context_.get();
         }
 
-        [[nodiscard]] context* get() const noexcept
+        [[nodiscard]] db_context* get() const noexcept
         {
             return context_.get();
         }
 
     private:
-        friend class context_pool;
+        friend class db_context_pool;
 
-        lease(context_pool* pool, std::unique_ptr<context> context)
+        lease(db_context_pool* pool, std::unique_ptr<db_context> context)
             : pool_{pool}, context_{std::move(context)}
         {
         }
@@ -79,19 +80,19 @@ public:
             }
         }
 
-        context_pool*            pool_;
-        std::unique_ptr<context> context_;
+        db_context_pool*            pool_;
+        std::unique_ptr<db_context> context_;
     };
 
-    explicit context_pool(std::string uri, std::size_t max_size = 16)
+    explicit db_context_pool(std::string uri, std::size_t max_size = 16)
         : uri_{std::move(uri)}, max_size_{max_size == 0 ? 1 : max_size}
     {
     }
 
-    context_pool(const context_pool&) = delete;
-    context_pool& operator=(const context_pool&) = delete;
+    db_context_pool(const db_context_pool&) = delete;
+    db_context_pool& operator=(const db_context_pool&) = delete;
 
-    [[nodiscard]] lease acquire()
+    [[nodiscard]] lease Acquire()
     {
         std::unique_lock lock{mutex_};
 
@@ -107,36 +108,35 @@ public:
             return lease{this, std::move(context)};
         }
 
-        auto created = std::make_unique<context>(uri_);
+        auto created = std::make_unique<db_context>(uri_);
         ++created_;
         return lease{this, std::move(created)};
     }
 
-    [[nodiscard]] std::size_t idle_count() const
+    [[nodiscard]] std::size_t IdleCount() const
     {
-        std::lock_guard lock{mutex_};
+        std::unique_lock lock{mutex_};
         return idle_.size();
     }
 
-    [[nodiscard]] std::size_t created_count() const
+    [[nodiscard]] std::size_t CreatedCount() const
     {
-        std::lock_guard lock{mutex_};
+        std::unique_lock lock{mutex_};
         return created_;
     }
 
 private:
-    void release(std::unique_ptr<context> context) noexcept
+    void release(std::unique_ptr<db_context> context) noexcept
     {
-        context->clear();
-        context->set_logger(nullptr);
-        context->set_retry_policy(retry_policy{});
-        context->set_batch_parameter_limit(1000);
-
+        if(!context)
         {
-            std::lock_guard lock{mutex_};
-            idle_.push_back(std::move(context));
+            return;
         }
 
+        context->Clear();
+
+        std::unique_lock lock{mutex_};
+        idle_.push_back(std::move(context));
         available_.notify_one();
     }
 
@@ -144,7 +144,7 @@ private:
     std::size_t                              max_size_;
     mutable std::mutex                       mutex_;
     std::condition_variable                  available_;
-    std::vector<std::unique_ptr<context>>    idle_;
+    std::vector<std::unique_ptr<db_context>> idle_;
     std::size_t                              created_ = 0;
 };
 
