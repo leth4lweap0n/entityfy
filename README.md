@@ -291,8 +291,21 @@ test counts as a failure. Tests write to a temporary workspace and do not pollut
 
 ## Build
 
-Requirements: GCC 16.2+ (C++26 `-freflection`), CMake 3.30+. The PostgreSQL backend requires
-`libpq`.
+The code needs a compiler with **C++26 reflection (P2996)**: `entityfy-core` publishes the C++26
+standard level and `-freflection` to every target that links it, so neither has to be repeated per
+module.
+
+| Toolchain | Status |
+|---|---|
+| **GCC 16.2** (winlibs MinGW-w64, Windows x64) | the verified toolchain: Debug and Release build, all 39 CTest entries, every benchmark number in this README and `docs/benchmarks.md` |
+| Clang 21+ | implements P2996 behind `-freflection`, but this project has **not** been built or tested with it |
+| MSVC | no C++26 reflection yet, so it cannot build the project |
+
+Requirements: CMake 3.30+ (`CMakePresets.json` targets 3.30; 4.4 was used here). The PostgreSQL
+backend requires `libpq`; `--preset release-no-pg` builds without it.
+
+There is no CI configuration yet, so "verified" above means the toolchain the maintainers build
+and test with locally.
 
 ```bash
 cmake --preset release
