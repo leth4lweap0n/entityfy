@@ -351,10 +351,21 @@ add_executable(app main.cpp)
 target_link_libraries(app PRIVATE entityfy::core)          # or entityfy::db_context, entityfy::migrate
 ```
 
-`add_subdirectory` and `FetchContent_MakeAvailable` both work; the dependencies (`sl3`,
-`taocpp::pq`, `spdlog`, `Catch2`, `nlohmann_json`) are fetched during the first configure, so that
-step needs network access. The `-freflection` flag and the C++26 standard level travel with the
-`entityfy::core` interface, so the consumer does not set them.
+`add_subdirectory` and `FetchContent_MakeAvailable` both work - both were built and run while
+writing this section. The dependencies are fetched during the first configure, so that step needs
+network access; which ones are pulled follows the options:
+
+| Option | Fetches |
+|---|---|
+| `ENTITYFY_ENABLE_SQLITE=ON` (default) | `sl3` (with an embedded SQLite) |
+| always | `nlohmann_json` |
+| `ENTITYFY_ENABLE_POSTGRESQL=ON` and libpq found | `taocpp::pq` |
+| `ENTITYFY_BUILD_TESTS=ON` (default) | `Catch2` |
+| `ENTITYFY_BUILD_EXAMPLES=ON` (default) | `spdlog` |
+
+So the four `OFF` switches above fetch only `sl3` and `nlohmann_json`. The `-freflection` flag and
+the C++26 standard level travel with the `entityfy::core` interface, so the consumer does not set
+them.
 
 Per-target use:
 
