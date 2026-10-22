@@ -7,7 +7,7 @@ target_compile_options(entityfy_console
 )
 
 add_executable(entityfy_bench bench_compare.cpp)
-target_link_libraries(entityfy_bench PRIVATE entityfy::core entityfy::sqlite)
+target_link_libraries(entityfy_bench PRIVATE entityfy::core entityfy::sqlite entityfy::db_context)
 target_compile_options(entityfy_bench
     PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-but-set-variable -Wno-unused-parameter
 )

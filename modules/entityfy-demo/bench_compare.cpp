@@ -4,6 +4,7 @@
 //
 // Usage: entityfy_bench [row_count] [repetitions]
 
+#include <entityfy/db_context.hpp>
 #include <entityfy/entityfy.hpp>
 
 #include <sqlite3.h>
@@ -17,6 +18,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <format>
 #include <iostream>
 #include <memory>
@@ -110,6 +112,162 @@ timing measure(Function&& function, std::size_t iterations, std::size_t repetiti
     result.min_ns = *std::ranges::min_element(samples);
     result.max_ns = *std::ranges::max_element(samples);
     return result;
+}
+
+// Context layer (change tracking) benchmark: the db_set/db_context paths that
+// sit on top of the core timings measured below. Inserts, lookups and updates
+// run against an in-memory database so they are comparable with the core
+// numbers; only the cold (not yet tracked) lookup needs a file database and a
+// second connection.
+void run_context_bench(const std::vector<std::string>& emails,
+                       const std::vector<std::string>& names,
+                       std::size_t rows,
+                       std::size_t repetitions)
+{
+    // ---- tracked insert (add + save_changes), median of 3 trials ----
+    std::vector<double> insert_rates;
+
+    for(int trial = 0; trial < 3; ++trial)
+    {
+        entityfy::db_context ctx{"sqlite://:memory:"};
+        ctx.migrate<bench_user>();
+        auto users = ctx.set<bench_user>();
+
+        const auto started = clock_type::now();
+        ctx.transaction([&] {
+            for(std::size_t index = 0; index < rows; ++index)
+            {
+                users.add(bench_user{.email = emails[index], .name = names[index]});
+            }
+            ctx.save_changes();
+        });
+        const auto finished = clock_type::now();
+
+        const double seconds = std::chrono::duration<double>(finished - started).count();
+        insert_rates.push_back(static_cast<double>(rows) / seconds);
+    }
+
+    // ---- steady state: one loaded in-memory context ----
+    double identity_ns = 0.0;
+    double load_ns = 0.0;
+    double update_ns = 0.0;
+
+    {
+        entityfy::db_context ctx{"sqlite://:memory:"};
+        ctx.migrate<bench_user>();
+        auto users = ctx.set<bench_user>();
+
+        for(std::size_t index = 0; index < rows; ++index)
+        {
+            users.add(bench_user{.email = emails[index], .name = names[index]});
+        }
+        ctx.save_changes();
+
+        const std::size_t lookups = std::min<std::size_t>(rows, 2000);
+
+        const auto identity_hit = measure(
+            [&](std::size_t index) {
+                auto* user = users.find(static_cast<std::int64_t>(index % lookups) + 1);
+                g_sink += user == nullptr ? 0u : static_cast<std::uint64_t>(user->id);
+            },
+            lookups,
+            repetitions
+        );
+        identity_ns = identity_hit.median_ns;
+
+        // Bulk load through the tracker: SELECT * plus attach per row.
+        entityfy::db_context loader{"sqlite://:memory:"};
+        loader.migrate<bench_user>();
+        auto loader_users = loader.set<bench_user>();
+        for(std::size_t index = 0; index < rows; ++index)
+        {
+            loader_users.add(bench_user{.email = emails[index], .name = names[index]});
+        }
+        loader.save_changes();
+
+        const auto load_started = clock_type::now();
+        const auto all_rows = loader_users.to_list();
+        const auto load_finished = clock_type::now();
+        load_ns = std::chrono::duration<double, std::nano>(load_finished - load_started).count() /
+                  static_cast<double>(rows);
+        g_sink += all_rows.size();
+
+        // Dirty-column update: one changed field, one transaction per call.
+        auto* first = users.find(1);
+        if(first == nullptr)
+        {
+            throw std::runtime_error{"context benchmark lost the first row"};
+        }
+
+        std::vector<double> update_samples;
+        update_samples.reserve(repetitions);
+
+        for(std::size_t repetition = 0; repetition < repetitions; ++repetition)
+        {
+            first->name = "Updated " + std::to_string(repetition);
+
+            const auto started = clock_type::now();
+            const auto result = ctx.save_changes();
+            const auto finished = clock_type::now();
+
+            update_samples.push_back(std::chrono::duration<double, std::nano>(finished - started).count());
+            g_sink += result.updated;
+        }
+
+        update_ns = median_of(update_samples);
+    }
+
+    // ---- cold lookup: fresh context, every key touched once (file database) ----
+    const char* path = "bench_context.db";
+    std::filesystem::remove(path);
+
+    double cold_ns = 0.0;
+    const std::size_t cold_rows = std::min<std::size_t>(rows, 5000);
+
+    {
+        entityfy::db_context seed{"sqlite://bench_context.db"};
+        seed.migrate<bench_user>();
+        auto seed_users = seed.set<bench_user>();
+
+        seed.transaction([&] {
+            for(std::size_t index = 0; index < cold_rows; ++index)
+            {
+                seed_users.add(bench_user{.email = emails[index], .name = names[index]});
+            }
+            seed.save_changes();
+        });
+    }
+
+    {
+        entityfy::db_context cold{"sqlite://bench_context.db"};
+        auto cold_users = cold.set<bench_user>();
+
+        const auto cold_started = clock_type::now();
+        for(std::size_t index = 0; index < cold_rows; ++index)
+        {
+            auto* user = cold_users.find(static_cast<std::int64_t>(index) + 1);
+            g_sink += user == nullptr ? 0u : static_cast<std::uint64_t>(user->id);
+        }
+        const auto cold_finished = clock_type::now();
+
+        cold_ns = std::chrono::duration<double, std::nano>(cold_finished - cold_started).count() /
+                  static_cast<double>(cold_rows);
+    }
+
+    std::filesystem::remove(path);
+
+    std::cout << "\n=== context layer benchmark (change tracking) ===\n";
+    std::cout << std::format("SQLite {} | rows={} | repetitions={} | single thread\n\n",
+                             sqlite3_libversion(),
+                             rows,
+                             repetitions);
+    std::cout << std::format("{:<34}{:>16.0f} rows/s\n", "add + save_changes", median_of(insert_rates));
+    std::cout << std::format("{:<34}{:>16.0f} ns\n", "find (identity map hit)", identity_ns);
+    std::cout << std::format("{:<34}{:>16.0f} ns\n", "find (database hit, cold)", cold_ns);
+    std::cout << std::format("{:<34}{:>16.0f} ns/row\n", "to_list (load + track)", load_ns);
+    std::cout << std::format("{:<34}{:>16.0f} ns\n", "save_changes (1 dirty row)", update_ns);
+    std::cout << "\nNote: cold find uses a file backed database (second connection); the\n"
+                 "      other context numbers are in-memory, like the core table above.\n";
 }
 
 void check_sqlite(int code, sqlite3* database, std::string_view what)
@@ -1166,6 +1324,9 @@ int main(int argc, char** argv)
                              raw_final_count,
                              deleted_per_variant);
     std::cout << std::format("[ok] measurement sink (optimization barrier): {}\n", static_cast<std::uint64_t>(g_sink));
+
+    run_context_bench(emails, names, rows, repetitions);
+
     std::cout << "\nNote: raw cached = a single prepared statement; raw prep-each = prepare/finalize on every call.\n";
     std::cout << "Note: entityfy timings include typed materialization (std::string copies).\n";
 

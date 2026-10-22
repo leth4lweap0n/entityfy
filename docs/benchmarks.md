@@ -131,6 +131,27 @@ So what is "slow" here is the driver/network layer, not the ORM. Against the sam
 `PQexecParams` (prepare on every call) remains slower than entityfy; the contribution of a
 prepared statement on the server side shows up here as well.
 
+## Context layer (change tracking)
+
+`entityfy_bench` also measures the context layer, i.e. the `db_set` / `db_context` path that the
+core numbers above do not cover. Inserts, lookups and updates run on an in-memory database so
+they are comparable with the core table; only the cold (not yet tracked) lookup needs a file
+backed database and a second connection.
+
+| Operation | Measured | Notes |
+|---|---|---|
+| `add` + `save_changes` (20.000 rows, one transaction) | 605.000 rows/s | typing + tracking + generated key write-back |
+| `find` (identity map hit) | 14 ns | hash lookup, no SQL |
+| `find` (database hit, cold) | 33 µs | SELECT + materialization + attach |
+| `to_list` (load + track 20.000 rows) | 286 ns/row | 14x cheaper than a cold `find` per row |
+| `save_changes` with 1 dirty row | scales with the tracked set | 437 µs @2k, 1,83 ms @8k, 5,37 ms @20k |
+
+The last row is the honest limitation of snapshot based tracking: `SaveChanges()` compares every
+tracked entity against its snapshot to find modified rows, so a one-row update costs O(tracked
+entities). The same scan happens in EF Core's `ChangeTracker.DetectChanges()` unless proxies are
+used. The columns of the modified row are still the only ones written — the scan is CPU work, not
+extra SQL.
+
 ## Honest assessment
 
 1. **The statement cache was the biggest gain** (same-process on/off measurement: PK 2,26x,
