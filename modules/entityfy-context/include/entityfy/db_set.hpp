@@ -86,6 +86,32 @@ consteval std::meta::info find_member_of_type(std::meta::info type, std::meta::i
     return std::meta::info{};
 }
 
+// Members the update path compares and writes: every persisted field except
+// the primary key and the version column. Resolved once at compile time so a
+// save does not rebuild column names inside the per entity loop.
+template <typename T>
+consteval auto update_members()
+{
+    std::vector<std::meta::info> members;
+
+    for(const auto member: std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::unchecked()))
+    {
+        if(!std::meta::has_identifier(member) || is_ignored_member(member))
+        {
+            continue;
+        }
+
+        if(member == find_primary_key(^^T) || member == find_member(^^T, "version"))
+        {
+            continue;
+        }
+
+        members.push_back(member);
+    }
+
+    return std::define_static_array(members);
+}
+
 template <typename T>
 std::int64_t key_of(const T& entity)
 {
@@ -201,11 +227,26 @@ struct set_state final : saveable
         T            entity;
         T            original;
         entity_state state = entity_state::unchanged;
+        // Generation of the last save that recorded an undo entry for this
+        // item, so the log stays proportional to what the save touched.
+        std::uint64_t undo_generation = 0;
+    };
+
+    // One pre-save image of a tracked item. Only items the save actually
+    // mutates are recorded, so a save with one dirty row stays O(1) in memory
+    // instead of copying the whole tracked set.
+    struct undo_entry
+    {
+        std::size_t  index = 0;
+        T            entity;
+        T            original;
+        entity_state state = entity_state::unchanged;
     };
 
     std::deque<std::unique_ptr<tracked>>      items;
     std::unordered_map<std::int64_t, std::size_t> identity;
-    std::deque<tracked>                        backup;
+    std::vector<undo_entry>                    undo_;
+    std::uint64_t                              save_generation_ = 0;
     std::string                                table_name_;
     std::vector<std::string>                   referenced_tables_;
 
@@ -232,50 +273,45 @@ struct set_state final : saveable
 
     void begin_save() override
     {
-        backup.clear();
-        for(const auto& holder: items)
-        {
-            backup.push_back(*holder);
-        }
+        undo_.clear();
+        ++save_generation_;
     }
 
     void commit_save() noexcept override
     {
-        backup.clear();
+        undo_.clear();
+    }
+
+    // Records the current image of an item before the save mutates it.
+    void mark_undo(std::size_t index)
+    {
+        auto& item = *items[index];
+
+        if(item.undo_generation == save_generation_)
+        {
+            return;
+        }
+
+        item.undo_generation = save_generation_;
+        undo_.push_back(undo_entry{
+            .index = index,
+            .entity = item.entity,
+            .original = item.original,
+            .state = item.state,
+        });
     }
 
     void rollback_save() override
     {
-        constexpr auto version_member = find_member(^^T, "version");
-        constexpr bool has_version_member = version_member != std::meta::info{};
-
-        if(items.size() != backup.size())
+        for(auto iterator = undo_.rbegin(); iterator != undo_.rend(); ++iterator)
         {
-            items.clear();
-            for(const auto& snapshot: backup)
-            {
-                items.push_back(std::make_unique<tracked>(snapshot));
-            }
-        }
-        else
-        {
-            for(std::size_t index = 0; index < items.size(); ++index)
-            {
-                items[index]->original = backup[index].original;
-                items[index]->state = backup[index].state;
-
-                if(backup[index].state == entity_state::added)
-                {
-                    items[index]->entity = backup[index].entity;
-                }
-                else if constexpr(has_version_member)
-                {
-                    items[index]->entity.[:version_member:] = backup[index].original.[:version_member:];
-                }
-            }
+            auto& item = *items[iterator->index];
+            item.entity = iterator->entity;
+            item.original = iterator->original;
+            item.state = iterator->state;
         }
 
-        backup.clear();
+        undo_.clear();
         rebuild_identity();
     }
 
@@ -486,9 +522,9 @@ save_result set_state<T>::delete_removed(db_context& owner)
     save_result result;
     const auto model = entityfy::describe_model<T>(owner.database().target_dialect());
 
-    for(auto& holder: items)
+    for(std::size_t index = 0; index < items.size(); ++index)
     {
-        auto& item = *holder;
+        auto& item = *items[index];
         if(item.state != entity_state::removed)
         {
             continue;
@@ -502,6 +538,7 @@ save_result set_state<T>::delete_removed(db_context& owner)
             result.removed += static_cast<std::size_t>(owner.database().execute(command).rows_affected);
         }
 
+        mark_undo(index);
         item.state = entity_state::detached;
     }
 
@@ -579,6 +616,7 @@ save_result set_state<T>::save(db_context& owner)
         auto& item = *items[index];
         if(item.state == entity_state::removed)
         {
+            mark_undo(index);
             item.state = entity_state::detached;
         }
     }
@@ -661,6 +699,7 @@ save_result set_state<T>::save(db_context& owner)
             {
                 const std::size_t index = added_indices[row];
                 auto& item = *items[index];
+                mark_undo(index);
                 item.original = item.entity;
                 item.state = entity_state::unchanged;
 
@@ -687,6 +726,8 @@ save_result set_state<T>::save(db_context& owner)
             {
                 throw std::runtime_error{"entityfy: explicit primary key is not allowed for an auto-increment model"};
             }
+
+            mark_undo(index);
 
             auto command = entityfy::insert_statement(item.entity, model);
             owner.log(command.sql);
@@ -747,58 +788,44 @@ save_result set_state<T>::save(db_context& owner)
             continue;
         }
 
-        std::string sql = "UPDATE " + table + " SET ";
+        // Allocated only once a field actually differs, so unchanged entities
+        // cost two comparisons and nothing else.
+        std::string sql;
         std::vector<entityfy::sql_value> binds;
         bool first = true;
 
-        template for (constexpr auto member: std::define_static_array(
-                          std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::unchecked())))
+        template for (constexpr auto member: update_members<T>())
         {
-            if constexpr(!is_ignored_member(member))
+            const auto& current = item.entity.[:member:];
+            const auto& original = item.original.[:member:];
+
+            if(current == original)
             {
-                if constexpr(member == find_primary_key(^^T))
-                {
-                    continue;
-                }
+                continue;
+            }
 
-                if constexpr(has_version_member)
-                {
-                    if constexpr(member == version_member)
-                    {
-                        continue;
-                    }
-                }
-
-                const std::string column{member_column_name(member)};
-                if(!is_persisted_column(model, column))
-                {
-                    continue;
-                }
-
-                const auto& current = item.entity.[:member:];
-                const auto& original = item.original.[:member:];
-
-                if(current == original)
-                {
-                    continue;
-                }
-
-                if(!first)
-                {
-                    sql += ", ";
-                }
-
-                sql += entityfy::detail::quote_identifier(column) + " = ?";
-                binds.push_back(entityfy::to_sql_value(current));
+            if(first)
+            {
+                sql = "UPDATE " + table + " SET ";
                 first = false;
             }
+            else
+            {
+                sql += ", ";
+            }
+
+            sql += entityfy::detail::quote_identifier(member_column_name(member)) + " = ?";
+            binds.push_back(entityfy::to_sql_value(current));
         }
 
         if(first)
         {
+            mark_undo(index);
             item.original = item.entity;
             continue;
         }
+
+        mark_undo(index);
 
         if constexpr(has_version_member)
         {

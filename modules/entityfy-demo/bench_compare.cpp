@@ -175,23 +175,6 @@ void run_context_bench(const std::vector<std::string>& emails,
         );
         identity_ns = identity_hit.median_ns;
 
-        // Bulk load through the tracker: SELECT * plus attach per row.
-        entityfy::db_context loader{"sqlite://:memory:"};
-        loader.migrate<bench_user>();
-        auto loader_users = loader.set<bench_user>();
-        for(std::size_t index = 0; index < rows; ++index)
-        {
-            loader_users.add(bench_user{.email = emails[index], .name = names[index]});
-        }
-        loader.save_changes();
-
-        const auto load_started = clock_type::now();
-        const auto all_rows = loader_users.to_list();
-        const auto load_finished = clock_type::now();
-        load_ns = std::chrono::duration<double, std::nano>(load_finished - load_started).count() /
-                  static_cast<double>(rows);
-        g_sink += all_rows.size();
-
         // Dirty-column update: one changed field, one transaction per call.
         auto* first = users.find(1);
         if(first == nullptr)
@@ -254,6 +237,20 @@ void run_context_bench(const std::vector<std::string>& emails,
                   static_cast<double>(cold_rows);
     }
 
+    // Bulk load through the tracker from a context that tracks nothing yet,
+    // so every row really is materialized and attached (not a hash hit).
+    {
+        entityfy::db_context loader{"sqlite://bench_context.db"};
+        auto loader_users = loader.set<bench_user>();
+
+        const auto load_started = clock_type::now();
+        const auto all_rows = loader_users.to_list();
+        const auto load_finished = clock_type::now();
+        load_ns = std::chrono::duration<double, std::nano>(load_finished - load_started).count() /
+                  static_cast<double>(all_rows.size());
+        g_sink += all_rows.size();
+    }
+
     std::filesystem::remove(path);
 
     std::cout << "\n=== context layer benchmark (change tracking) ===\n";
@@ -266,8 +263,15 @@ void run_context_bench(const std::vector<std::string>& emails,
     std::cout << std::format("{:<34}{:>16.0f} ns\n", "find (database hit, cold)", cold_ns);
     std::cout << std::format("{:<34}{:>16.0f} ns/row\n", "to_list (load + track)", load_ns);
     std::cout << std::format("{:<34}{:>16.0f} ns\n", "save_changes (1 dirty row)", update_ns);
-    std::cout << "\nNote: cold find uses a file backed database (second connection); the\n"
-                 "      other context numbers are in-memory, like the core table above.\n";
+
+    if(load_ns > 0.0)
+    {
+        std::cout << std::format("\ncold find / to_list per row: {:.0f}x\n", cold_ns / load_ns);
+    }
+
+    std::cout << "\nNote: cold find and to_list use a file backed database and a fresh\n"
+                 "      context (real SELECT + materialize + attach); the other context\n"
+                 "      numbers are in-memory, like the core table above.\n";
 }
 
 void check_sqlite(int code, sqlite3* database, std::string_view what)

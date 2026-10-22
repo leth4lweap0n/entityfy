@@ -51,12 +51,16 @@
    instead of `vector<vector<sql_value>>`.
 3. **Dirty-column update** — because core keeps no snapshot, `table_client::update` writes all
    columns; partial UPDATE exists only in the context layer.
-4. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
+4. **Write tracking in the context** — `save_changes()` compares every tracked entity against its
+   snapshot, so a one-row update is O(tracked entities) even though the undo log already records
+   only what a save touches (see `docs/benchmarks.md`). Removing the remaining scan needs write
+   hooks: an explicit `mark_modified(entity)` API or proxy-style setters.
+5. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
    in practice covered by `entityfy::value_converter<T>` (a composite type is written to a single
    column), but owned types **split across** columns (as in EF, e.g. `address_city`) and a TPH
    discriminator do not exist yet.
-5. **Additional providers** — MySQL / SQL Server.
-6. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
+6. **Additional providers** — MySQL / SQL Server.
+7. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
    **from the live schema** (the DB → model direction exists); the reverse direction (model → DB)
    is covered by the `snapshot` + `apply` commands, with no separate generation command.
 

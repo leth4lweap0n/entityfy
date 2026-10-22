@@ -135,22 +135,36 @@ prepared statement on the server side shows up here as well.
 
 `entityfy_bench` also measures the context layer, i.e. the `db_set` / `db_context` path that the
 core numbers above do not cover. Inserts, lookups and updates run on an in-memory database so
-they are comparable with the core table; only the cold (not yet tracked) lookup needs a file
-backed database and a second connection.
+they are comparable with the core table. The cold lookup and the bulk load use a file backed
+database and a **fresh context that tracks nothing**, so both really run `SELECT` + materialize +
+attach instead of hitting the identity map.
 
 | Operation | Measured | Notes |
 |---|---|---|
-| `add` + `save_changes` (20.000 rows, one transaction) | 605.000 rows/s | typing + tracking + generated key write-back |
+| `add` + `save_changes` (20.000 rows, one transaction) | 604.000 rows/s | typing + tracking + generated key write-back |
 | `find` (identity map hit) | 14 ns | hash lookup, no SQL |
-| `find` (database hit, cold) | 33 µs | SELECT + materialization + attach |
-| `to_list` (load + track 20.000 rows) | 286 ns/row | 14x cheaper than a cold `find` per row |
-| `save_changes` with 1 dirty row | scales with the tracked set | 437 µs @2k, 1,83 ms @8k, 5,37 ms @20k |
+| `find` (database hit, cold) | 32 µs | SELECT + materialization + attach |
+| `to_list` (5.000 rows into a fresh context) | 460 ns/row | real load; the bench prints the measured ratio (70x cheaper per row than a cold `find`) |
+| `save_changes` with 1 dirty row | grows with the tracked set | 244 µs @2k, 983 µs @8k, 2,60 ms @20k |
 
-The last row is the honest limitation of snapshot based tracking: `SaveChanges()` compares every
-tracked entity against its snapshot to find modified rows, so a one-row update costs O(tracked
-entities). The same scan happens in EF Core's `ChangeTracker.DetectChanges()` unless proxies are
-used. The columns of the modified row are still the only ones written — the scan is CPU work, not
-extra SQL.
+A one-row update is O(tracked entities) for two independent reasons, and only one of them
+remains:
+
+1. **Snapshot comparison (remains).** `save_changes()` has to decide which entities changed, and
+   without write hooks the only way is comparing every tracked entity against its snapshot. Every
+   unchanged entity costs a field-by-field comparison (~130 ns each on this model). This is the
+   same work EF Core does in `ChangeTracker.DetectChanges()` unless proxies are used.
+2. **Pre-save backup (removed).** `begin_save()` used to deep-copy the whole tracked set so that a
+   failed save could restore it. That was a second, larger O(n) term with two string copies per
+   entity. It is now an undo log: `mark_undo(index)` stores the pre-save image only for items the
+   save actually touches, so an update of one row records one entry. The same change also moved
+   the column list to compile time (`update_members<T>()`) and defers the `UPDATE` string and bind
+   vector until a field really differs; together they cut the 20k measurement from 5,37 ms to
+   2,60 ms.
+
+The columns of the modified row are still the only ones written - the scan is CPU work, not extra
+SQL. Removing the remaining term needs write tracking (explicit `mark_modified()` or proxy
+setters), which is on the roadmap.
 
 ## Honest assessment
 
@@ -194,5 +208,9 @@ cmake --preset release && cmake --build --preset release
 ENTITYFY_PG_URI=postgresql://postgres:postgres@127.0.0.1:5432/entityfy_bench \
   ./build/release/bin/entityfy_bench 5000 3
 ```
+
+The benchmark creates its tables in the given database, so point `ENTITYFY_PG_URI` at a dedicated
+database (`entityfy_bench` above) - never at the database the migration tests assert on, otherwise
+their "schema matches snapshot" check sees the leftover `bench_users*` tables.
 
 Environment: Windows 10 x64, GCC 16.2, Release, SQLite 3.53.3, PostgreSQL 18.6.
