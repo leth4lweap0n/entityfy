@@ -8,7 +8,7 @@ entity".
 ## Declaring a context
 
 C++26 reflection cannot synthesize a member, so each entity set is declared once — exactly
-like EF Core requires `public DbSet<User> Users => Set<User>();`. Everything inside the set
+like EF Core requires `public DbSet<User> Users => set<User>();`. Everything inside the set
 (table name, columns, primary key, foreign keys) is derived from the model through reflection.
 
 ```cpp
@@ -40,8 +40,8 @@ struct app_context : entityfy::db_context
 {
     using entityfy::db_context::db_context;
 
-    entityfy::db_set<user> Users{*this};
-    entityfy::db_set<post> Posts{*this};
+    entityfy::db_set<user> users{*this};
+    entityfy::db_set<post> posts{*this};
 };
 ```
 
@@ -50,32 +50,32 @@ struct app_context : entityfy::db_context
 ```cpp
 app_context ctx{"sqlite://app.db"};
 
-ctx.MigrateAll();                 // both tables, parents first, order derived from reflection
+ctx.migrate_all();                 // both tables, parents first, order derived from reflection
 
-ctx.Users.Add(user{.email = "ada@example.com", .name = "Ada"});
-ctx.Users.Add(user{.email = "grace@example.com", .name = "Grace"});
+ctx.users.add(user{.email = "ada@example.com", .name = "Ada"});
+ctx.users.add(user{.email = "grace@example.com", .name = "Grace"});
 
-const auto result = ctx.SaveChanges();   // single transaction: inserted / updated / removed
+const auto result = ctx.save_changes();   // single transaction: inserted / updated / removed
 ```
 
-`SaveChanges()` runs in a single transaction; on error it rolls back and preserves the user's
+`save_changes()` runs in a single transaction; on error it rolls back and preserves the user's
 pending edits. Generated keys are written back to the entity.
 
 A context without declared members works too:
 
 ```cpp
 entityfy::db_context ctx{"sqlite://app.db"};
-auto users = ctx.Set<user>();      // same tracker, same identity map
-users.Add(user{.email = "ada@example.com"});
-ctx.SaveChanges();
+auto users = ctx.set<user>();      // same tracker, same identity map
+users.add(user{.email = "ada@example.com"});
+ctx.save_changes();
 ```
 
 ## Reflection inside the context
 
-`db_context::Model()` exposes what reflection derived for every entity type the context knows:
+`db_context::model()` exposes what reflection derived for every entity type the context knows:
 
 ```cpp
-for(const auto& model: ctx.Model())
+for(const auto& model: ctx.model())
 {
     std::cout << model.table << ": " << model.columns.size() << " columns\n";
     for(const auto& referenced: model.foreign_keys)
@@ -85,7 +85,7 @@ for(const auto& model: ctx.Model())
 }
 ```
 
-`MigrateAll()` uses the same metadata to create tables parents-first:
+`migrate_all()` uses the same metadata to create tables parents-first:
 
 - INSERT/UPDATE **parent-first** (even if the child set was opened first, the parent is written
   first).
@@ -95,40 +95,40 @@ for(const auto& model: ctx.Model())
 
 ## Change tracking
 
-- Snapshot-based: an `original` copy of each entity is kept, and `SaveChanges()` writes only the
+- Snapshot-based: an `original` copy of each entity is kept, and `save_changes()` writes only the
   changed columns (partial UPDATE).
-- State is read with `Users.State(entity)`: `unchanged`, `added`, `modified`, `removed`,
+- state is read with `users.state(entity)`: `unchanged`, `added`, `modified`, `removed`,
   `detached`.
-- `Users.Refresh(entity)` reloads the entity from the database.
-- `Users.Detach(entity)` removes it from tracking.
-- `ctx.Clear()` drops all tracking state (the connection stays open) — the context pool uses
+- `users.refresh(entity)` reloads the entity from the database.
+- `users.detach(entity)` removes it from tracking.
+- `ctx.clear()` drops all tracking state (the connection stays open) — the context pool uses
   this.
 
-`Add` / `Attach` / `Find` / `ToList` return references into the tracker. Those references stay
+`add` / `attach` / `find` / `to_list` return references into the tracker. Those references stay
 valid across other inserts and deletes until the entity itself is removed from tracking or
-`Clear()` runs.
+`clear()` runs.
 
 ## Queries and relations
 
 ```cpp
-auto selected = ctx.Users.Query()
-                       .Where(entityfy::where(&user::email).ends_with("@example.com"))
-                       .OrderBy(&user::name)
-                       .Take(10)
-                       .ToList();
+auto selected = ctx.users.query()
+                       .where(entityfy::where(&user::email).ends_with("@example.com"))
+                       .order_by(&user::name)
+                       .take(10)
+                       .to_list();
 
-auto joined = ctx.Users.Join<post>(&user::id, &post::user_id);                 // two tables
-auto three  = ctx.Posts.Join<user, comment>(&post::user_id, &user::id,
+auto joined = ctx.users.join<post>(&user::id, &post::user_id);                 // two tables
+auto three  = ctx.posts.join<user, comment>(&post::user_id, &user::id,
                                             &comment::post_id, &post::id);    // three tables
 
-auto children = ctx.Users.Include<post>({&ada, &grace});                      // 1:N, single query
-auto parents  = ctx.Posts.IncludeParent<user>({&post1, &post2});              // N:1
+auto children = ctx.users.include<post>({&ada, &grace});                      // 1:N, single query
+auto parents  = ctx.posts.include_parent<user>({&post1, &post2});              // N:1
 ```
 
-`Include`/`IncludeParent` read the foreign key from the `references` annotation — no member
+`include`/`include_parent` read the foreign key from the `references` annotation — no member
 pointer, no manual join condition. When the parent declares
-`[[= entityfy::ignore]] std::vector<Child*>`, `Include<Child>` fills it with the tracked children
-(changes made to the pointer collection are written by `SaveChanges()`); a `std::vector<Child>`
+`[[= entityfy::ignore]] std::vector<Child*>`, `include<Child>` fills it with the tracked children
+(changes made to the pointer collection are written by `save_changes()`); a `std::vector<Child>`
 member receives a read-only copy snapshot.
 
 `entityfy::where(...)` is the core-level predicate builder; it stays snake_case because it lives
@@ -137,30 +137,30 @@ in `entityfy-core`, next to the SQL generation it feeds.
 Bulk operations bypass the change tracker:
 
 ```cpp
-const auto removed = ctx.Posts.Query().Where(entityfy::where(&post::id) == 7).RemoveAll();
-const auto updated = ctx.Posts.Query().Assign(&post::score, 10).UpdateAll();
+const auto removed = ctx.posts.query().where(entityfy::where(&post::id) == 7).remove_all();
+const auto updated = ctx.posts.query().assign(&post::score, 10).update_all();
 ```
 
 ## Batch, retry, transaction
 
 ```cpp
-ctx.SetBatchParameterLimit(500);      // multi-row INSERT splitting
-ctx.SetRetryPolicy(entityfy::retry_policy{.attempts = 3, .delay = std::chrono::milliseconds{50}});
+ctx.set_batch_parameter_limit(500);      // multi-row INSERT splitting
+ctx.set_retry_policy(entityfy::retry_policy{.attempts = 3, .delay = std::chrono::milliseconds{50}});
 
-ctx.Transaction([&] {
-    ctx.Users.Add(user{.email = "tx@example.com", .name = "Tx"});
-    ctx.SaveChanges();                // nested savepoint
+ctx.transaction([&] {
+    ctx.users.add(user{.email = "tx@example.com", .name = "Tx"});
+    ctx.save_changes();                // nested savepoint
 });
 ```
 
 ## Asynchronous saving
 
 ```cpp
-auto pending = ctx.SaveChangesAsync();
+auto pending = ctx.save_changes_async();
 const auto result = pending.get();     // std::future<save_result>
 ```
 
-`SaveChangesAsync()` runs the same save work on a worker thread; saves are serialized by the
+`save_changes_async()` runs the same save work on a worker thread; saves are serialized by the
 mutex inside the context, so two concurrent saves cannot interleave.
 **Honest limit:** this is not I/O asynchrony — the SQLite and PostgreSQL drivers run
 synchronously; the gain is only in reducing how long the calling thread waits. The context cannot
@@ -172,11 +172,11 @@ be used from other threads while a save is in progress (the same rule as EF Core
 entityfy::db_context_pool pool{"sqlite://app.db", 8};
 
 {
-    auto lease = pool.Acquire();
-    lease->Migrate<user>();
-    auto users = lease->Set<user>();
-    users.Add(user{.email = "ada@example.com", .name = "Ada"});
-    lease->SaveChanges();
+    auto lease = pool.acquire();
+    lease->migrate<user>();
+    auto users = lease->set<user>();
+    users.add(user{.email = "ada@example.com", .name = "Ada"});
+    lease->save_changes();
 }   // lease released: change tracker cleared, context returns to the pool
 ```
 
@@ -185,8 +185,9 @@ cleared; the logger, retry policy, and batch limit are kept.
 
 ## Naming
 
-The context module mirrors Entity Framework Core: `db_context` / `db_set<T>` (the
-`DbContext` / `DbSet<T>` equivalents) with PascalCase members (`SaveChanges`, `Add`, `Find`,
-`Include`, `Query`). `entityfy-core` keeps its own snake_case SQL/mapping surface
-(`client`, `table_client`, `describe_model`, `entityfy::where`); the context layer is built on
-top of it and `Database()` is the escape hatch to it.
+The context module mirrors Entity Framework Core's *shape* — `db_context` / `db_set<T>` (the
+`DbContext` / `DbSet<T>` equivalents) — but keeps the library's single convention: everything is
+snake_case, types and members alike (`save_changes`, `add`, `find`, `include`, `query`,
+`migrate_all`). `entityfy-core` uses the same convention (`client`, `table_client`,
+`describe_model`, `entityfy::where`); the context layer is built on top of it and `database()` is
+the escape hatch to it.

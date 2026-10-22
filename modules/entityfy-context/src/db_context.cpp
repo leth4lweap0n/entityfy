@@ -34,13 +34,13 @@ bool is_transient(const std::exception& error)
 
 } // namespace
 
-save_result db_context::SaveChanges()
+save_result db_context::save_changes()
 {
     const std::lock_guard lock{save_mutex_};
     return save_changes_with_retry();
 }
 
-std::future<save_result> db_context::SaveChangesAsync()
+std::future<save_result> db_context::save_changes_async()
 {
     return std::async(std::launch::async, [this] {
         const std::lock_guard lock{save_mutex_};
@@ -72,13 +72,13 @@ save_result db_context::save_changes_with_retry()
     }
 }
 
-void db_context::Clear()
+void db_context::clear()
 {
     order_.clear();
     states_.clear();
 }
 
-void db_context::MigrateAll()
+void db_context::migrate_all()
 {
     // Parents first: a table can only be created after every table it
     // references exists.

@@ -75,8 +75,8 @@ struct retry_policy
 //     };
 //
 //     app_context ctx{"sqlite://app.db"};
-//     ctx.Users.Add(user{.email = "ada@example.com"});
-//     ctx.SaveChanges();
+//     ctx.Users.add(user{.email = "ada@example.com"});
+//     ctx.save_changes();
 template <typename T>
 class db_set;
 
@@ -114,7 +114,7 @@ public:
     {
         if(database_.target_dialect() == entityfy::dialect::sqlite)
         {
-            ExecuteRaw("PRAGMA foreign_keys = ON");
+            execute("PRAGMA foreign_keys = ON");
         }
     }
 
@@ -124,119 +124,119 @@ public:
     // Generic accessor for a tracked entity set. Typed sets declared as
     // context members are the preferred form.
     template <typename T>
-    [[nodiscard]] db_set<T> Set();
+    [[nodiscard]] db_set<T> set();
 
     // Metadata of every entity type this context knows about. The list is
     // filled through reflection when a set is first used.
-    [[nodiscard]] const std::vector<model_info>& Model() const noexcept
+    [[nodiscard]] const std::vector<model_info>& model() const noexcept
     {
         return models_;
     }
 
     // Creates the tables of every known entity type, parents first. The order
     // is derived from the foreign key graph, so it needs no manual listing.
-    void MigrateAll();
+    void migrate_all();
 
     // Applies all tracked changes inside a single transaction.
-    save_result SaveChanges();
+    save_result save_changes();
 
     // Runs the same operation on a worker thread. Saves are serialized by
     // an internal mutex; the context cannot be used concurrently from
     // other threads (same rule as EF Core).
-    [[nodiscard]] std::future<save_result> SaveChangesAsync();
+    [[nodiscard]] std::future<save_result> save_changes_async();
 
     // Drops the tracked entities and the identity map; the DB connection is kept.
-    void Clear();
+    void clear();
 
     // Tracks an entity in the set that belongs to its type.
     template <typename T>
-    T& Add(T entity)
+    T& add(T entity)
     {
-        return Set<T>().Add(std::move(entity));
+        return set<T>().add(std::move(entity));
     }
 
     // Marks a tracked entity as removed.
     template <typename T>
-    void Remove(const T& entity)
+    void remove(const T& entity)
     {
-        Set<T>().Remove(entity);
+        set<T>().remove(entity);
     }
 
     template <typename T>
-    void Migrate()
+    void migrate()
     {
         database_.template table<T>().migrate();
     }
 
     template <typename T>
-    void MigrateForce()
+    void migrate_force()
     {
         database_.template table<T>().migrate_force();
     }
 
     template <typename T>
-    void ResetSchema()
+    void reset_schema()
     {
         database_.template table<T>().reset_schema();
     }
 
-    [[nodiscard]] std::uint64_t ExecuteRaw(std::string_view sql)
+    [[nodiscard]] std::uint64_t execute(std::string_view sql)
     {
-        return ExecuteRaw(sql, {});
+        return execute(sql, {});
     }
 
-    [[nodiscard]] std::uint64_t ExecuteRaw(std::string_view sql, const std::vector<entityfy::sql_value>& binds)
+    [[nodiscard]] std::uint64_t execute(std::string_view sql, const std::vector<entityfy::sql_value>& binds)
     {
-        Log(sql);
+        log(sql);
         return database_.execute(entityfy::statement{.sql = std::string{sql}, .binds = binds}).rows_affected;
     }
 
-    [[nodiscard]] std::vector<std::vector<entityfy::sql_value>> QueryRaw(std::string_view sql)
+    [[nodiscard]] std::vector<std::vector<entityfy::sql_value>> query(std::string_view sql)
     {
-        return QueryRaw(sql, {});
+        return query(sql, {});
     }
 
-    [[nodiscard]] std::vector<std::vector<entityfy::sql_value>> QueryRaw(
+    [[nodiscard]] std::vector<std::vector<entityfy::sql_value>> query(
         std::string_view sql,
         const std::vector<entityfy::sql_value>& binds)
     {
-        Log(sql);
+        log(sql);
         return database_.query(entityfy::statement{.sql = std::string{sql}, .binds = binds});
     }
 
     // Escape hatch to the lower level client API.
-    [[nodiscard]] entityfy::client& Database() noexcept
+    [[nodiscard]] entityfy::client& database() noexcept
     {
         return database_;
     }
 
     template <typename Function>
-    decltype(auto) Transaction(Function&& function)
+    decltype(auto) transaction(Function&& function)
     {
         return database_.transaction(std::forward<Function>(function));
     }
 
-    void SetLogger(std::function<void(std::string_view)> logger)
+    void set_logger(std::function<void(std::string_view)> logger)
     {
         logger_ = std::move(logger);
     }
 
-    void SetRetryPolicy(retry_policy value)
+    void set_retry_policy(retry_policy value)
     {
         retry_ = value;
     }
 
-    void SetBatchParameterLimit(std::size_t value)
+    void set_batch_parameter_limit(std::size_t value)
     {
         batch_parameter_limit_ = value == 0 ? 1 : value;
     }
 
-    [[nodiscard]] std::size_t BatchParameterLimit() const noexcept
+    [[nodiscard]] std::size_t batch_parameter_limit() const noexcept
     {
         return batch_parameter_limit_;
     }
 
-    void Log(std::string_view sql) const
+    void log(std::string_view sql) const
     {
         if(logger_)
         {

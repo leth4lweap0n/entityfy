@@ -92,7 +92,7 @@ public:
     db_context_pool(const db_context_pool&) = delete;
     db_context_pool& operator=(const db_context_pool&) = delete;
 
-    [[nodiscard]] lease Acquire()
+    [[nodiscard]] lease acquire()
     {
         std::unique_lock lock{mutex_};
 
@@ -113,13 +113,13 @@ public:
         return lease{this, std::move(created)};
     }
 
-    [[nodiscard]] std::size_t IdleCount() const
+    [[nodiscard]] std::size_t idle_count() const
     {
         std::unique_lock lock{mutex_};
         return idle_.size();
     }
 
-    [[nodiscard]] std::size_t CreatedCount() const
+    [[nodiscard]] std::size_t created_count() const
     {
         std::unique_lock lock{mutex_};
         return created_;
@@ -133,7 +133,7 @@ private:
             return;
         }
 
-        context->Clear();
+        context->clear();
 
         std::unique_lock lock{mutex_};
         idle_.push_back(std::move(context));
