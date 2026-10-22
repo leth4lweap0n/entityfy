@@ -145,23 +145,24 @@ attach instead of hitting the identity map.
 | `find` (identity map hit) | 14 ns | hash lookup, no SQL |
 | `find` (database hit, cold) | 32 µs | SELECT + materialization + attach |
 | `to_list` (5.000 rows into a fresh context) | 460 ns/row | real load + attach; the bench prints the measured ratio (71x cheaper per row than a cold `find`, 63-71x across runs) |
-| `to_list` (same rows, `as_no_tracking()`) | 332 ns/row | materialize only: no snapshot, no identity map entry - tracking costs **1,39x** per loaded row |
-| `save_changes` with 1 dirty row | grows with the tracked set | 244 µs @2k, 973 µs @8k, 2,62-2,89 ms @20k |
-| `save_changes` **per tracked entity** | 141 ns | the snapshot scan, divided by the tracked set (20k) |
+| `to_list` (same rows, `as_no_tracking()`) | 332 ns/row | materialize only: no snapshot, no identity map entry - tracking costs **1,39-1,52x** per loaded row |
+| `save_changes` with 1 dirty row | grows with the tracked set | 244 µs @2k, 973 µs @8k, 2,62-2,88 ms @20k |
+| `save_changes` **per tracked entity** | 141 ns | the snapshot scan, divided by the tracked set (20k); 141-144 ns across runs |
 
 Every number is a median over `repetitions`; the cold lookup and both bulk loads open a **fresh
 context per repetition**, so the ratios compare measured medians rather than single runs.
-Repeating the whole run moves the absolute values with machine load: three consecutive
-`20000 5` runs gave 576.000-606.000 rows/s, 457-521 ns/row for the tracked bulk load, 330-332 ns/row
-without tracking and 2,62-2,89 ms for the one-row save. The printed ratios stayed between 63x and
-71x (cold find / tracked load) and 1,38-1,39x (tracked / no-tracking).
+Repeating the whole run moves the absolute values with machine load. Five `20000 5` runs gave
+576.000-606.000 rows/s for the insert, 457-482 ns/row for the tracked bulk load, 316-335 ns/row
+without tracking (the last three runs, the only ones that measured it) and 2,62-2,88 ms for the
+one-row save - 141-144 ns per tracked entity. The printed ratios stayed between 63x and 71x
+(cold find / tracked load) and 1,39-1,52x (tracked / no-tracking).
 
 A one-row update is O(tracked entities) for two independent reasons, and only one of them
 remains:
 
 1. **Snapshot comparison (remains).** `save_changes()` has to decide which entities changed, and
    without write hooks the only way is comparing every tracked entity against its snapshot. Every
-   unchanged entity costs a field-by-field comparison (~130 ns each on this model). This is the
+   unchanged entity costs a field-by-field comparison (141-144 ns each on this model). This is the
    same work EF Core does in `ChangeTracker.DetectChanges()` unless proxies are used.
 2. **Pre-save backup (removed).** `begin_save()` used to deep-copy the whole tracked set so that a
    failed save could restore it. That was a second, larger O(n) term with two string copies per
