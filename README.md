@@ -63,17 +63,32 @@ int main()
 }
 ```
 
-Applications that need change tracking use the `entityfy-context` module:
+Applications that need change tracking use the `entityfy-context` module, which mirrors Entity
+Framework Core:
 
 ```cpp
-entityfy::context ctx{"sqlite://app.db"};
-ctx.migrate<user>();
+struct app_context : entityfy::db_context
+{
+    using entityfy::db_context::db_context;
 
-auto users = ctx.set<user>();
-auto& ada = users.add(user{.email = "ada@example.com", .name = "Ada"});
+    entityfy::db_set<user> Users{*this};
+    entityfy::db_set<post> Posts{*this};
+};
 
-ctx.save_changes();   // single transaction, INSERT + write-back of the generated id
+app_context ctx{"sqlite://app.db"};
+ctx.MigrateAll();                             // tables in foreign key order, derived by reflection
+
+ctx.Users.Add(user{.email = "ada@example.com", .name = "Ada"});
+ctx.Users.Add(post{.user_id = 1, .title = "first"});
+
+const auto result = ctx.SaveChanges();        // single transaction, generated ids written back
+
+auto* ada = ctx.Users.Find(1);
+const auto posts = ctx.Users.Include<post>({ada});   // foreign key read from the annotation
 ```
+
+The `DbSet` member is the only thing that has to be declared: its table, columns, primary key and
+relationships all come from the annotations through reflection.
 
 ## Modules
 
@@ -101,19 +116,24 @@ ctx.save_changes();   // single transaction, INSERT + write-back of the generate
 
 ## entityfy-context
 
-- Identity map and snapshot-based change tracking; `save_changes()` writes only the changed
+- EF Core style surface: `db_context` / `db_set<T>` with `SaveChanges()`, `Add()`, `Find()`,
+  `Query()`, `Include()`, `IncludeParent()`, `Remove()`, `Attach()`.
+- Reflection driven: a declared `db_set<T>` supplies its table, columns, primary key and foreign
+  keys; `Model()` exposes the derived metadata and `MigrateAll()` creates the tables parents-first.
+- Identity map and snapshot-based change tracking; `SaveChanges()` writes only the changed
   columns.
-- Control over tracking through `state(entity)`, `refresh`, `detach`, `clear`.
+- Control over tracking through `State(entity)`, `Refresh`, `Detach`, `Clear`.
 - **FK dependency order**: insert/update parent-first, delete child-first. In tables using
   `ON DELETE RESTRICT`, a parent and its child can be deleted in the same save.
-- Eager loading: `include<child>` (1:N), `include_parent<parent>` (N:1), two- and three-table
-  joins.
+- Eager loading: `Include<child>` (1:N), `IncludeParent<parent>` (N:1), two- and three-table
+  joins. The foreign key is read from the `references` annotation, so no member pointer or join
+  condition is passed.
 - Navigation fixup: the parent's `std::vector<Child*>` member is filled with the tracked
   children.
-- Bulk operations: `remove_all()`, `assign(...).update_all()`.
-- `context_pool`: lease-based context reuse; when the lease is released the change tracker is
+- Bulk operations: `Query().RemoveAll()`, `Query().Assign(...).UpdateAll()`.
+- `db_context_pool`: lease-based context reuse; when the lease is released the change tracker is
   cleared.
-- `save_changes_async()`: moves saving to a worker thread; saves are serialized by a mutex inside
+- `SaveChangesAsync()`: moves saving to a worker thread; saves are serialized by a mutex inside
   the context. This is not I/O asynchrony; the drivers run synchronously.
 
 ## entityfy-migrate
@@ -140,7 +160,7 @@ entityfy_migrate rename-table <old> --to <new>   # renames the table in place
 
 ```mermaid
 flowchart TD
-    start["save_changes()"] --> order["sort entity sets by the FK graph"]
+    start["SaveChanges()"] --> order["sort entity sets by the FK graph"]
     order --> del["DELETE phase<br/>child → parent"]
     del --> write["INSERT / UPDATE phase<br/>parent → child"]
     write --> commit["single transaction<br/>error → rollback"]
@@ -240,7 +260,7 @@ through `sl3`, and there is no second copy of SQLite.
 
 - The PostgreSQL backend does not use a prepared statement cache; `taocpp::pq` does not expose
   `PQexecPrepared`. An adapter moving to raw libpq is required.
-- `save_changes_async()` is a thread offload, not I/O asynchrony.
+- `SaveChangesAsync()` is a thread offload, not I/O asynchrony.
 - The core does not perform dirty-column updates; partial UPDATE lives in the context layer.
 - Column-split owned types and TPH inheritance are not supported. Composite/JSON values are
   stored through `value_converter`.

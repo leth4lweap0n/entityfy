@@ -41,9 +41,9 @@ The entire library is consolidated under a single root namespace: `entityfy`.
   language feature), so it would easily collide with other class/namespace names.
 - `entityfy::migrate` holds the types belonging to the migration module; it does not collide with
   core.
-- The context module exposes the `entityfy::context` class and the `entityfy::entity_set<T>`
+- The context module exposes the `entityfy::db_context` class and the `entityfy::db_set<T>`
   type. To avoid a name collision with core's `entityfy::query_builder<Model>`, the context
-  query builder is named `entityfy::entity_query_builder<Model>`.
+  query builder is named `entityfy::db_query_builder<Model>`.
 
 ## Dependency management
 
@@ -89,4 +89,4 @@ Measured effect: [docs/benchmarks.md](benchmarks.md).
 - The PostgreSQL backend does not use a statement cache (libpq prepared statement reuse is not
   exposed through taocpp). The API exists to keep it portable; capacity reports 0.
 - The migration module uses its own providers; there is no statement cache there.
-- There is no async/coroutine API; `context_pool` provides connection and context reuse.
+- There is no async/coroutine API; `db_context_pool` provides connection and context reuse.
