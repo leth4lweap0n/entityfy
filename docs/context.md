@@ -8,7 +8,7 @@ entity".
 ## Declaring a context
 
 C++26 reflection cannot synthesize a member, so each entity set is declared once — exactly
-like EF Core requires `public DbSet<User> Users => set<User>();`. Everything inside the set
+like EF Core requires `public DbSet<User> Users => Set<User>();`. Everything inside the set
 (table name, columns, primary key, foreign keys) is derived from the model through reflection.
 
 ```cpp

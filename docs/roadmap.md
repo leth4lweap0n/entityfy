@@ -68,5 +68,5 @@
 - The migration module uses its own providers; there is no statement cache there.
 - `save_changes_async()` is a thread offload, not I/O asynchrony (the drivers are synchronous).
 - The `db_set<T>` members of a context must be declared by hand: C++26 reflection can inspect
-  members but cannot synthesize them, so `ctx.Users` cannot be generated from the entity type
+  members but cannot synthesize them, so `ctx.users` cannot be generated from the entity type
   alone.

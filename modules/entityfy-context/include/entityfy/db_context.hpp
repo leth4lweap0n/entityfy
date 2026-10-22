@@ -64,18 +64,18 @@ struct retry_policy
     std::chrono::milliseconds delay{50};
 };
 
-// EF Core parity: a context owns one DbSet per entity type. The set itself is
+// EF Core parity: a context owns one db_set per entity type. The set itself is
 // a lazy handle, so it can be declared as a member of a user defined context:
 //
 //     struct app_context : entityfy::db_context
 //     {
 //         using entityfy::db_context::db_context;
-//         entityfy::db_set<user> Users{*this};
-//         entityfy::db_set<post> Posts{*this};
+//         entityfy::db_set<user> users{*this};
+//         entityfy::db_set<post> posts{*this};
 //     };
 //
 //     app_context ctx{"sqlite://app.db"};
-//     ctx.Users.add(user{.email = "ada@example.com"});
+//     ctx.users.add(user{.email = "ada@example.com"});
 //     ctx.save_changes();
 template <typename T>
 class db_set;

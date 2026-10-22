@@ -878,16 +878,17 @@ save_result set_state<T>::save(db_context& owner)
 template <typename T>
 class db_query_builder;
 
-// The DbSet equivalent: a typed handle over one entity type. It is a lazy
-// view, so it can be declared as a member of a user defined context:
+// The db_set equivalent of EF Core's DbSet: a typed handle over one entity
+// type. It is a lazy view, so it can be declared as a member of a user
+// defined context:
 //
 //     struct app_context : entityfy::db_context
 //     {
 //         using entityfy::db_context::db_context;
-//         entityfy::db_set<user> Users{*this};
+//         entityfy::db_set<user> users{*this};
 //     };
 //
-//     ctx.Users.add(user{...});
+//     ctx.users.add(user{...});
 //     ctx.save_changes();
 //
 // The set resolves its table, columns, primary key and relations through
