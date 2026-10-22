@@ -331,6 +331,39 @@ cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release \
 Options: `ENTITYFY_ENABLE_SQLITE`, `ENTITYFY_ENABLE_POSTGRESQL`, `ENTITYFY_BUILD_TESTS`,
 `ENTITYFY_BUILD_EXAMPLES`, `ENTITYFY_BUILD_DEMO`.
 
+### Using it in your project
+
+There is no `install()`/`find_package()` export yet, so consume the sources as a subdirectory.
+This is the exact setup that was built and run while writing this section:
+
+```cmake
+cmake_minimum_required(VERSION 3.30)
+project(app CXX)
+
+set(ENTITYFY_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ENTITYFY_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ENTITYFY_BUILD_DEMO OFF CACHE BOOL "" FORCE)
+set(ENTITYFY_ENABLE_POSTGRESQL OFF CACHE BOOL "" FORCE)   # omit to keep the PG backend
+
+add_subdirectory(path/to/entityfy entityfy)
+
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE entityfy::core)          # or entityfy::db_context, entityfy::migrate
+```
+
+`add_subdirectory` and `FetchContent_MakeAvailable` both work; the dependencies (`sl3`,
+`taocpp::pq`, `spdlog`, `Catch2`, `nlohmann_json`) are fetched during the first configure, so that
+step needs network access. The `-freflection` flag and the C++26 standard level travel with the
+`entityfy::core` interface, so the consumer does not set them.
+
+Per-target use:
+
+| Target | Brings |
+|---|---|
+| `entityfy::core` | models, SQL, DDL, query DSL, backends |
+| `entityfy::db_context` | the EF Core style context (depends on core) |
+| `entityfy::migrate` | snapshot/diff/apply, script, scaffold (depends on core) |
+
 ## Repository layout
 
 ```
@@ -360,6 +393,8 @@ through `sl3`, and there is no second copy of SQLite.
 - There are no MySQL or SQL Server providers.
 - Row reading is costly through `vector<vector<sql_value>>`; single-row reads need a separate
   path.
+- No `install()` / `find_package()` export yet: consume the project with `add_subdirectory` or
+  `FetchContent`.
 
 Roadmap: [docs/roadmap.md](docs/roadmap.md).
 
