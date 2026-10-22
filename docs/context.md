@@ -97,6 +97,12 @@ for(const auto& model: ctx.model())
 
 - Snapshot-based: an `original` copy of each entity is kept, and `save_changes()` writes only the
   changed columns (partial UPDATE).
+- `to_list()`, `find()`, `first()` and `include()` return pointers into the tracker: those rows
+  are materialized *and* attached, so they pay for the `original` copy and the identity map entry.
+- `query().select(&T::a, &T::b)` is the untracked read path: it returns
+  `std::vector<std::tuple<...>>` of values and never touches the tracker (the equivalent of EF
+  Core's `Select(x => new { ... })`). It also never registers an entity, so values read this way
+  cannot be modified and saved.
 - state is read with `users.state(entity)`: `unchanged`, `added`, `modified`, `removed`,
   `detached`.
 - `users.refresh(entity)` reloads the entity from the database.

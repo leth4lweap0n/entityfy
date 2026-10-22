@@ -55,12 +55,16 @@
    snapshot, so a one-row update is O(tracked entities) even though the undo log already records
    only what a save touches (see `docs/benchmarks.md`). Removing the remaining scan needs write
    hooks: an explicit `mark_modified(entity)` API or proxy-style setters.
-5. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
+5. **No-tracking full-entity reads** — `query().select(...)` already returns untracked tuples
+   (the `Select(new {...})` equivalent), but a full entity always goes through the tracker.
+   `ctx.users.as_no_tracking().to_list()` should return `std::vector<T>` by value (materialize,
+   skip attach and skip the snapshot), which also removes the pointer-lifetime caveat.
+6. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
    in practice covered by `entityfy::value_converter<T>` (a composite type is written to a single
    column), but owned types **split across** columns (as in EF, e.g. `address_city`) and a TPH
    discriminator do not exist yet.
-6. **Additional providers** — MySQL / SQL Server.
-7. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
+7. **Additional providers** — MySQL / SQL Server.
+8. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
    **from the live schema** (the DB → model direction exists); the reverse direction (model → DB)
    is covered by the `snapshot` + `apply` commands, with no separate generation command.
 

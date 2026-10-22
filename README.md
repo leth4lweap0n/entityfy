@@ -36,8 +36,11 @@ flowchart LR
 
 ## Quick start
 
+The default entry point mirrors Entity Framework Core: a `db_context` holds `db_set<T>` members,
+tracks the changes made to the entities it hands out, and saves them in one transaction.
+
 ```cpp
-#include <entityfy/entityfy.hpp>
+#include <entityfy/db_context.hpp>
 
 struct [[= entityfy::table{"users"}]] user
 {
@@ -51,22 +54,18 @@ struct [[= entityfy::table{"users"}]] user
     std::string name;
 };
 
-int main()
+struct [[= entityfy::table{"posts"}]] post
 {
-    entityfy::client db{"sqlite://app.db"};
-    db.migrate<user>();
+    [[= entityfy::id, = entityfy::auto_increment]]
+    std::int64_t id = 0;
 
-    db.insert(user{.email = "ada@example.com", .name = "Ada"});
+    [[= entityfy::references{"users", "id", "CASCADE"}]]   // foreign key
+    std::int64_t user_id = 0;
 
-    const auto found = db.find_one(entityfy::where(&user::email).eq("ada@example.com"));
-    return found ? 0 : 1;
-}
-```
+    [[= entityfy::not_null, = entityfy::varchar{200}]]
+    std::string title;
+};
 
-Applications that need change tracking use the `entityfy-context` module, which mirrors Entity
-Framework Core:
-
-```cpp
 struct app_context : entityfy::db_context
 {
     using entityfy::db_context::db_context;
@@ -79,16 +78,56 @@ app_context ctx{"sqlite://app.db"};
 ctx.migrate_all();                             // tables in foreign key order, derived by reflection
 
 ctx.users.add(user{.email = "ada@example.com", .name = "Ada"});
-ctx.users.add(post{.user_id = 1, .title = "first"});
+ctx.posts.add(post{.user_id = 1, .title = "first"});
 
 const auto result = ctx.save_changes();        // single transaction, generated ids written back
 
 auto* ada = ctx.users.find(1);
+ada->name = "Ada Lovelace";                    // tracked: the next save_changes() writes it
 const auto posts = ctx.users.include<post>({ada});   // foreign key read from the annotation
 ```
 
-The `DbSet` member is the only thing that has to be declared: its table, columns, primary key and
+The `db_set` member is the only thing that has to be declared: its table, columns, primary key and
 relationships all come from the annotations through reflection.
+
+### Reading without tracking
+
+`query().select(...)` returns plain tuples and never enters the identity map, so reports pay no
+tracking cost - the equivalent of EF Core's `Select(x => new { ... })`:
+
+```cpp
+for(const auto& [email, name]: ctx.users.query()
+                                   .where(entityfy::where(&user::name).eq("Ada Lovelace"))
+                                   .select(&user::email, &user::name))
+{
+    std::cout << email << ": " << name << '\n';
+}
+```
+
+### When not to open a context
+
+`entityfy::client` is the layer the context itself is built on: statements, the query DSL and the
+DDL, with no unit of work around them. Reach for it when nothing has to be tracked:
+
+- bulk work and `insert_many` (one statement per batch, no per-row snapshot),
+- full-entity reads that will not be updated - no `original` copy and no identity map entry per
+  row (measured: the context spends 457-480 ns per loaded row, see
+  [docs/benchmarks.md](docs/benchmarks.md)),
+- one-shot tools and CLIs that should not construct a context at all.
+
+```cpp
+#include <entityfy/entityfy.hpp>
+
+entityfy::client db{"sqlite://app.db"};
+db.migrate<user>();
+
+db.insert(user{.email = "ada@example.com", .name = "Ada"});
+
+const auto found = db.find_one<user>(entityfy::where(&user::email).eq("ada@example.com"));
+```
+
+The context is a consumer of this layer, not a replacement: `db_set` builds its SQL and runs it
+through `client::execute` / `client::query`.
 
 ## Modules
 
