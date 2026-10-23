@@ -38,7 +38,7 @@ if(ENTITYFY_ENABLE_SQLITE)
 endif()
 
 if(ENTITYFY_ENABLE_POSTGRESQL)
-    target_link_libraries(entityfy_core PRIVATE taocpp::taopq)
+    target_link_libraries(entityfy_core PRIVATE PostgreSQL::PostgreSQL)
     target_compile_definitions(entityfy_core PUBLIC ENTITYFY_ENABLE_POSTGRESQL)
 endif()
 

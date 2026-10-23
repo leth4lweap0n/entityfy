@@ -26,21 +26,11 @@ if(ENTITYFY_ENABLE_SQLITE)
     add_library(entityfy::sqlite ALIAS entityfy_sqlite)
 endif()
 
-# --- PostgreSQL (header only, used by the core backend) --------------------
+# --- PostgreSQL (libpq, used by the core backend) --------------------------
 if(ENTITYFY_ENABLE_POSTGRESQL)
     find_package(PostgreSQL QUIET)
 
-    if(PostgreSQL_FOUND)
-        FetchContent_Declare(
-            taocpp-taopq
-            GIT_REPOSITORY https://github.com/taocpp/taopq.git
-            GIT_TAG main
-            GIT_SHALLOW TRUE
-            EXCLUDE_FROM_ALL
-            SYSTEM
-        )
-        FetchContent_MakeAvailable(taocpp-taopq)
-    else()
+    if(NOT PostgreSQL_FOUND)
         message(STATUS
             "PostgreSQL client library not found: the PostgreSQL backend stays disabled. "
             "Set PostgreSQL_ROOT, or PostgreSQL_INCLUDE_DIR and PostgreSQL_LIBRARY, to enable it.")
