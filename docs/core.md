@@ -146,6 +146,7 @@ db.migrate_tph<animal, cat, dog>();      // one table with the union of the colu
 entityfy::client db{"sqlite://app.db"};                  // SQLite
 entityfy::client db{"postgres://host=... dbname=app"};  // PostgreSQL
 entityfy::client db{"mysql://user:pass@host:3306/app"}; // MySQL / MariaDB (opt-in at build time)
+entityfy::client db{"sqlserver://sa:pass@host:1433/app"}; // SQL Server via ODBC (opt-in)
 
 db.migrate<user>();          // creates the table + indexes (idempotent)
 db.migrate_force<user>();    // forces past a schema validation error
@@ -284,7 +285,8 @@ db.clear_statement_cache();
 ```
 
 SQLite reuses compiled statements, PostgreSQL keeps a bounded cache of named server side
-`PREPARE` plans, and MySQL reports capacity 0 (the client prepares each statement itself). Details
+`PREPARE` plans, and MySQL/SQL Server report capacity 0 (their clients prepare each statement
+themselves). Details
 and measurements: [benchmarks.md](benchmarks.md).
 
 ## Errors

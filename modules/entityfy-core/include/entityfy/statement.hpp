@@ -77,14 +77,70 @@ inline std::string excluded_column_reference(const column_descriptor& column)
     return "excluded." + quote_identifier(column.name);
 }
 
+// T-SQL returns generated keys with OUTPUT INSERTED.<key>, placed after the
+// column list and before VALUES.
 template <typename Model>
-inline void append_query_tail(std::string& sql, std::vector<sql_value>& binds, query_options<Model> options, bool include_ordering = true)
+inline void append_output_inserted_id(std::string& sql, const model_descriptor<Model>& model)
+{
+    if(model.target != dialect::sqlserver)
+    {
+        return;
+    }
+
+    for(const auto& descriptor: model.columns)
+    {
+        if(descriptor.flags.primary_key && descriptor.flags.auto_increment)
+        {
+            sql.append(" OUTPUT INSERTED.");
+            sql.append(quote_identifier(descriptor.name));
+            return;
+        }
+    }
+}
+
+template <typename Model>
+inline void append_query_tail(std::string& sql,
+                              std::vector<sql_value>& binds,
+                              query_options<Model> options,
+                              dialect target = dialect::sqlite,
+                              bool include_ordering = true)
 {
     if(!options.filter.empty())
     {
         sql.append(" WHERE ");
         sql.append(options.filter.sql);
         std::ranges::move(options.filter.binds, std::back_inserter(binds));
+    }
+
+    if(target == dialect::sqlserver)
+    {
+        // OFFSET/FETCH needs an ORDER BY; fall back to a constant ordering.
+        if(!options.limit && !options.offset)
+        {
+            return;
+        }
+
+        if(!include_ordering || options.orderings.empty())
+        {
+            sql.append(" ORDER BY (SELECT NULL)");
+        }
+        else
+        {
+            append_orderings(sql, options.orderings);
+        }
+
+        sql.append(" OFFSET ");
+        sql.append(std::to_string(options.offset.value_or(0)));
+        sql.append(" ROWS");
+
+        if(options.limit)
+        {
+            sql.append(" FETCH NEXT ");
+            sql.append(std::to_string(*options.limit));
+            sql.append(" ROWS ONLY");
+        }
+
+        return;
     }
 
     if(include_ordering)
@@ -128,6 +184,11 @@ inline std::string column_definition(const column_descriptor& column, dialect ta
             output.append(" AUTO_INCREMENT");
         }
 
+        if(column.flags.auto_increment && target == dialect::sqlserver)
+        {
+            output.append(" IDENTITY(1,1)");
+        }
+
         if(column.flags.primary_key)
         {
             output.append(" PRIMARY KEY");
@@ -160,16 +221,22 @@ inline std::string column_definition(const column_descriptor& column, dialect ta
         output.append(quote_identifier(column.reference.column));
         output.push_back(')');
 
+        const auto action = [&](const std::string& value) -> const std::string& {
+            static const std::string no_action{"NO ACTION"};
+            // T-SQL has no RESTRICT keyword; NO ACTION means the same thing.
+            return target == dialect::sqlserver && value == "RESTRICT" ? no_action : value;
+        };
+
         if(!column.reference.on_delete.empty())
         {
             output.append(" ON DELETE ");
-            output.append(column.reference.on_delete);
+            output.append(action(column.reference.on_delete));
         }
 
         if(!column.reference.on_update.empty())
         {
             output.append(" ON UPDATE ");
-            output.append(column.reference.on_update);
+            output.append(action(column.reference.on_update));
         }
     }
 
@@ -207,7 +274,19 @@ template <typename Model>
 [[nodiscard]] statement create_table(const model_descriptor<Model>& model)
 {
     statement output;
-    output.sql = "CREATE TABLE IF NOT EXISTS ";
+
+    if(model.target == dialect::sqlserver)
+    {
+        // T-SQL has no CREATE TABLE IF NOT EXISTS.
+        output.sql = "IF OBJECT_ID(N'";
+        output.sql.append(detail::quote_identifier(model.table_name));
+        output.sql.append("', N'U') IS NULL CREATE TABLE ");
+    }
+    else
+    {
+        output.sql = "CREATE TABLE IF NOT EXISTS ";
+    }
+
     output.sql.append(detail::quote_identifier(model.table_name));
     output.sql.append(" (");
 
@@ -276,10 +355,10 @@ template <typename Model>
         }
 
         statement index;
-        if(model.target == dialect::mysql)
+        if(model.target == dialect::mysql || model.target == dialect::sqlserver)
         {
-            // MySQL has no IF NOT EXISTS for indexes; migrate_tph() skips the
-            // ones that already exist.
+            // Neither MySQL nor SQL Server accepts IF NOT EXISTS on CREATE
+            // INDEX; migrate_tph() skips the ones that already exist.
             index.sql = column.flags.unique ? "CREATE UNIQUE INDEX " : "CREATE INDEX ";
         }
         else
@@ -326,13 +405,25 @@ template <typename Model>
 
     if(inserted_descriptors.empty())
     {
-        output.sql.append(model.target == dialect::mysql ? " () VALUES ()" : " DEFAULT VALUES");
+        detail::append_output_inserted_id(output.sql, model);
+
+        if(model.target == dialect::mysql)
+        {
+            output.sql.append(" () VALUES ()");
+        }
+        else
+        {
+            output.sql.append(" DEFAULT VALUES");
+        }
+
         return output;
     }
 
     output.sql.append(" (");
     detail::append_joined_identifiers(output.sql, inserted_descriptors);
-    output.sql.append(") VALUES (");
+    output.sql.append(")");
+    detail::append_output_inserted_id(output.sql, model);
+    output.sql.append(" VALUES (");
     detail::append_placeholders(output.sql, inserted_descriptors.size());
     output.sql.push_back(')');
 
@@ -409,13 +500,25 @@ template <typename Model>
 
     if(inserted.empty())
     {
-        output.sql.append(model.target == dialect::mysql ? " () VALUES ()" : " DEFAULT VALUES");
+        detail::append_output_inserted_id(output.sql, model);
+
+        if(model.target == dialect::mysql)
+        {
+            output.sql.append(" () VALUES ()");
+        }
+        else
+        {
+            output.sql.append(" DEFAULT VALUES");
+        }
+
         return output;
     }
 
     output.sql.append(" (");
     detail::append_joined_identifiers(output.sql, inserted);
-    output.sql.append(") VALUES ");
+    output.sql.append(")");
+    detail::append_output_inserted_id(output.sql, model);
+    output.sql.append(" VALUES ");
 
     bool first_row = true;
     for(const auto& object: models)
@@ -486,6 +589,108 @@ template <typename Model>
     }
 
     bool has_update_assignment = false;
+
+    if(model.target == dialect::sqlserver)
+    {
+        if(inserted_descriptors.empty())
+        {
+            output.sql = "INSERT INTO ";
+            output.sql.append(detail::quote_identifier(model.table_name));
+            output.sql.append(" DEFAULT VALUES");
+            return output;
+        }
+
+        output.sql = "MERGE INTO ";
+        output.sql.append(detail::quote_identifier(model.table_name));
+        output.sql.append(" AS \"target\" USING (VALUES (");
+        detail::append_placeholders(output.sql, inserted_descriptors.size());
+        output.sql.append(")) AS \"source\" (");
+        detail::append_joined_identifiers(output.sql, inserted_descriptors);
+        output.sql.append(") ON \"target\".");
+        output.sql.append(detail::quote_identifier(primary_key.name));
+        output.sql.append(" = \"source\".");
+        output.sql.append(detail::quote_identifier(primary_key.name));
+
+        std::string matched;
+        for(const auto& descriptor: model.columns)
+        {
+            if(descriptor.flags.primary_key || (descriptor.generated_on_insert && !descriptor.flags.updated_at))
+            {
+                continue;
+            }
+
+            if(!matched.empty())
+            {
+                matched.append(", ");
+            }
+
+            matched.append("\"target\".");
+            matched.append(detail::quote_identifier(descriptor.name));
+            matched.append(" = ");
+
+            if(descriptor.flags.updated_at && !descriptor.on_update_sql.empty())
+            {
+                matched.append(descriptor.on_update_sql);
+            }
+            else
+            {
+                matched.append("\"source\".");
+                matched.append(detail::quote_identifier(descriptor.name));
+            }
+        }
+
+        if(!matched.empty())
+        {
+            output.sql.append(" WHEN MATCHED THEN UPDATE SET ");
+            output.sql.append(std::move(matched));
+        }
+
+        // An IDENTITY column can be matched on but not inserted explicitly.
+        std::vector<column_descriptor> merge_inserts;
+        for(const auto& descriptor: inserted_descriptors)
+        {
+            if(!descriptor.flags.auto_increment)
+            {
+                merge_inserts.emplace_back(descriptor);
+            }
+        }
+
+        output.sql.append(" WHEN NOT MATCHED THEN INSERT (");
+        detail::append_joined_identifiers(output.sql, merge_inserts);
+        output.sql.append(") VALUES (");
+        for(std::size_t index = 0; index < merge_inserts.size(); ++index)
+        {
+            if(index != 0)
+            {
+                output.sql.append(", ");
+            }
+
+            output.sql.append("\"source\".");
+            output.sql.append(detail::quote_identifier(merge_inserts[index].name));
+        }
+
+        output.sql.append(");");
+
+        std::size_t descriptor_index = 0;
+        detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
+            const auto& descriptor = model.columns[descriptor_index];
+            if(!descriptor.generated_on_insert || descriptor.flags.primary_key)
+            {
+                if(descriptor.flags.discriminator && !model.type_tag.empty())
+                {
+                    output.binds.emplace_back(model.type_tag);
+                }
+                else
+                {
+                    output.binds.emplace_back(detail::to_sql_value(value));
+                }
+            }
+
+            ++descriptor_index;
+        });
+
+        return output;
+    }
 
     if(model.target == dialect::mysql)
     {
@@ -849,7 +1054,7 @@ template <typename Model>
     output.sql.append(" FROM ");
     output.sql.append(detail::quote_identifier(model.table_name));
     options.filter = detail::scoped_condition(model, std::move(options.filter));
-    detail::append_query_tail(output.sql, output.binds, std::move(options));
+    detail::append_query_tail(output.sql, output.binds, std::move(options), model.target);
     return output;
 }
 
@@ -869,7 +1074,16 @@ template <typename Model>
 [[nodiscard]] statement select_one_statement(const model_descriptor<Model>& model, condition filter = {})
 {
     statement output = select_statement(model, std::move(filter));
-    output.sql.append(" LIMIT 1");
+
+    if(model.target == dialect::sqlserver)
+    {
+        output.sql.append(" ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY");
+    }
+    else
+    {
+        output.sql.append(" LIMIT 1");
+    }
+
     return output;
 }
 
@@ -935,7 +1149,13 @@ template <typename Model>
     output.sql = "DELETE FROM ";
     output.sql.append(detail::quote_identifier(model.table_name));
     options.filter = detail::scoped_condition(model, std::move(options.filter));
-    detail::append_query_tail(output.sql, output.binds, std::move(options), false);
+
+    if(model.target == dialect::sqlserver && (options.limit || options.offset))
+    {
+        throw std::logic_error{"entityfy ORM SQL Server does not support LIMIT/OFFSET on DELETE"};
+    }
+
+    detail::append_query_tail(output.sql, output.binds, std::move(options), model.target, false);
     return output;
 }
 

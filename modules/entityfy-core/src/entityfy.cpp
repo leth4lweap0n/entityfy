@@ -46,6 +46,16 @@ client::client(std::string_view uri)
 #endif
     }
 
+    if(starts_with(uri, "sqlserver://") || starts_with(uri, "mssql://"))
+    {
+#if defined(ENTITYFY_ENABLE_SQLSERVER)
+        backend_ = detail::make_sqlserver_backend(std::string{uri});
+        return;
+#else
+        throw std::invalid_argument{"SQL Server backend was not enabled when entityfy was built"};
+#endif
+    }
+
     if(starts_with(uri, "mysql://"))
     {
 #if defined(ENTITYFY_ENABLE_MYSQL)
@@ -57,7 +67,7 @@ client::client(std::string_view uri)
     }
 
     throw std::invalid_argument{
-        "unsupported entityfy ORM URI. Expected sqlite://, postgres://, postgresql://, or mysql://"
+        "unsupported entityfy ORM URI. Expected sqlite://, postgres://, postgresql://, mysql://, or sqlserver://"
     };
 }
 

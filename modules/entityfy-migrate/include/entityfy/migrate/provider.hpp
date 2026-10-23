@@ -81,4 +81,8 @@ void rename_table(provider& backend, std::string_view from, std::string_view to)
     std::string uri,
     const provider_options& options = {});
 
+[[nodiscard]] std::unique_ptr<provider> open_sqlserver_provider(
+    std::string uri,
+    const provider_options& options = {});
+
 } // namespace entityfy::migrate

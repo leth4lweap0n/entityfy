@@ -13,7 +13,12 @@ entityfy_test::status test_postgres();
 entityfy_test::status test_history_table();
 entityfy_test::status test_rename_table();
 entityfy_test::status test_owned_model();
+#if defined(ENTITYFY_ENABLE_MYSQL)
 entityfy_test::status test_mysql();
+#endif
+#if defined(ENTITYFY_ENABLE_SQLSERVER)
+entityfy_test::status test_sqlserver();
+#endif
 
 int main()
 {
@@ -36,7 +41,12 @@ int main()
         {"history_table", test_history_table},
         {"rename_table", test_rename_table},
         {"owned_model", test_owned_model},
+#if defined(ENTITYFY_ENABLE_MYSQL)
         {"mysql", test_mysql},
+#endif
+#if defined(ENTITYFY_ENABLE_SQLSERVER)
+        {"sqlserver", test_sqlserver},
+#endif
     };
 
     int passed = 0;

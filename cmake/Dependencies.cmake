@@ -68,6 +68,18 @@ if(ENTITYFY_ENABLE_MYSQL)
     endif()
 endif()
 
+# --- SQL Server (ODBC, used by the core backend) --------------------------
+if(ENTITYFY_ENABLE_SQLSERVER)
+    find_package(ODBC QUIET)
+
+    if(NOT ODBC_FOUND)
+        message(STATUS
+            "ODBC not found: the SQL Server backend stays disabled. Install unixODBC (Linux) or use the "
+            "Windows ODBC driver manager, and set ODBC_ROOT if needed.")
+        set(ENTITYFY_ENABLE_SQLSERVER OFF CACHE BOOL "Build the SQL Server backend" FORCE)
+    endif()
+endif()
+
 # --- JSON (migration snapshots and scaffold) -------------------------------
 FetchContent_Declare(
     nlohmann_json

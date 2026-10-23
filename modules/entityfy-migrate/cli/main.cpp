@@ -52,7 +52,7 @@ void print_help()
         "\n"
         "options:\n"
         "  --db <uri>               sqlite://file.db or postgres://conninfo\n"
-        "  --provider <name>        sqlite | postgres | mysql (for snapshot/add, defaults to sqlite)\n"
+        "  --provider <name>        sqlite | postgres | mysql | sqlserver (for snapshot/add, defaults to sqlite)\n"
         "  --root <dir>             migration directory (defaults to migrations/<provider>)\n"
         "  --rename <old>=<new>     column rename hint (table.column=new_name by default)\n"
         "  --allow-destructive      allows destructive operations such as drop/type changes\n"
@@ -203,7 +203,17 @@ std::string normalize_database_uri(std::string uri)
 
 entityfy::dialect dialect_of(std::string_view provider)
 {
-    return provider == "postgres" ? entityfy::dialect::postgresql : entityfy::dialect::sqlite;
+    if(provider == "postgres")
+    {
+        return entityfy::dialect::postgresql;
+    }
+
+    if(provider == "mysql")
+    {
+        return entityfy::dialect::mysql;
+    }
+
+    return provider == "sqlserver" ? entityfy::dialect::sqlserver : entityfy::dialect::sqlite;
 }
 
 } // namespace
@@ -250,6 +260,22 @@ int main(int argc, char** argv)
             if(options.provider == "postgres")
             {
                 backend = entityfy::migrate::open_postgres_provider(uri);
+            }
+            else if(options.provider == "mysql")
+            {
+#if defined(ENTITYFY_ENABLE_MYSQL)
+                backend = entityfy::migrate::open_mysql_provider(uri);
+#else
+                throw std::runtime_error{"entityfy-migrate: the MySQL provider is not enabled in this build"};
+#endif
+            }
+            else if(options.provider == "sqlserver")
+            {
+#if defined(ENTITYFY_ENABLE_SQLSERVER)
+                backend = entityfy::migrate::open_sqlserver_provider(uri);
+#else
+                throw std::runtime_error{"entityfy-migrate: the SQL Server provider is not enabled in this build"};
+#endif
             }
             else
             {

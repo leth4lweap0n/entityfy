@@ -263,7 +263,12 @@ template <typename Type>
     }
     else if constexpr(std::same_as<value_type, bool>)
     {
-        return target == dialect::sqlite ? "INTEGER" : "BOOLEAN";
+        if(target == dialect::sqlite)
+        {
+            return "INTEGER";
+        }
+
+        return target == dialect::sqlserver ? "BIT" : "BOOLEAN";
     }
     else if constexpr(std::is_enum_v<value_type>)
     {
@@ -287,11 +292,16 @@ template <typename Type>
             return "DOUBLE PRECISION";
         }
 
+        if(target == dialect::sqlserver)
+        {
+            return "FLOAT";
+        }
+
         return target == dialect::mysql ? "DOUBLE" : "REAL";
     }
     else if constexpr(std::same_as<value_type, std::string>)
     {
-        return "TEXT";
+        return target == dialect::sqlserver ? "NVARCHAR(MAX)" : "TEXT";
     }
     else if constexpr(is_sys_days_v<value_type>)
     {
@@ -299,7 +309,17 @@ template <typename Type>
     }
     else if constexpr(is_system_time_point_v<value_type>)
     {
-        return target == dialect::sqlite ? "TEXT" : (target == dialect::mysql ? "DATETIME" : "TIMESTAMP");
+        if(target == dialect::sqlite)
+        {
+            return "TEXT";
+        }
+
+        if(target == dialect::mysql)
+        {
+            return "DATETIME";
+        }
+
+        return target == dialect::sqlserver ? "DATETIME2" : "TIMESTAMP";
     }
     else if constexpr(is_chrono_duration_v<value_type>)
     {
@@ -307,13 +327,18 @@ template <typename Type>
     }
     else if constexpr(is_byte_vector_v<value_type>)
     {
-        return target == dialect::postgresql ? "BYTEA" : "BLOB";
+        if(target == dialect::postgresql)
+        {
+            return "BYTEA";
+        }
+
+        return target == dialect::sqlserver ? "VARBINARY(MAX)" : "BLOB";
     }
     else if constexpr(has_value_converter<value_type>)
     {
         // Types that use a converter are stored in a text column by default;
         // narrow them with [[= entityfy::text]] / [[= entityfy::varchar{n}}].
-        return "TEXT";
+        return target == dialect::sqlserver ? "NVARCHAR(MAX)" : "TEXT";
     }
     else
     {
@@ -333,7 +358,8 @@ template <typename Field, auto ReflectedField>
     if constexpr(meta::has_annotation<varchar, ReflectedField>())
     {
         const auto annotation = meta::annotation_or<varchar, ReflectedField>();
-        return "VARCHAR(" + std::to_string(annotation.length) + ")";
+        const auto prefix = target == dialect::sqlserver ? "NVARCHAR(" : "VARCHAR(";
+        return std::string{prefix} + std::to_string(annotation.length) + ")";
     }
     else if constexpr(meta::has_annotation<decimal, ReflectedField>())
     {
@@ -342,11 +368,16 @@ template <typename Field, auto ReflectedField>
     }
     else if constexpr(meta::has_annotation<text_t, ReflectedField>())
     {
-        return "TEXT";
+        return target == dialect::sqlserver ? "NVARCHAR(MAX)" : "TEXT";
     }
     else if constexpr(meta::has_annotation<blob_t, ReflectedField>())
     {
-        return target == dialect::postgresql ? "BYTEA" : "BLOB";
+        if(target == dialect::postgresql)
+        {
+            return "BYTEA";
+        }
+
+        return target == dialect::sqlserver ? "VARBINARY(MAX)" : "BLOB";
     }
     else if constexpr(meta::has_annotation<json_t, ReflectedField>())
     {
@@ -357,7 +388,12 @@ template <typename Field, auto ReflectedField>
 
         // MariaDB implements JSON as LONGTEXT plus a validity check and reports
         // it as longtext, so the portable choice is LONGTEXT on MySQL/MariaDB.
-        return target == dialect::mysql ? "LONGTEXT" : "TEXT";
+        if(target == dialect::mysql)
+        {
+            return "LONGTEXT";
+        }
+
+        return target == dialect::sqlserver ? "NVARCHAR(MAX)" : "TEXT";
     }
     else if constexpr(meta::has_annotation<uuid_t, ReflectedField>())
     {
@@ -366,7 +402,12 @@ template <typename Field, auto ReflectedField>
             return "UUID";
         }
 
-        return target == dialect::mysql ? "CHAR(36)" : "TEXT";
+        if(target == dialect::mysql)
+        {
+            return "CHAR(36)";
+        }
+
+        return target == dialect::sqlserver ? "NVARCHAR(36)" : "TEXT";
     }
     else if constexpr(meta::has_annotation<date_t, ReflectedField>())
     {
@@ -399,7 +440,12 @@ template <typename Field, auto ReflectedField>
                 return "TEXT";
             }
 
-            return target == dialect::mysql ? "DATETIME" : "TIMESTAMP";
+            if(target == dialect::mysql)
+            {
+                return "DATETIME";
+            }
+
+            return target == dialect::sqlserver ? "DATETIME2" : "TIMESTAMP";
         }
     }
     else

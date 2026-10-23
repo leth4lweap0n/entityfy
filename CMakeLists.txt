@@ -51,6 +51,7 @@ option(ENTITYFY_BUILD_DEMO "Build entityfy console, benchmark and migration prob
 option(ENTITYFY_ENABLE_SQLITE "Build the SQLite backend" ON)
 option(ENTITYFY_ENABLE_POSTGRESQL "Build the PostgreSQL backend" ON)
 option(ENTITYFY_ENABLE_MYSQL "Build the MySQL/MariaDB backend" OFF)
+option(ENTITYFY_ENABLE_SQLSERVER "Build the SQL Server backend" OFF)
 
 include(cmake/Dependencies.cmake)
 include(CTest)

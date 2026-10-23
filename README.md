@@ -31,7 +31,7 @@ The path from model to SQL:
 flowchart LR
     model["struct + annotation"] --> describe["describe_model&lt;Model&gt;"]
     describe --> statement["statement generation"]
-    statement --> backend["backend<br/>SQLite · PostgreSQL · MySQL"]
+    statement --> backend["backend<br/>SQLite · PostgreSQL · MySQL · SQL Server"]
 ```
 
 ## Quick start
@@ -167,7 +167,7 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
 
 | Module | Responsibility | Documentation |
 |---|---|---|
-| `entityfy-core` | Model/annotation system, DDL generation, query DSL, SQLite + PostgreSQL + MySQL/MariaDB backends, statement cache, value converter | [docs/core.md](docs/core.md) |
+| `entityfy-core` | Model/annotation system, DDL generation, query DSL, SQLite + PostgreSQL + MySQL/MariaDB + SQL Server backends, statement cache, value converter | [docs/core.md](docs/core.md) |
 | `entityfy-context` | Identity map, snapshot-based change tracking, partial UPDATE, FK dependency ordering, eager loading, context pool | [docs/context.md](docs/context.md) |
 | `entityfy-migrate` | Snapshot, diff, apply/rollback, runnable SQL script, scaffold, CLI | [docs/migration.md](docs/migration.md) |
 
@@ -295,14 +295,15 @@ ctest --preset release
 ```
 
 50 CTest entries in the default build: 48 core Catch2 test cases (233 assertions) and the
-migrate/context test binaries - which contain 10 and 17 scenarios respectively. With
-`ENTITYFY_ENABLE_MYSQL=ON` the core suite adds two cases and the migrate and context binaries add
-one scenario each (52 entries).
+migrate/context test binaries - which contain 10 and 17 scenarios respectively. Each opt-in
+backend (`ENTITYFY_ENABLE_MYSQL`, `ENTITYFY_ENABLE_SQLSERVER`) adds two core cases and one
+scenario to the migrate and context binaries (52 entries with MySQL, 52 with SQL Server).
 
-PostgreSQL tests run when `ENTITYFY_PG_URI` is provided; MySQL tests run when
-`ENTITYFY_MYSQL_URI` is provided. With `ENTITYFY_REQUIRE_PG=1` / `ENTITYFY_REQUIRE_MYSQL=1` a
-skipped backend counts as a failure. Tests write to a temporary workspace and do not pollute the
-source tree.
+PostgreSQL tests run when `ENTITYFY_PG_URI` is provided, MySQL tests when `ENTITYFY_MYSQL_URI` is
+provided and SQL Server tests when `ENTITYFY_SQLSERVER_URI` is provided. With
+`ENTITYFY_REQUIRE_PG=1` / `ENTITYFY_REQUIRE_MYSQL=1` / `ENTITYFY_REQUIRE_SQLSERVER=1` a skipped
+backend counts as a failure. Tests write to a temporary workspace and do not pollute the source
+tree.
 
 ## Build
 
@@ -324,6 +325,11 @@ The MySQL backend is off by default and needs MariaDB Connector/C:
 `-DENTITYFY_ENABLE_MYSQL=ON -DMYSQL_ROOT=<connector>` (or `MYSQL_INCLUDE_DIR` and `MYSQL_LIBRARY`).
 The connector can be built from source with `-DWITH_SSL=SCHANNEL` on Windows, so it needs no
 OpenSSL; keep `libmariadb.dll` next to the executables.
+
+The SQL Server backend is off by default and uses ODBC: `-DENTITYFY_ENABLE_SQLSERVER=ON`
+(`ODBC_ROOT` if CMake cannot find the driver manager). The connection string uses
+`ODBC Driver 18 for SQL Server` with `TrustServerCertificate=yes`, so the driver must be installed
+(winget `Microsoft.msodbcsql.18` on Windows, `msodbcsql18` on Linux).
 
 On MinGW the runtime (`libstdc++`, `libgcc`, `libwinpthread`) is linked statically for
 Release-like configurations, so the shipped executables need no MinGW DLLs. **Debug is excluded**:
@@ -349,7 +355,8 @@ cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release \
 ```
 
 Options: `ENTITYFY_ENABLE_SQLITE`, `ENTITYFY_ENABLE_POSTGRESQL`, `ENTITYFY_ENABLE_MYSQL`,
-`ENTITYFY_BUILD_TESTS`, `ENTITYFY_BUILD_EXAMPLES`, `ENTITYFY_BUILD_DEMO`.
+`ENTITYFY_ENABLE_SQLSERVER`, `ENTITYFY_BUILD_TESTS`, `ENTITYFY_BUILD_EXAMPLES`,
+`ENTITYFY_BUILD_DEMO`.
 
 ### Using it in your project
 
@@ -421,11 +428,12 @@ through `sl3`, and there is no second copy of SQLite.
   `find_all_types`), but no tracked or eager-loaded polymorphic reads, and a hierarchy has one base
   class. Composite/JSON values are stored through `value_converter`, and
   `[[= entityfy::owned]]` value objects are split into prefixed columns.
-- SQL Server is not supported. MySQL/MariaDB support is opt-in (`ENTITYFY_ENABLE_MYSQL`), its DDL
-  is not transactional (a failed migration cannot be rolled back), the migrate provider has no
-  mysqldump backup (destructive steps need `--no-backup`), `[[= entityfy::json]]` maps to
-  `LONGTEXT` because MariaDB reports its JSON alias that way, and the backend reports a statement
-  cache capacity of zero.
+- MySQL/MariaDB and SQL Server are opt-in (`ENTITYFY_ENABLE_MYSQL`, `ENTITYFY_ENABLE_SQLSERVER`).
+  MySQL has no transactional DDL (a failed migration cannot be rolled back) and neither provider
+  implements backups (destructive steps need `--no-backup`); `[[= entityfy::json]]` maps to
+  `LONGTEXT` on MySQL because MariaDB reports its JSON alias that way; both backends report a
+  statement cache capacity of zero; the SQL Server migrate provider rebuilds dependent indexes
+  around `ALTER COLUMN` and refuses primary-key/identity changes.
 - Row reading is costly through `vector<vector<sql_value>>`; single-row reads need a separate
   path.
 - No `install()` / `find_package()` export yet: consume the project with `add_subdirectory` or

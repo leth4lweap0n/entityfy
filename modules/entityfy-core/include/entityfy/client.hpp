@@ -213,10 +213,10 @@ public:
         backend_->execute(create_table(model));
 
         std::vector<std::string> existing_indexes;
-        if(model.target == dialect::mysql)
+        if(model.target == dialect::mysql || model.target == dialect::sqlserver)
         {
-            // MySQL has no CREATE INDEX IF NOT EXISTS, so the existing index
-            // names are read back first.
+            // Neither MySQL nor SQL Server has CREATE INDEX IF NOT EXISTS, so
+            // the existing index names are read back first.
             for(const auto& index : backend_->inspect_table(model.table_name).indexes)
             {
                 existing_indexes.push_back(index.name);
@@ -511,13 +511,35 @@ public:
 private:
     void begin_transaction(bool nested, std::string_view savepoint)
     {
+        const bool tsql = backend_->target_dialect() == dialect::sqlserver;
+
         statement command;
-        command.sql = nested ? "SAVEPOINT " + detail::quote_identifier(savepoint) : "BEGIN";
+        if(tsql)
+        {
+            command.sql = nested ? "SAVE TRANSACTION " + detail::quote_identifier(savepoint) : "BEGIN TRANSACTION";
+        }
+        else
+        {
+            command.sql = nested ? "SAVEPOINT " + detail::quote_identifier(savepoint) : "BEGIN";
+        }
+
         backend_->execute(command);
     }
 
     void commit_transaction(bool nested, std::string_view savepoint)
     {
+        if(backend_->target_dialect() == dialect::sqlserver)
+        {
+            // T-SQL savepoints are not released; the outer COMMIT finishes them.
+            if(nested)
+            {
+                return;
+            }
+
+            backend_->execute(statement{.sql = "COMMIT"});
+            return;
+        }
+
         statement command;
         command.sql = nested ? "RELEASE SAVEPOINT " + detail::quote_identifier(savepoint) : "COMMIT";
         backend_->execute(command);
@@ -527,6 +549,14 @@ private:
     {
         try
         {
+            if(backend_->target_dialect() == dialect::sqlserver)
+            {
+                statement command;
+                command.sql = nested ? "ROLLBACK TRANSACTION " + detail::quote_identifier(savepoint) : "ROLLBACK";
+                backend_->execute(command);
+                return;
+            }
+
             statement command;
             command.sql = nested ? "ROLLBACK TO SAVEPOINT " + detail::quote_identifier(savepoint) : "ROLLBACK";
             backend_->execute(command);

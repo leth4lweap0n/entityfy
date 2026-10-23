@@ -207,20 +207,43 @@ void engine::ensure_history() const
 
     const std::string history = history_table();
 
-    const bool mysql = backend_->name() == "mysql";
+    const bool        mysql = backend_->name() == "mysql";
+    const bool        sqlserver = backend_->name() == "sqlserver";
+    const std::string id_type = sqlserver ? "NVARCHAR(191)" : (mysql ? "VARCHAR(191)" : "TEXT");
+    const std::string checksum_type = sqlserver ? "NVARCHAR(64)" : (mysql ? "VARCHAR(64)" : "TEXT");
+    const std::string applied_type = sqlserver ? "DATETIME2" : (mysql ? "DATETIME" : "TEXT");
 
-    backend_->execute_sql(
-        "CREATE TABLE IF NOT EXISTS \"" + history + "\" ("
-        "\"id\" " + (mysql ? "VARCHAR(191)" : "TEXT") + " PRIMARY KEY, "
-        "\"checksum\" " + (mysql ? "VARCHAR(64)" : "TEXT") + " NOT NULL DEFAULT '', "
-        "\"seq\" INTEGER NOT NULL DEFAULT 0, "
-        "\"applied_at\" " + (mysql ? "DATETIME" : "TEXT") + " NOT NULL DEFAULT CURRENT_TIMESTAMP"
-        ")");
+    if(sqlserver)
+    {
+        backend_->execute_sql(
+            "IF OBJECT_ID(N'" + history + "', N'U') IS NULL CREATE TABLE \"" + history + "\" ("
+            "\"id\" " + id_type + " PRIMARY KEY, "
+            "\"checksum\" " + checksum_type + " NOT NULL DEFAULT '', "
+            "\"seq\" INTEGER NOT NULL DEFAULT 0, "
+            "\"applied_at\" " + applied_type + " NOT NULL DEFAULT CURRENT_TIMESTAMP)");
+    }
+    else
+    {
+        backend_->execute_sql(
+            "CREATE TABLE IF NOT EXISTS \"" + history + "\" ("
+            "\"id\" " + id_type + " PRIMARY KEY, "
+            "\"checksum\" " + checksum_type + " NOT NULL DEFAULT '', "
+            "\"seq\" INTEGER NOT NULL DEFAULT 0, "
+            "\"applied_at\" " + applied_type + " NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            ")");
+    }
 
     bool has_sequence = true;
     try
     {
-        (void)backend_->query("SELECT \"seq\" FROM \"" + history + "\" LIMIT 1");
+        if(sqlserver)
+        {
+            (void)backend_->query("SELECT TOP (1) \"seq\" FROM \"" + history + "\"");
+        }
+        else
+        {
+            (void)backend_->query("SELECT \"seq\" FROM \"" + history + "\" LIMIT 1");
+        }
     }
     catch(...)
     {

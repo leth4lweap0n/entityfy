@@ -7,7 +7,8 @@ enum class dialect
 {
     sqlite,
     postgresql,
-    mysql
+    mysql,
+    sqlserver
 };
 
 } // namespace entityfy

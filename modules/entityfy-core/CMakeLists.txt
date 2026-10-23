@@ -16,6 +16,10 @@ if(ENTITYFY_ENABLE_MYSQL)
     list(APPEND core_sources src/mysql_backend.cpp)
 endif()
 
+if(ENTITYFY_ENABLE_SQLSERVER)
+    list(APPEND core_sources src/sqlserver_backend.cpp)
+endif()
+
 add_library(entityfy_core STATIC ${core_sources})
 add_library(entityfy::core ALIAS entityfy_core)
 
@@ -41,6 +45,11 @@ endif()
 if(ENTITYFY_ENABLE_MYSQL)
     target_link_libraries(entityfy_core PRIVATE entityfy::mysql)
     target_compile_definitions(entityfy_core PUBLIC ENTITYFY_ENABLE_MYSQL)
+endif()
+
+if(ENTITYFY_ENABLE_SQLSERVER)
+    target_link_libraries(entityfy_core PRIVATE ODBC::ODBC)
+    target_compile_definitions(entityfy_core PUBLIC ENTITYFY_ENABLE_SQLSERVER)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -77,6 +86,9 @@ if(ENTITYFY_BUILD_TESTS)
     endif()
     if(NOT ENTITYFY_ENABLE_MYSQL)
         list(REMOVE_ITEM test_sources "${CMAKE_CURRENT_SOURCE_DIR}/tests/MysqlBackend.test.cpp")
+    endif()
+    if(NOT ENTITYFY_ENABLE_SQLSERVER)
+        list(REMOVE_ITEM test_sources "${CMAKE_CURRENT_SOURCE_DIR}/tests/SqlserverBackend.test.cpp")
     endif()
 
     if(test_sources)

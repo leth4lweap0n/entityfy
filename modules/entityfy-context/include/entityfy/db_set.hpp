@@ -1955,8 +1955,11 @@ public:
     {
         using group_type = std::remove_cvref_t<decltype(std::declval<T>().*group)>;
         using value_type = std::remove_cvref_t<decltype(std::declval<T>().*value)>;
+        const auto dialect = owner_->database().target_dialect();
+        const auto column = entityfy::detail::quote_identifier(entityfy::column_name(value));
+
         return grouped<group_type, double>(
-            "AVG(" + entityfy::detail::quote_identifier(entityfy::column_name(value)) + ")",
+            dialect == entityfy::dialect::sqlserver ? "AVG(CAST(" + column + " AS FLOAT))" : "AVG(" + column + ")",
             entityfy::column_name(group));
     }
 
@@ -2098,8 +2101,18 @@ private:
     {
         const auto model = entityfy::describe_model<T>(owner_->database().target_dialect());
 
-        std::string sql = "SELECT " + std::string{function} + "(" +
-                          entityfy::detail::quote_identifier(column) + ") FROM " +
+        std::string expression;
+        if(function == "AVG" && model.target == entityfy::dialect::sqlserver)
+        {
+            // T-SQL AVG over an integer column returns an integer; cast first.
+            expression = "AVG(CAST(" + entityfy::detail::quote_identifier(column) + " AS FLOAT))";
+        }
+        else
+        {
+            expression = std::string{function} + "(" + entityfy::detail::quote_identifier(column) + ")";
+        }
+
+        std::string sql = "SELECT " + expression + " FROM " +
                           entityfy::detail::quote_identifier(model.table_name);
 
         std::vector<entityfy::sql_value> binds;

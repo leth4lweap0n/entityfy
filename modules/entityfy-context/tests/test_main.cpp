@@ -1609,6 +1609,108 @@ status run_mysql_checks()
     return status::passed;
 }
 
+status run_sqlserver_checks()
+{
+    const char* uri = std::getenv("ENTITYFY_SQLSERVER_URI");
+    if(uri == nullptr || std::string{uri}.empty())
+    {
+        std::cout << "sqlserver skipped: ENTITYFY_SQLSERVER_URI is not set\n";
+        return status::skipped;
+    }
+
+    entityfy::db_context ctx{uri};
+
+    for(const char* table : {"rc_children", "rc_parents", "rc_comments", "rc_posts", "rc_tags", "rc_users"})
+    {
+        ctx.execute(std::string{"IF OBJECT_ID(N'dbo."} + table + "', N'U') IS NOT NULL DROP TABLE dbo." + table);
+    }
+
+    ctx.migrate<rc_user>();
+    ctx.migrate<rc_post>();
+    ctx.migrate<rc_comment>();
+    ctx.migrate<rc_tag>();
+    ctx.migrate<rc_parent>();
+    ctx.migrate<rc_child>();
+
+    auto users = ctx.set<rc_user>();
+    auto& ada = users.add(rc_user{.email = "ada@tsql.test", .name = "Ada"});
+    auto& grace = users.add(rc_user{.email = "grace@tsql.test", .name = "Grace"});
+
+    require(ctx.save_changes().inserted == 2, "sqlserver insert count");
+    require(users.query().sum(&rc_user::id) == std::optional<std::int64_t>{3}, "sqlserver aggregate sum");
+    require(users.query().avg(&rc_user::id) == std::optional<double>{1.5}, "sqlserver aggregate avg");
+
+    std::vector<std::string> statements;
+    ctx.set_logger([&](std::string_view sql) { statements.emplace_back(sql); });
+
+    const auto selected = users.query()
+                              .where(entityfy::where(&rc_user::email).ends_with("@tsql.test"))
+                              .order_by(&rc_user::name)
+                              .take(1)
+                              .to_list();
+    require(selected.size() == 1 && selected.front() == &ada, "sqlserver filter/order/take");
+
+    auto posts = ctx.set<rc_post>();
+    auto& first_post = posts.add(rc_post{.user_id = ada.id, .title = "first", .score = 10});
+    posts.add(rc_post{.user_id = ada.id, .title = "second", .score = 20});
+    posts.add(rc_post{.user_id = grace.id, .title = "third", .score = 5});
+    require(ctx.save_changes().inserted == 3, "sqlserver posts inserted");
+
+    const auto joined = users.join<rc_post>(&rc_user::id, &rc_post::user_id);
+    require(joined.size() == 3, "sqlserver join row count");
+
+    const auto counts = posts.query().count_by(&rc_post::user_id);
+    require(counts.size() == 2 && counts[0].first == ada.id && counts[0].second == 2,
+            "sqlserver count_by");
+
+    const auto included = users.include<rc_post>({&ada, &grace});
+    require(included.size() == 2 && included[0].second.size() == 2 && included[1].second.size() == 1,
+            "sqlserver include");
+
+    const auto projected = users.query().order_by(&rc_user::name).select(&rc_user::id, &rc_user::name);
+    require(projected.size() == 2 && std::get<1>(projected[0]) == "Ada", "sqlserver projection values");
+
+    const auto raw = users.from_sql(
+        "SELECT \"id\", \"email\", \"name\", \"version\" FROM \"rc_users\" WHERE \"email\" = 'ada@tsql.test'");
+    require(raw.size() == 1 && raw.front() == &ada, "sqlserver raw sql materialization");
+
+    statements.clear();
+    ada.name = "Ada Lovelace";
+    require(ctx.save_changes().updated == 1, "sqlserver single update tracked");
+    require(statements.size() == 1, "sqlserver single update statement");
+    require(statements.front().find("\"name\" = ?") != std::string::npos, "sqlserver changed column is in update");
+
+    users.remove(ada);
+    require(ctx.save_changes().removed == 1, "sqlserver delete tracked");
+    require(ctx.database().table<rc_post>().count() == 1, "sqlserver delete cascade removed posts");
+
+    auto tags = ctx.set<rc_tag>();
+    tags.add(rc_tag{.id = 1, .name = "one"});
+    tags.add(rc_tag{.id = 2, .name = "two"});
+    tags.add(rc_tag{.id = 3, .name = "three"});
+    require(ctx.save_changes().inserted == 3, "sqlserver explicit-key entities inserted");
+    require(ctx.database().table<rc_tag>().count() == 3, "sqlserver batched rows exist");
+
+    const auto json_rows = ctx.query("SELECT \"payload\" FROM \"rc_tags\" WHERE \"id\" = 1");
+    require(json_rows.size() == 1 && std::get<std::string>(json_rows.front().front()) == "{}",
+            "sqlserver json column round trip");
+
+    ctx.transaction([&] {
+        users.add(rc_user{.email = "tx@tsql.test", .name = "Tx"});
+        ctx.save_changes();
+    });
+    require(ctx.database().table<rc_user>().count() == 2, "sqlserver transaction commit persists");
+
+    (void)first_post;
+
+    for(const char* table : {"rc_children", "rc_parents", "rc_comments", "rc_posts", "rc_tags", "rc_users"})
+    {
+        ctx.execute(std::string{"IF OBJECT_ID(N'dbo."} + table + "', N'U') IS NOT NULL DROP TABLE dbo." + table);
+    }
+
+    return status::passed;
+}
+
 } // namespace
 
 int main()
@@ -1641,6 +1743,7 @@ int main()
         {"async", run_async_checks},
         {"postgres", run_postgres_checks},
         {"mysql", run_mysql_checks},
+        {"sqlserver", run_sqlserver_checks},
     };
 
     int passed = 0;

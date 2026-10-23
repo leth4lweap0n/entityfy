@@ -18,6 +18,10 @@ if(ENTITYFY_ENABLE_MYSQL)
     list(APPEND entityfy_migrate_sources src/mysql_provider.cpp)
 endif()
 
+if(ENTITYFY_ENABLE_SQLSERVER)
+    list(APPEND entityfy_migrate_sources src/sqlserver_provider.cpp)
+endif()
+
 add_library(entityfy_migrate STATIC ${entityfy_migrate_sources})
 add_library(entityfy::migrate ALIAS entityfy_migrate)
 
@@ -42,6 +46,11 @@ if(ENTITYFY_ENABLE_MYSQL)
     target_compile_definitions(entityfy_migrate PUBLIC ENTITYFY_ENABLE_MYSQL)
 endif()
 
+if(ENTITYFY_ENABLE_SQLSERVER)
+    target_link_libraries(entityfy_migrate PRIVATE ODBC::ODBC)
+    target_compile_definitions(entityfy_migrate PUBLIC ENTITYFY_ENABLE_SQLSERVER)
+endif()
+
 # ---------------------------------------------------------------------------
 # Command line interface
 # ---------------------------------------------------------------------------
@@ -56,7 +65,7 @@ target_compile_options(entityfy_migrate_cli
 # Tests
 # ---------------------------------------------------------------------------
 if(ENTITYFY_BUILD_TESTS)
-    add_executable(entityfy_migrate_tests
+    set(entityfy_migrate_test_sources
         tests/test_main.cpp
         tests/test_schema.cpp
         tests/test_diff.cpp
@@ -67,8 +76,17 @@ if(ENTITYFY_BUILD_TESTS)
         tests/test_postgres.cpp
         tests/test_table_ops.cpp
         tests/test_owned_model.cpp
-        tests/test_mysql.cpp
     )
+
+    if(ENTITYFY_ENABLE_MYSQL)
+        list(APPEND entityfy_migrate_test_sources tests/test_mysql.cpp)
+    endif()
+
+    if(ENTITYFY_ENABLE_SQLSERVER)
+        list(APPEND entityfy_migrate_test_sources tests/test_sqlserver.cpp)
+    endif()
+
+    add_executable(entityfy_migrate_tests ${entityfy_migrate_test_sources})
     target_link_libraries(entityfy_migrate_tests PRIVATE entityfy::migrate)
     target_include_directories(entityfy_migrate_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples)
     target_compile_definitions(entityfy_migrate_tests PRIVATE

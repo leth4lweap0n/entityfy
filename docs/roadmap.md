@@ -52,6 +52,11 @@
 - **Owned value objects**: `[[= entityfy::owned]]` splits a struct across prefixed columns,
   through `describe_model`, DDL, INSERT/UPDATE/UPSERT, `insert_many`, the row mapper and
   migrations; nested owned values and inner annotations supported
+- **SQL Server support**: opt-in ODBC backend (`sqlserver://`, T-SQL dialect with
+  `IDENTITY(1,1)`, `OUTPUT INSERTED`, `MERGE` upserts, `OFFSET/FETCH`), context integration and a
+  migrate provider (identity columns, dependent index rebuilds, named default constraints); SQL
+  Server has no `CREATE INDEX IF NOT EXISTS`, has no `RESTRICT` keyword, and `AVG` over integers is
+  cast to FLOAT
 - **MySQL/MariaDB support**: opt-in core backend (`mysql://`, `mysql` dialect, prepared statement
   path, `information_schema` introspection, error classification), context integration and a
   migrate provider with its own DDL/diff path and tests; MySQL has no transactional DDL and the
@@ -72,10 +77,10 @@ surface that has to change, so a session can pick one up without redoing the
 analysis. Everything above this section is implemented and covered by the test
 suite.
 
-1. **SQL Server provider** — needs an ODBC based client (`msodbcsql` on Windows, `unixodbc` on
-   Linux), a T-SQL dialect (`TOP`/`OFFSET FETCH`, `OUTPUT INSERTED`, bracket identifiers, no
-   `ON DUPLICATE KEY`) plus a migrate provider. Acceptance: core, migrate and context suites run
-   against a SQL Server service container in CI.
+1. **Backups for the MySQL and SQL Server migrate providers** — `mysqldump` / `BACKUP DATABASE`
+   integration so destructive steps do not need `--no-backup`.
+2. **Statement caching for MySQL and SQL Server** — the clients prepare each statement again; a
+   bounded cache like the PostgreSQL one would cut the parse round trip.
 
 ## Smaller follow-ups
 
