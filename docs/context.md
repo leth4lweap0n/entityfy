@@ -333,15 +333,21 @@ ctx.transaction([&] {
 ## Asynchronous saving
 
 ```cpp
-auto pending = ctx.save_changes_async();
-const auto result = pending.get();     // std::future<save_result>
+auto pending = ctx.save_changes_async();   // entityfy::task<save_result>
+const auto result = pending.get();
 ```
 
-`save_changes_async()` runs the same save work on a worker thread; saves are serialized by the
-mutex inside the context, so two concurrent saves cannot interleave.
-**Honest limit:** this is not I/O asynchrony — the SQLite and PostgreSQL drivers run
-synchronously; the gain is only in reducing how long the calling thread waits. The context cannot
-be used from other threads while a save is in progress (the same rule as EF Core).
+`save_changes_async()` runs the same save work on a lazily created single-worker executor and
+returns a task; retry delays elapse on that worker. Retry attempts and classification are
+unchanged. A **save gate** rejects overlapping saves: while any save is in flight, `save_changes()`
+and `save_changes_async()` throw `std::logic_error("a save is already in progress")` instead of
+queueing. The gate is released on success, failure and submit errors, so the context is usable
+again afterwards. Destroying a context with an in-flight async save drains the job before the
+tracked sets and the connection are destroyed.
+**Honest limit:** the context save path is a thread offload; the SQLite driver is serialized on
+one connection, and the PostgreSQL backend's native async path is exposed through the client
+(`execute_async`/`query_async`) rather than through `save_changes_async` in this phase. The
+context cannot be used from other threads while a save is in progress (the same rule as EF Core).
 
 ## Context pool
 

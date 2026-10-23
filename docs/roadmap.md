@@ -103,8 +103,18 @@
   entities, typed lifecycle errors, one-query loads through the identity map, eager-loading cache
   fill, and reset/rebind after writes and rollback
 - **Task primitives (P2.1)**: `entityfy::task<T>`/`task<void>`, cancellation hooks, `then`
-  flattening, `inline_executor` and a bounded `thread_pool_executor` (not yet wired to the
-  synchronous drivers)
+  flattening, `inline_executor` and a bounded `thread_pool_executor`
+- **Native async PostgreSQL (P2.2)**: raw libpq throughout; one in-flight operation per
+  connection, a per-backend reactor using `PQsocketPoll`, nonblocking execution/query/pipeline
+  batches, and cancellation through the libpq 17+ cancel API (SQLSTATE 57014 → `task_cancelled`)
+- **Async client/table surface (P2.3)**: `async_mode`, `execute_async`, `query_async`,
+  `execute_batch_async`, `query_each_async`, and async `table_client` CRUD built from the same
+  statement builders
+- **SQLite async facade (P2.4)**: reports `thread_offload`, one lazily created bounded worker per
+  connection, FIFO, cooperative cancellation before a job starts
+- **Async context save (P2.5)**: `save_changes_async()` returns `entityfy::task<save_result>`, a
+  single-worker executor runs the save/retries, and a save gate rejects overlapping saves;
+  destroying a context drains an in-flight save
 
 ## Next
 
@@ -112,14 +122,16 @@ EF Core parity on SQLite and PostgreSQL. The slice plan, contracts and acceptanc
 [parity-plan.md](parity-plan.md); each slice is committed only when its tests and the full suite
 are green.
 
-1. **P0 composite and non-integral keys** — `entityfy::row_key`, descriptor key lists, table-level
-   primary keys, key-based statements, context identity/concurrency and migration diff. In
-   progress.
-2. **P1 lazy loading** — `entityfy::lazy<T>` handles bound to tracked entities, typed errors for
-   detached/no-tracking entities, include-cache integration, composite foreign keys.
-3. **P2 async I/O** — `entityfy::task<T>` and executors, native nonblocking PostgreSQL through
-   libpq, an honest SQLite thread-offload facade, async client/table/context/pool surfaces.
-4. **P3 ODBC** — decision only: SQLite and PostgreSQL keep their native drivers; the frozen SQL
+1. **P0 composite and non-integral keys** — complete (row_key, key lists, table-level and
+   string/UUID keys, key-based statements, identity/concurrency, migration diff). Altering the
+   columns of an existing key (P0.3b2) remains.
+2. **P1 lazy loading** — P1.1-P1.4 complete (handles, binding, loaders, include cache, lifetimes).
+   P1.5 composite foreign keys remains.
+3. **P2 async I/O** — complete for the implemented slices: task/executors, native nonblocking
+   PostgreSQL, client/table async, SQLite thread-offload facade, task-based context save with a
+   save gate. Remaining: `transaction_async`, native async `saveable` methods and
+   `db_context_pool::acquire_async`.
+4. **P3 ODBC** — decided, no code: SQLite and PostgreSQL keep their native drivers; the frozen SQL
    Server backend's gaps stay documented in the parity plan.
 
 The other backends stay buildable and tested but get no new features for now (see

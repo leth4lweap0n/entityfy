@@ -211,10 +211,12 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
 - **Partial UPDATE in core**: `db.update_partial(entity, &T::a, &T::b)` writes only the named
   columns; `update(entity)` still rewrites the row (core keeps no snapshot).
 - **SQL logger**: `client::set_logger(...)` reports every statement before it executes.
-- **Task primitives**: header-only `entityfy::task<T>` / `task<void>` (move-only results,
-  exceptions, cancellation hook, `on_complete`, `then` flattening) and `inline_executor` /
-  bounded `thread_pool_executor`. These are the groundwork for the async phase; the drivers and
-  client are still synchronous.
+- **Async I/O**: `entityfy::task<T>` / `task<void>` (move-only results, exceptions, cancellation
+  hook, `on_complete`, flattened `then`), `inline_executor` and a bounded
+  `thread_pool_executor`. The client exposes `async_mode`, `execute_async`, `query_async`,
+  `execute_batch_async` and `query_each_async`, and `table_client` mirrors CRUD asynchronously.
+  PostgreSQL uses native nonblocking libpq (one in-flight operation per connection, cancellation
+  through the task hook); SQLite reports `thread_offload` and serializes async work on one worker.
 
 ## entityfy-context
 
@@ -248,8 +250,10 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
 - Bulk operations: `query().remove_all()`, `query().assign(...).update_all()`.
 - `db_context_pool`: lease-based context reuse; when the lease is released the change tracker is
   cleared.
-- `save_changes_async()`: moves saving to a worker thread; saves are serialized by a mutex inside
-  the context. This is not I/O asynchrony; the drivers run synchronously.
+- `save_changes_async()`: returns `entityfy::task<save_result>` and runs the save on a lazily
+  created single-worker executor; retry delays elapse there. A save gate rejects overlapping
+  sync/async saves with `logic_error`, and destroying a context drains an in-flight save. This is
+  a thread offload, not native I/O asynchrony.
 
 ## entityfy-migrate
 
@@ -329,10 +333,10 @@ the ratios are more stable.
 ctest --preset release
 ```
 
-116 CTest entries in the default build: 114 core Catch2 test cases (1309 assertions with
-PostgreSQL enabled; SQLite-only runs execute 110 cases and 1246 assertions) and the
-migrate/context test binaries - which contain 10 and 23 scenarios respectively (22 with SQLite
-only, 23 with PostgreSQL). Each opt-in backend (`ENTITYFY_ENABLE_MYSQL`,
+135 CTest entries in the default build: 133 core Catch2 test cases (1496 assertions with
+PostgreSQL enabled; SQLite-only runs execute 117 cases and 1327 assertions) and the
+migrate/context test binaries - which contain 10 and 26 scenarios respectively (23 executed with
+SQLite only, 24 with PostgreSQL). Each opt-in backend (`ENTITYFY_ENABLE_MYSQL`,
 `ENTITYFY_ENABLE_SQLSERVER`) adds three core cases (two backend tests and a statement cache test)
 and one scenario to the migrate and context binaries.
 

@@ -181,6 +181,8 @@ cancellation.
 
 ### P2.2 PostgreSQL native async
 
+**Status:** implemented (commits 19338ab, 94965eb): raw libpq port, per-backend reactor, nonblocking execute/query/pipeline batch, single-flight and cancellation. `transaction_async` remains.
+
 Follow the audit decision B: the PostgreSQL backend owns one raw `PGconn*` and serves both the
 sync and async paths through shared parameter/result/SQLSTATE helpers (taopq is removed from the
 dependency once the port is proven). Async flow: `PQsendQueryParams`/`PQsendQueryPrepared` →
@@ -193,12 +195,16 @@ fallbacks) is enforced.
 
 ### P2.3 Client and table surface
 
+**Status:** implemented (commit f5585c4): `async_mode`, async execute/query/batch/each and async table CRUD. `transaction_async` remains.
+
 `async_capability async_mode()`, `execute_async`, `query_async`, `query_each_async`,
 `execute_batch_async`, `transaction_async`, and `table_client` async CRUD mirroring the sync
 methods. The async API uses the same `statement` values, so SQL generation and the key work are
 shared.
 
 ### P2.4 SQLite facade
+
+**Status:** implemented (commit a2f5703): `thread_offload`, one bounded worker per connection, FIFO, cooperative cancellation between statements.
 
 Bounded worker pool with one serialized queue per connection (no thread per call), returning the
 same `task<T>` and reporting `thread_offload`. Cancellation is cooperative between statements
@@ -207,6 +213,8 @@ single-context by definition.
 
 ### P2.5 Context and pool
 
+**Status:** partially implemented (commit 6a60d8d): `save_changes_async` returns a task on a lazy single-worker executor and the save gate rejects overlap; a destroyed context drains. Native `saveable` async methods and `db_context_pool::acquire_async` remain.
+
 `save_changes_async` returns `task<save_result>`; retry delays await the executor instead of
 blocking a thread; a save gate rejects concurrent sync/async saves. Phase 1 lands the offload
 path, phase 2 the native path (`saveable` async methods, `save_changes_once_async`,
@@ -214,6 +222,8 @@ path, phase 2 the native path (`saveable` async methods, `save_changes_once_asyn
 after timeout/cancel.
 
 ### P2.6 Tests and docs
+
+**Status:** implemented for the shipped slices (async backend/client/table/SQLite/context tests, docs and capability notes); the remaining P2.2/P2.5 gaps are listed in the roadmap.
 
 `pg_sleep` interleaving proves a running coroutine does not block the caller; the same test over
 two connections proves the reactor is shared; a hundred async queries keep the thread count
