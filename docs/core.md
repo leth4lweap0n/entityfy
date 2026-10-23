@@ -293,4 +293,10 @@ and measurements: [benchmarks.md](benchmarks.md).
 
 Under the `entityfy::orm_error` root: `connection_error`, `sql_error`, `query_error`,
 `transaction_error`, `migration_error`, `constraint_error`, and under the latter
-`unique_violation`, `foreign_key_violation`, `not_null_violation`.
+`unique_violation`, `foreign_key_violation`, `not_null_violation`, `check_violation`.
+
+Errors a retry can resolve derive from `transient_error`: `serialization_failure` (PostgreSQL
+SQLSTATE `40001`), `deadlock_detected` (`40P01`) and `database_busy` (SQLite
+busy/locked message texts). PostgreSQL codes come from the driver's SQLSTATE, SQLite only exposes the
+message text. The context retry policy checks the type first and keeps the message matching as a
+fallback for other backends.

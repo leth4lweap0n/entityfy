@@ -2,6 +2,7 @@
 
 #include <entityfy/dialect.hpp>
 #include <entityfy/introspection.hpp>
+#include <entityfy/statement.hpp>
 #include <entityfy/value.hpp>
 
 #include <cstdint>
@@ -10,13 +11,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-namespace entityfy
-{
-
-struct statement;
-
-} // namespace entityfy
 
 namespace entityfy::detail
 {
@@ -36,6 +30,24 @@ public:
 
     [[nodiscard]] virtual dialect target_dialect() const noexcept = 0;
     virtual execution_result execute(const entityfy::statement& input) = 0;
+
+    // Runs several independent statements in order. The default executes them
+    // one by one; PostgreSQL overrides it with a protocol pipeline so the
+    // statements travel in one round trip (prepared statements are cached as
+    // they are for single statements).
+    [[nodiscard]] virtual std::vector<execution_result> execute_batch(
+        const std::vector<entityfy::statement>& statements)
+    {
+        std::vector<execution_result> output;
+        output.reserve(statements.size());
+
+        for(const auto& current: statements)
+        {
+            output.push_back(execute(current));
+        }
+
+        return output;
+    }
     [[nodiscard]] virtual std::vector<row> query(const entityfy::statement& input) = 0;
 
     // Streams rows to a consumer without collecting them: the backend reuses a

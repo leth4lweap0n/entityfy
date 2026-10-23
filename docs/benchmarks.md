@@ -114,6 +114,25 @@ row-by-row path (SQLite `:memory:`, 20.000 rows):
 1024 parameters); for models with auto-increment keys, generated ids are fetched row by row, so
 that path runs row by row.
 
+## Migration providers: is a statement cache worth it?
+
+Measured decision for the SQLite and PostgreSQL migrate providers, which prepare every statement:
+
+- A typical initial migration is **4 statements** (`CREATE TABLE` twice plus the two indexes); a
+  column add is one statement. The SQL text is generated from the snapshot and each statement runs
+  once per migration, so an LRU keyed by SQL text would never hit.
+- Preparing a representative DDL statement costs **10,5 µs** on SQLite
+  (`sqlite3_prepare_v2` + finalize, 200.000 iterations, in-memory) against **43 µs** for
+  prepare + execute, so preparation is ~20-25 % of one DDL statement - but only when the
+  statement runs, which it does once.
+- On PostgreSQL a `PREPARE` is a **81 µs** round trip (localhost); a 4-statement migration pays
+  ~324 µs once.
+
+**Decision:** no cache in the migrate providers. It cannot produce a hit, and the measurable cost
+would be bookkeeping, not saved work. The only real saving would come from pipelining the
+independent steps of one migration (and only on PostgreSQL); that changes the apply semantics, so
+it stays out of scope here.
+
 ## PostgreSQL measurement (same machine, local server)
 
 When `ENTITYFY_PG_URI` is provided, `entityfy_bench` also measures the PostgreSQL path: entityfy,
@@ -138,6 +157,19 @@ same process with the cache off and on:
 the server side cache the ORM layer adds 1,3–1,6 times the raw driver instead of 1,3–2,3 times;
 against `PQexecParams` (prepare on every call) entityfy is now faster (0,7–0,8x). What remains is
 the per-call round trip, not parsing or planning.
+
+**Batched writes:** `insert_many` sends its chunks through one libpq pipeline (all statements are
+sent before any result is awaited). Measured on the same 5.000-row insert, batched at the default
+parameter limit (15 chunks):
+
+| Path | Throughput |
+|---|---:|
+| one round trip per chunk | 114k rows/s |
+| pipelined chunks | 119–124k rows/s |
+| Gain | 1,05–1,08x |
+
+On localhost the saved round trips are a small share of the total; the gain grows with latency
+and with the number of chunks (a remote server or a smaller batch limit).
 
 ## Row materialization
 

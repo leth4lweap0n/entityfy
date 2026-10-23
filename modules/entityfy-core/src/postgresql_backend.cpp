@@ -5,6 +5,8 @@
 #include <tao/pq.hpp>
 #include <tao/pq/binary.hpp>
 #include <tao/pq/oid.hpp>
+#include <tao/pq/pipeline.hpp>
+#include <tao/pq/result_status.hpp>
 #include <tao/pq/result_traits.hpp>
 
 #include <cctype>
@@ -26,6 +28,28 @@ namespace
 {
 
 constexpr std::size_t max_pg_parameters = 1024;
+
+// taopq turns PostgreSQL SQLSTATE codes into typed exceptions; the two that a
+// retry can resolve get a dedicated entityfy type, everything else keeps the
+// message based classification.
+[[noreturn]] void throw_pg_error(std::string_view operation,
+                                 const std::string& sql,
+                                 const tao::pq::sql_error& error)
+{
+    auto message = sql_context_message("PostgreSQL", operation, sql, error.what());
+
+    if(error.sqlstate == "40001")
+    {
+        throw serialization_failure{std::move(message), sql};
+    }
+
+    if(error.sqlstate == "40P01")
+    {
+        throw deadlock_detected{std::move(message), sql};
+    }
+
+    throw_classified_sql_error("PostgreSQL", operation, sql, error.what());
+}
 
 struct pg_parameter
 {
@@ -375,7 +399,127 @@ public:
     execution_result execute(const entityfy::statement& input) override
     {
         const std::lock_guard lock{mutex_};
+        return execute_locked(input);
+    }
 
+    // Batched writes use libpq's pipeline mode: every statement is sent before
+    // any result is awaited, so a multi-chunk insert costs one round trip.
+    [[nodiscard]] std::vector<execution_result> execute_batch(
+        const std::vector<entityfy::statement>& statements) override
+    {
+        const std::lock_guard lock{mutex_};
+
+        bool pipeline_ready = statements.size() > 1;
+
+        for(const auto& entry: statements)
+        {
+            const auto sql = postgres_placeholders(entry.sql);
+
+            if(is_ddl(sql) || !is_preparable(sql))
+            {
+                pipeline_ready = false;
+                break;
+            }
+        }
+
+        if(!pipeline_ready)
+        {
+            std::vector<execution_result> output;
+            output.reserve(statements.size());
+
+            for(const auto& entry: statements)
+            {
+                output.push_back(execute_locked(entry));
+            }
+
+            return output;
+        }
+
+        try
+        {
+            std::vector<std::string> sqls;
+            std::vector<std::string> prepared_names;
+            sqls.reserve(statements.size());
+            prepared_names.reserve(statements.size());
+
+            // PREPARE has to happen before the pipeline starts; a prepared
+            // statement can then be sent inside it.
+            for(const auto& entry: statements)
+            {
+                sqls.push_back(postgres_placeholders(entry.sql));
+                prepared_names.push_back(statement_name_for(sqls.back()));
+            }
+
+            auto pipe = connection_->pipeline();
+
+            try
+            {
+                for(std::size_t index = 0; index < statements.size(); ++index)
+                {
+                    if(logger_)
+                    {
+                        logger_(statements[index].sql);
+                    }
+
+                    auto parameters = to_pg_parameters(statements[index].binds);
+                    tao::pq::parameter<max_pg_parameters> bound;
+                    bind_parameters(bound, parameters);
+
+                    pipe->send(prepared_names[index].empty() ? sqls[index] : prepared_names[index], bound);
+                }
+
+                pipe->sync();
+
+                std::vector<execution_result> output;
+                output.reserve(statements.size());
+
+                for(std::size_t index = 0; index < statements.size(); ++index)
+                {
+                    auto result = pipe->get_result();
+                    output.push_back(execution_result{
+                        .rows_affected = result.has_rows_affected() ? result.rows_affected() : 0,
+                    });
+                }
+
+                pipe->consume_sync();
+                return output;
+            }
+            catch(...)
+            {
+                // A failed statement aborts the rest of the pipeline. The
+                // remaining results (and the sync) have to be consumed before
+                // the connection can leave pipeline mode and be used again.
+                try
+                {
+                    while(true)
+                    {
+                        auto result = pipe->get_result();
+                        if(result.status() == tao::pq::result_status::pipeline_sync)
+                        {
+                            break;
+                        }
+                    }
+                }
+                catch(...)
+                {
+                }
+
+                throw;
+            }
+        }
+        catch(const tao::pq::sql_error& error)
+        {
+            throw_pg_error("execute batch", statements.front().sql, error);
+        }
+        catch(const std::exception& error)
+        {
+            throw_classified_sql_error("PostgreSQL", "execute batch", statements.front().sql, error.what());
+        }
+    }
+
+private:
+    execution_result execute_locked(const entityfy::statement& input)
+    {
         try
         {
             if(logger_)
@@ -403,12 +547,17 @@ public:
                 .rows_affected = result.has_rows_affected() ? result.rows_affected() : 0,
             };
         }
+        catch(const tao::pq::sql_error& error)
+        {
+            throw_pg_error("execute", input.sql, error);
+        }
         catch(const std::exception& error)
         {
             throw_classified_sql_error("PostgreSQL", "execute", input.sql, error.what());
         }
     }
 
+public:
     [[nodiscard]] std::vector<row> query(const entityfy::statement& input) override
     {
         const std::lock_guard lock{mutex_};
@@ -458,6 +607,10 @@ public:
             }
 
             return rows;
+        }
+        catch(const tao::pq::sql_error& error)
+        {
+            throw_pg_error("query", input.sql, error);
         }
         catch(const std::exception& error)
         {

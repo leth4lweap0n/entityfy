@@ -90,6 +90,34 @@ public:
     using constraint_error::constraint_error;
 };
 
+// Errors that a retry can resolve: the transaction lost a race, not the data.
+class transient_error : public sql_error
+{
+public:
+    using sql_error::sql_error;
+};
+
+// PostgreSQL SQLSTATE 40001: the transaction must be retried.
+class serialization_failure : public transient_error
+{
+public:
+    using transient_error::transient_error;
+};
+
+// PostgreSQL SQLSTATE 40P01: the transaction was chosen as the deadlock victim.
+class deadlock_detected : public transient_error
+{
+public:
+    using transient_error::transient_error;
+};
+
+// SQLite SQLITE_BUSY / SQLITE_LOCKED: another connection holds the lock.
+class database_busy : public transient_error
+{
+public:
+    using transient_error::transient_error;
+};
+
 namespace detail
 {
 

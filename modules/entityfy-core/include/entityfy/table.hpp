@@ -264,14 +264,20 @@ public:
         const std::size_t limit = backend_->batch_parameter_limit();
         const std::size_t max_rows = std::max<std::size_t>(1, limit / column_count);
 
+        std::vector<entityfy::statement> commands;
+        commands.reserve((models.size() + max_rows - 1) / max_rows);
+
         for(std::size_t chunk = 0; chunk < models.size(); chunk += max_rows)
         {
             const std::size_t chunk_end = std::min(models.size(), chunk + max_rows);
             const std::vector<Model> batch{models.begin() + static_cast<std::ptrdiff_t>(chunk),
                                            models.begin() + static_cast<std::ptrdiff_t>(chunk_end)};
 
-            auto command = insert_many_statement(batch, model_);
-            const auto executed = backend_->execute(command);
+            commands.push_back(insert_many_statement(batch, model_));
+        }
+
+        for(const auto& executed: backend_->execute_batch(commands))
+        {
             summary.rows_affected += executed.rows_affected;
         }
 

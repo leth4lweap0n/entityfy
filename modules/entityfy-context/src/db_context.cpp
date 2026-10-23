@@ -13,6 +13,11 @@ namespace
 
 bool is_transient(const std::exception& error)
 {
+    if(dynamic_cast<const entityfy::transient_error*>(&error) != nullptr)
+    {
+        return true;
+    }
+
     const std::string message = error.what();
 
     for(const std::string_view needle: {            "database is locked",

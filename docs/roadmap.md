@@ -69,6 +69,15 @@
   migrate provider (identity columns, dependent index rebuilds, named default constraints); SQL
   Server has no `CREATE INDEX IF NOT EXISTS`, has no `RESTRICT` keyword, and `AVG` over integers is
   cast to FLOAT
+- **PostgreSQL pipeline batching**: `insert_many` chunks go through one libpq pipeline
+  (`execute_batch`, one round trip instead of one per chunk); measured 1,05-1,08x on localhost,
+  larger as latency grows
+- **Typed transient errors**: `serialization_failure` (40001), `deadlock_detected` (40P01) and
+  `database_busy` (SQLite busy/locked) derive from `transient_error`; the context retry policy
+  checks the type before falling back to message matching
+- **Migration-provider statement cache: decided against by measurement** - each migration
+  statement is unique (an LRU cannot hit); prepare costs 10,5 us (SQLite DDL) / 81 us (PG round
+  trip) once per statement. Numbers and rationale in `docs/benchmarks.md`
 - **Statement cache for MySQL and SQL Server**: `MYSQL_STMT` handles and ODBC statements stay in
   an LRU (default capacity 32), resetting the result set/parameter bindings between uses; measured
   by the backend cache tests (size, capacity changes, results after disabling)
@@ -91,25 +100,10 @@ features for now (see [Deferred](#deferred-other-providers)). Each entry records
 has to change so a session can pick it up without redoing the analysis. Everything above this
 section is implemented and covered by the test suite.
 
-### Change tracker
-
 1. **PostgreSQL `xmin` token (P2)** — the store-generated token EF Core users get from Npgsql, so
    a model can use the system column instead of an application column. Surface:
    `postgresql_backend.cpp` select/update paths, model mapping. Acceptance: a model using the
    system column conflicts after an out-of-band update without an application column.
-
-### SQLite and PostgreSQL
-
-2. **PostgreSQL pipeline mode / batching** — with the statement cache in place the per-call round
-   trip dominates. Surface: `postgresql_backend.cpp` batch path. Acceptance: batched writes use a
-   pipeline, the benchmark table records before/after, the PostgreSQL suite stays green.
-3. **Type-based transient errors and retry** — retries match message text ("deadlock detected",
-   "database is locked"). Surface: `postgresql_backend.cpp`, `sqlite_backend.cpp`, `error.hpp`,
-   `db_context` retry predicate. Acceptance: PostgreSQL `40001`/`40P01` and SQLite
-   `SQLITE_BUSY`/`SQLITE_LOCKED` map to dedicated error types and the retry policy keys off them.
-4. **Statement cache in the migration providers** — SQLite/PostgreSQL only for now; decide by
-   measurement. Acceptance: the measurement lands in `docs/benchmarks.md` and the outcome
-   (implementation or documented decision) is recorded.
 
 ## Deferred: other providers
 

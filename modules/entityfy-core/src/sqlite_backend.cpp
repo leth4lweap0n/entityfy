@@ -106,6 +106,24 @@ namespace
     return columns.getText(index);
 }
 
+// sl3 only exposes the sqlite3 message text, so busy/locked are recognized by
+// the message and get the typed error a retry can look at.
+[[noreturn]] void throw_sqlite_error(std::string_view operation,
+                                     const std::string& sql,
+                                     const std::exception& error)
+{
+    const std::string_view message{error.what()};
+
+    if(message.find("database is locked") != std::string_view::npos ||
+       message.find("database table is locked") != std::string_view::npos ||
+       message.find("database schema is locked") != std::string_view::npos)
+    {
+        throw database_busy{sql_context_message("SQLite", operation, sql, error.what()), sql};
+    }
+
+    throw_classified_sql_error("SQLite", operation, sql, error.what());
+}
+
 } // namespace
 
 class sqlite_backend final : public backend
@@ -145,7 +163,7 @@ public:
         }
         catch(const std::exception& error)
         {
-            throw_classified_sql_error("SQLite", "execute", input.sql, error.what());
+            throw_sqlite_error("execute", input.sql, error);
         }
     }
 
@@ -184,7 +202,7 @@ public:
         }
         catch(const std::exception& error)
         {
-            throw_classified_sql_error("SQLite", "query", input.sql, error.what());
+            throw_sqlite_error("query", input.sql, error);
         }
     }
 
@@ -229,7 +247,7 @@ public:
                 throw;
             }
 
-            throw_classified_sql_error("SQLite", "query", input.sql, error.what());
+            throw_sqlite_error("query", input.sql, error);
         }
     }
 
