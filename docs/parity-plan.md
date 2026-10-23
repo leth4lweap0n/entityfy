@@ -137,7 +137,7 @@ flag), `lazy_error` with `not_attached`, `context_destroyed`, `context_cleared`,
 
 ### P1.2 Context binding and lifetimes
 
-**Status:** implemented (commits a20ed7b, 4c529a8). Handles bind on add/attach/refresh/save and on identity-map hits; save and rollback reset/rebind the touched entity. Composite owner keys are rejected until P1.5.
+**Status:** implemented (commits a20ed7b, 4c529a8). Handles bind on add/attach/refresh/save and on identity-map hits; save and rollback reset/rebind the touched entity. Composite owner keys and multi-column relations are supported since P1.5.
 
 `db_context` owns the link; `clear()` bumps the generation; the destructor clears `alive`.
 `set_state<T>` binds/rebinds handles in `add`, `attach` (only when not already attached),
@@ -162,6 +162,11 @@ foreign key, added entity after key generation, pool lease invalidation. Documen
 rules and the EF differences (explicit handle instead of a proxy).
 
 ### P1.5 Composite foreign keys
+
+**Status:** implemented (commit 1921d56): grouped `references{..., group}`, table-level composite
+FOREIGN KEY DDL, tuple-based include/include_parent and lazy collection/reference, plus composite
+FK introspection and whole-list validation on SQLite and PostgreSQL. The migrate providers still
+describe foreign keys one column at a time.
 
 Multi-column `references`, relation descriptors with column lists, `include`/lazy grouping and
 `include_parent` across composite keys. Until this slice lands, composite keys work for CRUD but

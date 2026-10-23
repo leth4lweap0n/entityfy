@@ -220,10 +220,22 @@ A handle does not keep the context alive: it holds a weak link and a generation.
 context is destroyed a call throws `lazy_error` with `context_destroyed`; after `clear()` it
 throws `context_cleared`; an entity obtained through `as_no_tracking()` is `not_attached` and has
 no valid context to query. A null foreign key loads as `get() == nullptr`; dereferencing it throws
-`not_found`. Composite foreign keys, including a composite owner key on a model with a lazy
-member, are rejected with an explicit `logic_error` until P1.5; single-column keys - integral,
-string and UUID - are supported. A handle is only as thread-safe as its context; the SQLite and
-libpq drivers here are synchronous and one connection is not shared between threads.
+`not_found`. Foreign keys may span several columns: give every participating member the same
+non-zero `group` and the matching referenced column:
+```cpp
+struct child
+{
+    [[= entityfy::references{"parents", "tenant_id", "CASCADE", "CASCADE", 1}]]
+    std::int64_t tenant_id;
+    [[= entityfy::references{"parents", "code", "CASCADE", "CASCADE", 1}]]
+    std::string parent_code;
+};
+```
+The group produces one table-level `FOREIGN KEY (tenant_id, parent_code) REFERENCES
+parents(tenant_id, code)`; navigation validates that the referenced tuple is the parent's complete
+primary key and then binds/loads every key part. Single-column keys - integral, string and UUID -
+keep the column-level form. A handle is only as thread-safe as its context; the SQLite and libpq
+drivers here are synchronous and one connection is not shared between threads.
 
 Bulk operations bypass the change tracker:
 

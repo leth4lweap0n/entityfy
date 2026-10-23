@@ -125,8 +125,8 @@ are green.
 1. **P0 composite and non-integral keys** — complete (row_key, key lists, table-level and
    string/UUID keys, key-based statements, identity/concurrency, migration diff). Altering the
    columns of an existing key (P0.3b2) remains.
-2. **P1 lazy loading** — P1.1-P1.4 complete (handles, binding, loaders, include cache, lifetimes).
-   P1.5 composite foreign keys remains.
+2. **P1 lazy loading** — complete: P1.1-P1.4 (handles, binding, loaders, include cache,
+   lifetimes) and P1.5 (composite foreign keys in include/lazy navigation).
 3. **P2 async I/O** — complete for the implemented slices: task/executors, native nonblocking
    PostgreSQL, client/table async, SQLite thread-offload facade, task-based context save with a
    save gate. Remaining: `transaction_async`, native async `saveable` methods and
@@ -145,9 +145,9 @@ are green.
 | P0.4 | key tests and docs | complete |
 | P1.1 | `lazy<T>` handles, cache, typed errors | complete |
 | P1.2 | context binding, lifetimes, write/rollback invalidation | complete |
-| P1.3 | loaders and include cache fill | complete (single-column relations); P1.5 open |
+| P1.3 | loaders and include cache fill | complete |
 | P1.4 | lazy tests and docs | complete |
-| P1.5 | composite foreign keys in relations/navigation | open |
+| P1.5 | composite foreign keys in relations/navigation | complete |
 | P2.1 | `task<T>`, executors | complete |
 | P2.2 | native nonblocking PostgreSQL | complete; `transaction_async` open |
 | P2.3 | async client/table surface | complete |
@@ -179,7 +179,8 @@ picked up again.
   decision was made against implementation by measurement (`docs/benchmarks.md`).
 - `save_changes_async()` is a thread offload, not I/O asynchrony (the drivers are synchronous).
 - Migrations add and drop key columns, but altering the columns of an existing primary key in
-  place (P0.3b2) is not implemented; composite foreign keys in navigation helpers wait for P1.5.
+  place (P0.3b2) is not implemented. Composite foreign keys are created and navigated; the migrate
+  providers still describe them one column at a time.
 - The `db_set<T>` members of a context must be declared by hand: C++26 reflection can inspect
   members but cannot synthesize them, so `ctx.users` cannot be generated from the entity type
   alone.

@@ -258,6 +258,9 @@ returning `false` stops further consumer calls, not the network read.
   `context_destroyed` or `context_cleared` instead of dereferencing stale state. `include` /
   `include_parent` fill the same caches from their single query, and a save that changes the key
   or foreign key resets and rebinds the handles of the touched entity.
+- **Composite foreign keys**: members sharing a non-zero `references{..., group}` form one
+  table-level foreign key; `include`, `include_parent` and lazy handles resolve the complete
+  column tuple, and introspection/validation compare the whole key instead of its first column.
 - Navigation fixup: the parent's `std::vector<Child*>` member is filled with the tracked
   children.
 - Bulk operations: `query().remove_all()`, `query().assign(...).update_all()`.
@@ -348,10 +351,10 @@ the ratios are more stable.
 ctest --preset release
 ```
 
-142 CTest entries in the default build: 140 core Catch2 test cases (1535 assertions with
-PostgreSQL enabled; SQLite-only runs execute 118 cases and 1338 assertions) and the
-migrate/context test binaries - which contain 10 and 26 scenarios respectively (23 executed with
-SQLite only, 24 with PostgreSQL). Each opt-in backend (`ENTITYFY_ENABLE_MYSQL`,
+155 CTest entries in the default build: 153 core Catch2 test cases (1634 assertions with
+PostgreSQL enabled; SQLite-only runs execute 129 cases and 1407 assertions) and the
+migrate/context test binaries - which contain 10 and 27 scenarios respectively (24 executed with
+SQLite only, 25 with PostgreSQL). Each opt-in backend (`ENTITYFY_ENABLE_MYSQL`,
 `ENTITYFY_ENABLE_SQLSERVER`) adds three core cases (two backend tests and a statement cache test)
 and one scenario to the migrate and context binaries.
 
