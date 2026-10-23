@@ -3,6 +3,7 @@
 #include <entityfy/entityfy.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -57,6 +58,16 @@ struct [[= entityfy::table{"ck_slugs"}]] ck_slug
 {
     [[= entityfy::primary_key, = entityfy::varchar{64}]]
     std::string slug;
+
+    [[= entityfy::not_null, = entityfy::varchar{120}]]
+    std::string name;
+};
+
+// A GUID key: std::string storage with the portable UUID column type.
+struct [[= entityfy::table{"ck_uuid_events"}]] ck_uuid_event
+{
+    [[= entityfy::primary_key, = entityfy::uuid]]
+    std::string id;
 
     [[= entityfy::not_null, = entityfy::varchar{120}]]
     std::string name;
@@ -257,6 +268,75 @@ TEST_CASE("sqlite string primary key round trips through row_key", "[composite][
     REQUIRE_FALSE(db.find<ck_slug>(slug_key("entityfy")).has_value());
     REQUIRE(db.remove_by_key<ck_slug>(slug_key("entityfy")) == 0);
 }
+
+TEST_CASE("sqlite guid primary key round trips through row_key", "[composite][sqlite][uuid-key]")
+{
+    entityfy::client db{"sqlite://:memory:"};
+    db.migrate<ck_uuid_event>();
+
+    const auto key_columns = entityfy::primary_key_columns<ck_uuid_event>(db.target_dialect());
+    REQUIRE(key_columns.size() == 1);
+    REQUIRE(key_columns[0].name == "id");
+
+    const std::string id = "6f1c2c9e-3a6d-4f4e-9f1a-2b7c8d9e0f11";
+    REQUIRE(db.insert(ck_uuid_event{.id = id, .name = "created"}).rows_affected == 1);
+    REQUIRE_THROWS_AS(
+        db.insert(ck_uuid_event{.id = id, .name = "duplicate"}),
+        entityfy::unique_violation
+    );
+
+    const auto loaded = db.find<ck_uuid_event>(entityfy::row_key{entityfy::sql_value{id}});
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->name == "created");
+
+    const auto by_value = db.find<ck_uuid_event>(id);
+    REQUIRE(by_value.has_value());
+
+    auto renamed = *loaded;
+    renamed.name = "updated";
+    REQUIRE(db.update(renamed) == 1);
+    REQUIRE(db.find<ck_uuid_event>(id)->name == "updated");
+
+    REQUIRE(db.remove_by_key<ck_uuid_event>(entityfy::row_key{entityfy::sql_value{id}}) == 1);
+    REQUIRE_FALSE(db.find<ck_uuid_event>(id).has_value());
+}
+
+#ifdef ENTITYFY_ENABLE_POSTGRESQL
+
+TEST_CASE("postgres guid primary key round trips through row_key", "[composite][postgresql][uuid-key]")
+{
+    const char* uri = std::getenv("ENTITYFY_PG_URI");
+    if(uri == nullptr)
+    {
+        SKIP("ENTITYFY_PG_URI is not set");
+    }
+
+    entityfy::client db{uri};
+    db.migrate<ck_uuid_event>();
+
+    const std::string id = "6f1c2c9e-3a6d-4f4e-9f1a-2b7c8d9e0f12";
+    (void)db.remove_by_key<ck_uuid_event>(entityfy::row_key{entityfy::sql_value{id}});
+
+    REQUIRE(db.insert(ck_uuid_event{.id = id, .name = "created"}).rows_affected == 1);
+    REQUIRE_THROWS_AS(
+        db.insert(ck_uuid_event{.id = id, .name = "duplicate"}),
+        entityfy::unique_violation
+    );
+
+    const auto loaded = db.find<ck_uuid_event>(id);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->name == "created");
+
+    auto renamed = *loaded;
+    renamed.name = "updated";
+    REQUIRE(db.update(renamed) == 1);
+    REQUIRE(db.find<ck_uuid_event>(id)->name == "updated");
+
+    REQUIRE(db.remove_by_key<ck_uuid_event>(entityfy::row_key{entityfy::sql_value{id}}) == 1);
+    REQUIRE_FALSE(db.find<ck_uuid_event>(id).has_value());
+}
+
+#endif // ENTITYFY_ENABLE_POSTGRESQL
 
 TEST_CASE("sqlite relationship helpers reject a composite parent key", "[composite][sqlite][relations]")
 {
