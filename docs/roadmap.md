@@ -74,35 +74,77 @@
 
 ## Next
 
-The remaining work is large and none of it is started; each entry records the
-surface that has to change, so a session can pick one up without redoing the
-analysis. Everything above this section is implemented and covered by the test
-suite.
+The focus is SQLite and PostgreSQL. The other backends stay buildable and tested but get no new
+features for now (see [Deferred](#deferred-other-providers)). Each entry records the surface that
+has to change so a session can pick it up without redoing the analysis. Everything above this
+section is implemented and covered by the test suite.
 
-1. **`as_no_tracking()` with eager loading** — a no-tracking query currently rejects `include`;
+### Change tracker: EF Core concurrency parity
+
+1. **Structured concurrency error (P0)** — an update/delete that affects zero rows currently throws
+   a plain `std::runtime_error` with the key in the message. Surface:
+   `modules/entityfy-context/include/entityfy/db_set.hpp` (save/delete paths),
+   a new `concurrency_error` with `entries()` carrying table, key, original values and the current
+   database row. Acceptance: a stale save throws `concurrency_error` whose entry exposes the
+   winner's values; existing suites keep passing.
+2. **Resolution APIs (P0)** — no way to resolve a conflict without losing work: `refresh()`
+   overwrites the entity and resets it to unchanged. Surface: `db_set<T>` plus
+   `docs/context.md`. Add `database_values(entity)` (read without overwriting),
+   `accept_changes(entity, database_row)` (client wins: original snapshot := DB row) and a
+   per-member overload for merges. Acceptance: client-wins and merge scenarios save successfully
+   and are covered by the context suite.
+3. **Delete token check (P0)** — deletes use `DELETE ... WHERE id = ?` only, so a stale delete wins.
+   Surface: `entityfy::delete_by_id_statement` (core) plus the context delete path. Acceptance:
+   a stale delete throws `concurrency_error`; a delete of an already removed row reports it.
+4. **Token selection and attach (P1)** — the token member must be named `version`; disconnected
+   entities cannot carry a separate original snapshot. Surface: annotations, `db_set<T>`.
+   Add `[[= entityfy::concurrency_token]]` for any integral member and
+   `attach(value, original)`. Acceptance: a model whose token is named `revision` conflicts
+   correctly, and a stale attached entity conflicts.
+5. **PostgreSQL `xmin` token (P2)** — the store-generated token EF Core users get from Npgsql.
+   Surface: `postgresql_backend.cpp` select/update paths, model mapping. Acceptance: a model using
+   the system column conflicts after an out-of-band update without an application column.
+
+### SQLite and PostgreSQL
+
+6. **`as_no_tracking()` with eager loading** — a no-tracking query currently rejects `include`;
    the include path in `db_set` would have to carry read-only pairs and merge them by key.
-   Surface: `modules/entityfy-context/include/entityfy/db_set.hpp`, the context test suite.
-   Acceptance: an eager-loaded no-tracking read returns the same rows as the tracked variant, with
-   a scenario in the context binary.
-2. **Deduplicate the context read path** — `include`/`join` still collect `vector<row>` before
-   materializing; `find`, `to_list`, `from_sql` and `as_no_tracking` already stream through
-   `client::query_each`. Surface: the same file. Acceptance: the include path builds rows in the
-   consumer without an intermediate vector, all suites green, and the delta recorded in
-   `docs/benchmarks.md`.
-3. **PostgreSQL pipeline mode / batching** — with the statement cache in place the per-call round
-   trip dominates (`docs/benchmarks.md`); taocpp supports pipelines. Surface:
-   `postgresql_backend.cpp` batch path. Acceptance: batched writes use a pipeline, the benchmark
-   table records the before/after numbers, and the PostgreSQL suite stays green.
-4. **Statement cache in the migration providers** — they prepare every statement. Decide by
-   measurement first: count the statements a typical migration issues and time the prepare cost;
-   implement the LRU only if it is visible. Acceptance: the measurement lands in
-   `docs/benchmarks.md` and the outcome (implementation or documented decision) is recorded.
+   Surface: `modules/entityfy-context/include/entityfy/db_set.hpp`. Acceptance: an eager-loaded
+   no-tracking read returns the same rows as the tracked variant, with a scenario.
+7. **Deduplicate the context read path** — `include`/`join` still collect `vector<row>` before
+   materializing. Surface: the same file. Acceptance: rows are built in the consumer, all suites
+   green, delta recorded in `docs/benchmarks.md`.
+8. **PostgreSQL pipeline mode / batching** — with the statement cache in place the per-call round
+   trip dominates. Surface: `postgresql_backend.cpp` batch path. Acceptance: batched writes use a
+   pipeline, the benchmark table records before/after, the PostgreSQL suite stays green.
+9. **Type-based transient errors and retry** — retries match message text ("deadlock detected",
+   "database is locked"). Surface: `postgresql_backend.cpp`, `sqlite_backend.cpp`, `error.hpp`,
+   `db_context` retry predicate. Acceptance: PostgreSQL `40001`/`40P01` and SQLite
+   `SQLITE_BUSY`/`SQLITE_LOCKED` map to dedicated error types and the retry policy keys off them.
+10. **Statement cache in the migration providers** — SQLite/PostgreSQL only for now; decide by
+    measurement. Acceptance: the measurement lands in `docs/benchmarks.md` and the outcome
+    (implementation or documented decision) is recorded.
+
+## Deferred: other providers
+
+Paused deliberately; the code stays compiled and tested, no feature work until this section is
+picked up again.
+
+- **MySQL/MariaDB**: no transactional DDL (inherent), SQL-dump backups only (no `mysqldump`),
+  `[[= entityfy::json]]` is `LONGTEXT` because MariaDB reports its alias that way.
+- **SQL Server / ODBC**: the migrate provider refuses primary-key/identity changes and rebuilds
+  dependent indexes around `ALTER COLUMN`; backups are SQL dumps (no `BACKUP DATABASE`).
+- **Concurrency parity P0/P1 above is provider-agnostic** (context/core), so it also applies to
+  these backends; P2 (`xmin`) is PostgreSQL-only by design.
 
 ## Known limitations
 
 - The context module uses `entityfy::db_query_builder`; it is named this way to avoid a name
   collision with core's `entityfy::query_builder`.
-- The migration module uses its own providers; there is no statement cache there.
+- The migration module uses its own providers; there is no statement cache there (tracked as a
+  measured decision for SQLite/PostgreSQL).
+- Concurrency: until the change tracker items land, a conflict without a token column is a plain
+  error, deletes are not versioned, and resolving a conflict means reloading and re-applying edits.
 - `save_changes_async()` is a thread offload, not I/O asynchrony (the drivers are synchronous).
 - The `db_set<T>` members of a context must be declared by hand: C++26 reflection can inspect
   members but cannot synthesize them, so `ctx.users` cannot be generated from the entity type
