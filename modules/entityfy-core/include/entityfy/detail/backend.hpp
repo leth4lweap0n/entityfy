@@ -3,11 +3,13 @@
 #include <entityfy/dialect.hpp>
 #include <entityfy/introspection.hpp>
 #include <entityfy/statement.hpp>
+#include <entityfy/task.hpp>
 #include <entityfy/value.hpp>
 
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -21,6 +23,17 @@ struct execution_result
 {
     std::uint64_t rows_affected = 0;
     std::int64_t  last_insert_id = 0;
+};
+
+// How a backend produces the asynchronous surface below. `unsupported` means
+// the async entry points throw, `thread_offload` means the synchronous call is
+// performed on a worker thread, and `native` means the driver itself is driven
+// without blocking a thread while a statement is in flight.
+enum class async_capability
+{
+    unsupported,
+    thread_offload,
+    native,
 };
 
 class backend
@@ -47,6 +60,31 @@ public:
 
         return output;
     }
+
+    // Asynchronous surface. A backend that reports `unsupported` rejects every
+    // async call instead of silently running it synchronously, so a caller can
+    // branch on the capability without a surprise fallback.
+    [[nodiscard]] virtual async_capability async_mode() const noexcept
+    {
+        return async_capability::unsupported;
+    }
+
+    virtual entityfy::task<execution_result> execute_async(const entityfy::statement&)
+    {
+        throw std::logic_error{"async execution is not supported by this backend"};
+    }
+
+    virtual entityfy::task<std::vector<row>> query_async(const entityfy::statement&)
+    {
+        throw std::logic_error{"async execution is not supported by this backend"};
+    }
+
+    virtual entityfy::task<std::vector<execution_result>> execute_batch_async(
+        const std::vector<entityfy::statement>&)
+    {
+        throw std::logic_error{"async execution is not supported by this backend"};
+    }
+
     [[nodiscard]] virtual std::vector<row> query(const entityfy::statement& input) = 0;
 
     // Streams rows to a consumer without collecting them: the backend reuses a
