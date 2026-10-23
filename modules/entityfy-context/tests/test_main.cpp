@@ -245,6 +245,18 @@ struct [[= entityfy::table{"lz_users"}]] lz_user
 static_assert(entityfy::detail::is_ignored_member(^^lz_user::posts), "posts must be ignored");
 static_assert(entityfy::detail::is_ignored_member(^^lz_post::author), "author must be ignored");
 
+// An include fills only the handle whose element type it loaded. A model
+// without a matching handle resolves to an empty reflection, so the fill
+// branch compiles away and the include keeps its old behavior.
+static_assert(entityfy::detail::lazy_collection_member<lz_user, lz_post>() != std::meta::info{},
+              "lz_user declares a lazy post collection");
+static_assert(entityfy::detail::lazy_reference_member<lz_post, lz_user>() != std::meta::info{},
+              "lz_post declares a lazy author reference");
+static_assert(entityfy::detail::lazy_collection_member<lz_post, lz_user>() == std::meta::info{},
+              "lz_post has no lazy collection to fill");
+static_assert(entityfy::detail::lazy_reference_member<lz_user, lz_post>() == std::meta::info{},
+              "lz_user has no lazy reference to fill");
+
 // A nullable foreign key has no parent to load, so its handle caches nullptr
 // without issuing a query.
 struct [[= entityfy::table{"lz_notes"}]] lz_note
@@ -2664,6 +2676,74 @@ status run_lazy_loading_checks()
         composite_parent = std::string{error.what()}.find("P1.5") != std::string::npos;
     }
     require(composite_parent, "a composite parent key is an explicit logic_error");
+
+    // Eager loading fills the lazy handle from the rows the include query
+    // already returned, so a later access never issues a second query. The
+    // handle is seeded with an empty payload the include has to replace, so a
+    // pass cannot come from a payload that was already going to be returned.
+    require(ada->posts.is_attached(), "the owner's handle is bound before the include");
+    ada->posts.mark_loaded(std::vector<lz_post*>{});
+    require(ada->posts.is_loaded() && ada->posts.empty(), "the handle starts with a stale empty payload");
+
+    statements.clear();
+    const auto included = users.include<lz_post>({ada});
+    require(included.size() == 1 && included.front().first == ada, "include maps the owner");
+    require(included.front().second.size() == 1, "include returns the owner's children");
+    require(ada->posts.is_loaded(), "include fills the lazy collection cache");
+    require(ada->posts.is_attached(), "include keeps the lazy collection bound");
+    require(ada->posts.size() == 1 && ada->posts.get() == included.front().second,
+            "the cached collection is exactly the included bucket");
+    require(statements.size() == 1 && statements.front().rfind("SELECT", 0) == 0,
+            "include issues exactly one select");
+    require(posts.find(ada->posts.get().front()->id) == ada->posts.get().front(),
+            "included children are the tracked rows");
+    require(statements.size() == 1, "the identity check adds no SQL");
+
+    statements.clear();
+    require(ada->posts.size() == 1 && ada->posts.get() == included.front().second,
+            "a cached include collection is returned again");
+    require(statements.empty(), "the included collection issues no second select");
+
+    // Every owner caches its own bucket, including an owner without children:
+    // an empty collection is a loaded payload, not a pending query.
+    statements.clear();
+    const auto multi = users.include<lz_post>({ada, grace, &fresh});
+    require(multi.size() == 3, "include maps every owner");
+    require(ada->posts.size() == 1 && grace->posts.size() == 1, "each owner caches its own bucket");
+    require(ada->posts.get().front()->title == "second" && grace->posts.get().front()->title == "grace",
+            "the cached buckets hold the right children");
+    require(fresh.posts.is_loaded() && fresh.posts.empty(), "an owner without children caches an empty bucket");
+    require(statements.size() == 1, "a multi-owner include issues one select");
+
+    statements.clear();
+    require_not(grace_post->author.is_loaded(), "the reference starts unloaded");
+    const auto included_parents = posts.include_parent<lz_user>({grace_post});
+    require(included_parents.size() == 1 && included_parents.front().first == grace_post,
+            "include_parent maps the child");
+    require(grace_post->author.is_loaded(), "include_parent fills the lazy reference cache");
+    require(grace_post->author.is_attached(), "include_parent keeps the lazy reference bound");
+    require(grace_post->author.get() == included_parents.front().second,
+            "the cached reference is the included parent");
+    require(grace_post->author.get() == users.find(grace_post->user_id),
+            "the included parent is the tracked parent find() returns");
+    require(statements.size() == 1 && statements.front().rfind("SELECT", 0) == 0,
+            "include_parent issues exactly one select");
+
+    statements.clear();
+    require(grace_post->author.get() == included_parents.front().second,
+            "a cached include reference is returned again");
+    require(statements.empty(), "the included reference issues no second select");
+
+    // mark_loaded() only fills the cache, so the binding is still the one the
+    // tracker gave the handle: reset() makes it load through its own query.
+    ada->posts.reset();
+    require_not(ada->posts.is_loaded(), "reset() drops the included payload");
+    require(ada->posts.is_attached(), "the included handle is still bound");
+
+    statements.clear();
+    const auto& bound_reload = ada->posts.get();
+    require(bound_reload.size() == 1, "the preserved binding still loads the owner's children");
+    require(statements.size() == 1, "the rebound handle loads with one query");
 
     return status::passed;
 }

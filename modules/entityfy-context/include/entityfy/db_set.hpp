@@ -372,6 +372,41 @@ consteval std::string_view lazy_member_name()
     return std::meta::identifier_of(Member);
 }
 
+// The collection handle an include of `Element` can fill: the member whose type
+// is exactly `lazy<std::vector<Element>>`, or an empty reflection when the
+// model has none. Resolved at compile time, so a model outside the include
+// cache path compiles the branch away instead of paying for it at run time.
+template <typename Owner, typename Element>
+consteval std::meta::info lazy_collection_member()
+{
+    for(const auto member: meta::type<Owner>::fields())
+    {
+        if(std::meta::type_of(member) == ^^entityfy::lazy<std::vector<Element>>)
+        {
+            return member;
+        }
+    }
+
+    return std::meta::info{};
+}
+
+// The reference handle an include_parent of `Parent` can fill: the member whose
+// type is exactly `lazy<Parent>`, or an empty reflection when the model has
+// none.
+template <typename Owner, typename Parent>
+consteval std::meta::info lazy_reference_member()
+{
+    for(const auto member: meta::type<Owner>::fields())
+    {
+        if(std::meta::type_of(member) == ^^entityfy::lazy<Parent>)
+        {
+            return member;
+        }
+    }
+
+    return std::meta::info{};
+}
+
 // The relation from a child model to a parent model, resolved through the
 // "references" annotation. This slice binds single-column foreign keys only, so
 // a relation that points anywhere but the parent's primary key is an explicit
@@ -2146,6 +2181,7 @@ public:
 
             constexpr auto pointer_navigation = detail::find_member_of_type(^^T, ^^std::vector<Child*>);
             constexpr auto value_navigation = detail::find_member_of_type(^^T, ^^std::vector<Child>);
+            constexpr auto lazy_navigation = detail::lazy_collection_member<T, Child>();
 
             if constexpr(pointer_navigation != std::meta::info{})
             {
@@ -2162,6 +2198,15 @@ public:
                 }
 
                 (*parent).[:value_navigation:] = std::move(values);
+            }
+
+            if constexpr(lazy_navigation != std::meta::info{})
+            {
+                // The include query already returned these rows, so the handle
+                // caches exactly that bucket; a later access is served from the
+                // cache instead of issuing a second query. mark_loaded() leaves
+                // the binding alone, so reset() still reloads through it.
+                (*parent).[:lazy_navigation:].mark_loaded(bucket);
             }
 
             output.emplace_back(parent, std::move(bucket));
@@ -2201,6 +2246,8 @@ public:
                                      parent_model.table_name + " does not point at the primary key"};
         }
 
+        constexpr auto lazy_navigation = detail::lazy_reference_member<T, Parent>();
+
         std::vector<row_key> keys;
         std::vector<entityfy::sql_value> binds;
 
@@ -2224,6 +2271,13 @@ public:
         {
             for(auto* child: children)
             {
+                if constexpr(lazy_navigation != std::meta::info{})
+                {
+                    // No foreign key to resolve: the include already answered
+                    // "no parent", which is what the handle caches.
+                    (*child).[:lazy_navigation:].mark_loaded(nullptr);
+                }
+
                 output.emplace_back(child, nullptr);
             }
 
@@ -2276,14 +2330,23 @@ public:
         for(auto* child: children)
         {
             const auto key = entityfy::detail::read_column(*child, relation.local_column);
-            if(!key)
+            Parent* parent = nullptr;
+
+            if(key)
             {
-                output.emplace_back(child, nullptr);
-                continue;
+                const auto found = loaded.find(entityfy::detail::single_part_key(*key));
+                parent = found == loaded.end() ? nullptr : found->second;
             }
 
-            const auto found = loaded.find(entityfy::detail::single_part_key(*key));
-            output.emplace_back(child, found == loaded.end() ? nullptr : found->second);
+            if constexpr(lazy_navigation != std::meta::info{})
+            {
+                // The parent this include already resolved fills the handle, so
+                // the next access is served from the cache. mark_loaded() keeps
+                // the binding, so a later reset() still reloads through it.
+                (*child).[:lazy_navigation:].mark_loaded(parent);
+            }
+
+            output.emplace_back(child, parent);
         }
 
         return output;
