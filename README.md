@@ -120,6 +120,22 @@ Eager loading works on both paths: `as_no_tracking().include<post>()` yields own
 `(user, std::vector<post>)` pairs, and the tracked `include`, `include_parent` and join paths
 consume rows through `query_each` instead of buffering them.
 
+Navigation can also be declared lazy instead of eager: a `[[= entityfy::ignore]]
+entityfy::lazy<std::vector<post>> posts;` member (or `lazy<user> author;` for a reference) binds
+when the entity enters the context and loads once through the identity map on first access.
+`include` / `include_parent` fill the same handle from their single query, and a handle that
+outlives the context fails with a typed error instead of touching freed state.
+
+```cpp
+struct user
+{
+    std::int64_t id = 0;
+    [[= entityfy::not_null]] std::string email;
+
+    [[= entityfy::ignore]] entityfy::lazy<std::vector<post>> posts;
+};
+```
+
 ### When not to open a context
 
 `entityfy::client` is the layer the context itself is built on: statements, the query DSL and the
@@ -218,6 +234,11 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
 - Eager loading: `include<child>` (1:N), `include_parent<parent>` (N:1), two- and three-table
   joins. The foreign key is read from the `references` annotation, so no member pointer or join
   condition is passed.
+- **Lazy loading**: `entityfy::lazy<T>` collection and reference handles bind when the entity
+  enters the context, load on first access through the identity map, and report `not_attached`,
+  `context_destroyed` or `context_cleared` instead of dereferencing stale state. `include` /
+  `include_parent` fill the same caches from their single query, and a save that changes the key
+  or foreign key resets and rebinds the handles of the touched entity.
 - Navigation fixup: the parent's `std::vector<Child*>` member is filled with the tracked
   children.
 - Bulk operations: `query().remove_all()`, `query().assign(...).update_all()`.
@@ -304,11 +325,12 @@ the ratios are more stable.
 ctest --preset release
 ```
 
-55 CTest entries in the default build: 53 core Catch2 test cases (259 assertions with
-PostgreSQL enabled) and the migrate/context test binaries - which contain 10 and 21 scenarios
-respectively. Each opt-in backend (`ENTITYFY_ENABLE_MYSQL`, `ENTITYFY_ENABLE_SQLSERVER`) adds
-three core cases (two backend tests and a statement cache test) and one scenario to the migrate
-and context binaries.
+97 CTest entries in the default build: 95 core Catch2 test cases (1193 assertions with
+PostgreSQL enabled; SQLite-only runs execute 91 cases and 1130 assertions) and the
+migrate/context test binaries - which contain 10 and 23 scenarios respectively (22 with SQLite
+only, 23 with PostgreSQL). Each opt-in backend (`ENTITYFY_ENABLE_MYSQL`,
+`ENTITYFY_ENABLE_SQLSERVER`) adds three core cases (two backend tests and a statement cache test)
+and one scenario to the migrate and context binaries.
 
 PostgreSQL tests run when `ENTITYFY_PG_URI` is provided, MySQL tests when `ENTITYFY_MYSQL_URI` is
 provided and SQL Server tests when `ENTITYFY_SQLSERVER_URI` is provided. With

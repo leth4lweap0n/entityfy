@@ -96,6 +96,12 @@
 - **Streaming row materialization**: `find`/`find_one`/`find_many`/`exists` materialize in place
   without an intermediate row vector (measured: no significant single-row gain, small gain for
   many-row reads - see `docs/benchmarks.md`)
+- **Composite and non-integral keys (P0)**: `entityfy::row_key` key lists, table-level and static
+  primary keys including string and UUID, key-based statements, context identity and concurrency,
+  and the migration diff for table-level keys
+- **Lazy loading (P1)**: `entityfy::lazy<T>` reference and collection handles bound to tracked
+  entities, typed lifecycle errors, one-query loads through the identity map, eager-loading cache
+  fill, and reset/rebind after writes and rollback
 
 ## Next
 
@@ -135,6 +141,8 @@ picked up again.
 - The migration module uses its own providers and runs every statement once; the statement-cache
   decision was made against implementation by measurement (`docs/benchmarks.md`).
 - `save_changes_async()` is a thread offload, not I/O asynchrony (the drivers are synchronous).
+- Migrations add and drop key columns, but altering the columns of an existing primary key in
+  place (P0.3b2) is not implemented; composite foreign keys in navigation helpers wait for P1.5.
 - The `db_set<T>` members of a context must be declared by hand: C++26 reflection can inspect
   members but cannot synthesize them, so `ctx.users` cannot be generated from the entity type
   alone.

@@ -185,6 +185,46 @@ member receives a read-only copy snapshot.
 `entityfy::where(...)` is the core-level predicate builder; it stays snake_case because it lives
 in `entityfy-core`, next to the SQL generation it feeds.
 
+### Lazy loading
+
+A navigation member can load on first access instead of with the query. It must be ignored for
+column mapping:
+
+```cpp
+struct user
+{
+    std::int64_t id = 0;
+    std::string name;
+
+    [[= entityfy::ignore]] entityfy::lazy<std::vector<post>> posts;   // 1:N
+};
+
+struct post
+{
+    std::int64_t id = 0;
+    std::int64_t user_id = 0;
+
+    [[= entityfy::ignore]] entityfy::lazy<user> author;               // N:1
+};
+```
+
+Tracked entities bind their handles when they enter the context (`add`, `attach`, `find`,
+`to_list`) and after a save of the touched entity. `get()` issues one statement, attaches the
+loaded rows through the identity map and caches them; a second call does not query. `reset()`
+drops the cache and the next `get()` loads again, `is_loaded()` / `is_attached()` report the state,
+and `operator*` / `->` forward to the payload. `include` / `include_parent` fill the same handle
+from their own single query (`mark_loaded`), so eager and lazy loading can be mixed without a
+second round trip.
+
+A handle does not keep the context alive: it holds a weak link and a generation. After the
+context is destroyed a call throws `lazy_error` with `context_destroyed`; after `clear()` it
+throws `context_cleared`; an entity obtained through `as_no_tracking()` is `not_attached` and has
+no valid context to query. A null foreign key loads as `get() == nullptr`; dereferencing it throws
+`not_found`. Composite foreign keys, including a composite owner key on a model with a lazy
+member, are rejected with an explicit `logic_error` until P1.5; single-column keys - integral,
+string and UUID - are supported. A handle is only as thread-safe as its context; the SQLite and
+libpq drivers here are synchronous and one connection is not shared between threads.
+
 Bulk operations bypass the change tracker:
 
 ```cpp

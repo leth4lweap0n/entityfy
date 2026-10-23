@@ -31,6 +31,8 @@ Slices are sequential; each one keeps the current single-integral-key behaviour 
 
 ### P0.0 `row_key` core
 
+**Status:** implemented (`key.hpp`, canonical ordering; tests in the core suite).
+
 New `entityfy-core/include/entityfy/key.hpp`:
 
 ```cpp
@@ -59,6 +61,8 @@ Acceptance: unit tests for equality/order/hash, empty keys, mixed numeric/string
 
 ### P0.1 Models, DDL and statements
 
+**Status:** implemented for SQLite, PostgreSQL and the frozen backends (create/read/update/delete/upsert by composite and string keys).
+
 - `model_descriptor` gains `primary_key_indices`; `primary_key_columns(model)` returns the key
   columns in declaration order. `primary_key_column(model)` stays for the single-key fast path and
   reports a clear error when the model has a composite key.
@@ -80,6 +84,8 @@ by a composite and by a string key.
 
 ### P0.2 Context identity map and concurrency
 
+**Status:** implemented (row_key identity map, key-predicate concurrency entries, include grouping).
+
 - `set_state<T>` keys `identity` by `row_key`; `find` accepts `row_key` and the existing
   single-value convenience overloads; `add`/`attach`/`refresh`/`remove`/`save`/`delete_removed`
   use the general key. "Key is unset" becomes an explicit generated-key check, not `key == 0`.
@@ -93,6 +99,8 @@ add/find/attach/remove/refresh, composite concurrency conflict entries, and no c
 integral auto-increment models.
 
 ### P0.3 Migration, introspection and validation
+
+**Status:** implemented for creating table-level keys, key add/drop and introspection; altering the columns of an existing key (P0.3b2) is still open.
 
 - `entityfy-migrate`'s table model carries the ordered primary-key column list, not only
   per-column flags; JSON round-trips it and old files without the list are read as the current
@@ -109,6 +117,8 @@ PostgreSQL (constraint), JSON/scaffold round-trip, and the old single-key migrat
 
 ### P0.4 Tests and docs
 
+**Status:** implemented (live SQLite/PostgreSQL key coverage; docs updated).
+
 Live SQLite and PostgreSQL coverage for every key shape; docs (`core.md`, `context.md`,
 `migration.md`, README) describe the key rules, the composite-FK status and the
 single-integral restriction on identity columns. Benchmarks note any measured cost of the general
@@ -118,12 +128,16 @@ key path on single-column models.
 
 ### P1.1 `lazy<T>` core
 
+**Status:** implemented (commit e7f0a0c); unit tests cover loads, cache, copies and lifetimes.
+
 New `entityfy-core/include/entityfy/lazy.hpp`: `lazy<T>` for a reference (`T*`) and
 `lazy<std::vector<T>>` for a collection, a `detail::lazy_link` (owner pointer, generation, alive
 flag), `lazy_error` with `not_attached`, `context_destroyed`, `context_cleared`, `not_found`.
 `validate_model` rejects unignored lazy members and lazy members inside owned types.
 
 ### P1.2 Context binding and lifetimes
+
+**Status:** implemented (commits a20ed7b, 4c529a8). Handles bind on add/attach/refresh/save and on identity-map hits; save and rollback reset/rebind the touched entity. Composite owner keys are rejected until P1.5.
 
 `db_context` owns the link; `clear()` bumps the generation; the destructor clears `alive`.
 `set_state<T>` binds/rebinds handles in `add`, `attach` (only when not already attached),
@@ -132,11 +146,15 @@ key changed. Rollback resets caches. Binding stores key values, never entity add
 
 ### P1.3 Loaders and include integration
 
+**Status:** implemented (commits a20ed7b, f31554b): collection and reference loaders, include cache fill, no-tracking stays unbound.
+
 1:N loads by parent key, N:1 by the child's foreign key; rows go through `materialize_row` and
 attach, so identity-map semantics match `include`. `include`/`include_parent` fill the handle
 cache (`mark_loaded`) without a second query. No-tracking paths do not bind.
 
 ### P1.4 Tests and docs
+
+**Status:** implemented (lazy_loading scenario on SQLite and PostgreSQL; README/context/roadmap).
 
 Tracked 1:N/N:1, one query per load, include cache, no-tracking rejection, destroyed/cleared
 context errors, transaction visibility and rollback reset, dirty-tracking neutrality, refreshed
