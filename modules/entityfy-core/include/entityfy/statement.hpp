@@ -1,5 +1,6 @@
 #pragma once
 
+#include <entityfy/key.hpp>
 #include <entityfy/meta.hpp>
 #include <entityfy/query.hpp>
 #include <entityfy/schema.hpp>
@@ -52,6 +53,67 @@ inline void append_placeholders(std::string& output, std::size_t count)
     }
 }
 
+// WHERE fragment for every primary key part, in descriptor order.
+[[nodiscard]] inline std::string primary_key_predicate_sql(const std::vector<column_descriptor>& key_columns)
+{
+    std::string output;
+
+    for(std::size_t index = 0; index < key_columns.size(); ++index)
+    {
+        if(index != 0)
+        {
+            output.append(" AND ");
+        }
+
+        output.append(quote_identifier(key_columns[index].name));
+        output.append(" = ?");
+    }
+
+    return output;
+}
+
+// Builds the key predicate and binds the key parts in descriptor order. The
+// part count and NULL parts are caller errors, not SQL errors.
+template <typename Model>
+[[nodiscard]] condition primary_key_filter(const model_descriptor<Model>& model, const row_key& key)
+{
+    const auto key_columns = primary_key_columns(model);
+
+    if(key.size() != key_columns.size())
+    {
+        throw std::logic_error{
+            "entityfy ORM row_key has " + std::to_string(key.size()) + " part(s) but model `" + model.table_name + "` has " +
+            std::to_string(key_columns.size()) + " primary key column(s)"
+        };
+    }
+
+    condition filter;
+    filter.sql = primary_key_predicate_sql(key_columns);
+    filter.binds.reserve(key.size());
+
+    for(const auto& part: key.parts())
+    {
+        if(std::holds_alternative<std::monostate>(part))
+        {
+            throw std::logic_error{"entityfy ORM row_key cannot contain NULL: a primary key part must be set"};
+        }
+
+        filter.binds.emplace_back(part);
+    }
+
+    return filter;
+}
+
+// The single-value statements build a one-part row_key internally, so the old
+// templated call sites keep compiling unchanged.
+template <typename Id>
+[[nodiscard]] row_key single_part_key(const Id& id)
+{
+    std::vector<sql_value> parts;
+    parts.emplace_back(to_sql_value(id));
+    return row_key{std::move(parts)};
+}
+
 inline void append_orderings(std::string& output, const std::vector<ordering>& orderings)
 {
     if(orderings.empty())
@@ -78,7 +140,8 @@ inline std::string excluded_column_reference(const column_descriptor& column)
 }
 
 // T-SQL returns generated keys with OUTPUT INSERTED.<key>, placed after the
-// column list and before VALUES.
+// column list and before VALUES. Only a single generated key column can be
+// returned, so composite keys never emit OUTPUT.
 template <typename Model>
 inline void append_output_inserted_id(std::string& sql, const model_descriptor<Model>& model)
 {
@@ -87,15 +150,14 @@ inline void append_output_inserted_id(std::string& sql, const model_descriptor<M
         return;
     }
 
-    for(const auto& descriptor: model.columns)
+    const auto key_columns = primary_key_columns(model);
+    if(key_columns.size() != 1 || !key_columns.front().flags.auto_increment)
     {
-        if(descriptor.flags.primary_key && descriptor.flags.auto_increment)
-        {
-            sql.append(" OUTPUT INSERTED.");
-            sql.append(quote_identifier(descriptor.name));
-            return;
-        }
+        return;
     }
+
+    sql.append(" OUTPUT INSERTED.");
+    sql.append(quote_identifier(key_columns.front().name));
 }
 
 template <typename Model>
@@ -161,12 +223,12 @@ inline void append_query_tail(std::string& sql,
     }
 }
 
-inline std::string column_definition(const column_descriptor& column, dialect target, bool alter_table)
+inline std::string column_definition(const column_descriptor& column, dialect target, bool alter_table, bool column_level_primary_key)
 {
     std::string output = quote_identifier(column.name);
     output.push_back(' ');
 
-    if(column.flags.primary_key && column.flags.auto_increment && target == dialect::sqlite)
+    if(column.flags.primary_key && column.flags.auto_increment && target == dialect::sqlite && column_level_primary_key)
     {
         output.append("INTEGER PRIMARY KEY AUTOINCREMENT");
     }
@@ -189,13 +251,15 @@ inline std::string column_definition(const column_descriptor& column, dialect ta
             output.append(" IDENTITY(1,1)");
         }
 
-        if(column.flags.primary_key)
+        if(column.flags.primary_key && column_level_primary_key)
         {
             output.append(" PRIMARY KEY");
         }
     }
 
-    if(column.flags.not_null && !column.flags.primary_key)
+    // A single-key table gets the column-level PRIMARY KEY, which already makes
+    // the column NOT NULL. Table-level key parts need their own NOT NULL.
+    if(column.flags.not_null && (!column.flags.primary_key || !column_level_primary_key))
     {
         output.append(" NOT NULL");
     }
@@ -290,6 +354,12 @@ template <typename Model>
     output.sql.append(detail::quote_identifier(model.table_name));
     output.sql.append(" (");
 
+    // One key keeps the column-level PRIMARY KEY (and the SQLite
+    // INTEGER PRIMARY KEY AUTOINCREMENT path); two or more keys become one
+    // table-level constraint and each key part is declared NOT NULL.
+    const auto key_columns = primary_key_columns(model);
+    const bool column_level_primary_key = key_columns.size() == 1;
+
     bool first = true;
     for(const auto& descriptor: model.columns)
     {
@@ -304,7 +374,14 @@ template <typename Model>
         }
 
         first = false;
-        output.sql.append(detail::column_definition(descriptor, model.target, false));
+        output.sql.append(detail::column_definition(descriptor, model.target, false, column_level_primary_key));
+    }
+
+    if(key_columns.size() > 1)
+    {
+        output.sql.append(", PRIMARY KEY (");
+        detail::append_joined_identifiers(output.sql, key_columns);
+        output.sql.push_back(')');
     }
 
     output.sql.push_back(')');
@@ -339,7 +416,7 @@ template <typename Model>
     output.sql = "ALTER TABLE ";
     output.sql.append(detail::quote_identifier(model.table_name));
     output.sql.append(" ADD COLUMN ");
-    output.sql.append(detail::column_definition(descriptor, model.target, true));
+    output.sql.append(detail::column_definition(descriptor, model.target, true, primary_key_columns(model).size() == 1));
     return output;
 }
 
@@ -565,7 +642,12 @@ template <typename Model>
 template <typename Model>
 [[nodiscard]] statement upsert_statement(const Model& object, const model_descriptor<Model>& model)
 {
-    const auto primary_key = primary_key_column(model);
+    const auto key_columns = primary_key_columns(model);
+
+    if(key_columns.empty())
+    {
+        throw std::logic_error{"entityfy ORM upsert requires a primary key column"};
+    }
 
     std::vector<column_descriptor> inserted_descriptors;
     inserted_descriptors.reserve(model.columns.size());
@@ -618,10 +700,19 @@ template <typename Model>
         detail::append_placeholders(output.sql, inserted_descriptors.size());
         output.sql.append(")) AS \"source\" (");
         detail::append_joined_identifiers(output.sql, inserted_descriptors);
-        output.sql.append(") ON \"target\".");
-        output.sql.append(detail::quote_identifier(primary_key.name));
-        output.sql.append(" = \"source\".");
-        output.sql.append(detail::quote_identifier(primary_key.name));
+        output.sql.append(") ON ");
+        for(std::size_t index = 0; index < key_columns.size(); ++index)
+        {
+            if(index != 0)
+            {
+                output.sql.append(" AND ");
+            }
+
+            output.sql.append("\"target\".");
+            output.sql.append(detail::quote_identifier(key_columns[index].name));
+            output.sql.append(" = \"source\".");
+            output.sql.append(detail::quote_identifier(key_columns[index].name));
+        }
 
         std::string matched;
         for(const auto& descriptor: model.columns)
@@ -741,15 +832,15 @@ template <typename Model>
         if(!has_update_assignment)
         {
             // MySQL needs at least one assignment; a no-op keeps the statement valid.
-            output.sql.append(detail::quote_identifier(primary_key.name));
+            output.sql.append(detail::quote_identifier(key_columns.front().name));
             output.sql.append(" = ");
-            output.sql.append(detail::quote_identifier(primary_key.name));
+            output.sql.append(detail::quote_identifier(key_columns.front().name));
         }
     }
     else
     {
         output.sql.append(" ON CONFLICT (");
-        output.sql.append(detail::quote_identifier(primary_key.name));
+        detail::append_joined_identifiers(output.sql, key_columns);
         output.sql.append(") DO ");
 
         for(const auto& descriptor: model.columns)
@@ -820,7 +911,12 @@ template <typename Model>
 template <typename Model>
 [[nodiscard]] statement update_statement(const Model& object, const model_descriptor<Model>& model)
 {
-    const auto primary_key = primary_key_column(model);
+    const auto key_columns = primary_key_columns(model);
+
+    if(key_columns.empty())
+    {
+        throw std::logic_error{"entityfy ORM update requires a primary key column"};
+    }
 
     statement output;
     output.sql = "UPDATE ";
@@ -829,7 +925,8 @@ template <typename Model>
 
     bool        first = true;
     std::size_t descriptor_index = 0;
-    std::optional<sql_value> key_bind;
+    std::vector<sql_value> key_binds;
+    key_binds.reserve(key_columns.size());
 
     detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
         const auto& descriptor = model.columns[descriptor_index];
@@ -842,7 +939,7 @@ template <typename Model>
 
         if(descriptor.flags.primary_key)
         {
-            key_bind = detail::to_sql_value(value);
+            key_binds.emplace_back(detail::to_sql_value(value));
             ++descriptor_index;
             return;
         }
@@ -886,7 +983,7 @@ template <typename Model>
         ++descriptor_index;
     });
 
-    if(!key_bind)
+    if(key_binds.size() != key_columns.size())
     {
         throw std::logic_error{"entityfy ORM update requires a primary key column"};
     }
@@ -897,9 +994,8 @@ template <typename Model>
     }
 
     output.sql.append(" WHERE ");
-    output.sql.append(detail::quote_identifier(primary_key.name));
-    output.sql.append(" = ?");
-    output.binds.emplace_back(std::move(*key_bind));
+    output.sql.append(detail::primary_key_predicate_sql(key_columns));
+    std::ranges::move(key_binds, std::back_inserter(output.binds));
 
     if(!model.type_tag.empty())
     {
@@ -946,30 +1042,34 @@ template <typename Model, typename... Members>
         throw std::logic_error{"entityfy ORM partial update requires at least one column"};
     }
 
-    const auto primary_key = primary_key_column(model);
-    bool       bound = false;
+    const auto key_columns = primary_key_columns(model);
 
-    meta::for_each_persistent_field_reflection<Model, ignore_t>([&]<auto meta_field>() {
-        if(bound)
+    if(key_columns.empty())
+    {
+        throw std::logic_error{"entityfy ORM partial update requires a primary key column"};
+    }
+
+    std::vector<sql_value> key_binds;
+    key_binds.reserve(key_columns.size());
+
+    std::size_t descriptor_index = 0;
+    detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
+        if(descriptor_index < model.columns.size() && model.columns[descriptor_index].flags.primary_key)
         {
-            return;
+            key_binds.emplace_back(detail::to_sql_value(value));
         }
 
-        if(std::string_view{detail::annotated_column_name<meta_field>().view()} == primary_key.name)
-        {
-            output.binds.emplace_back(detail::to_sql_value(object.[:meta_field:]));
-            bound = true;
-        }
+        ++descriptor_index;
     });
 
-    if(!bound)
+    if(key_binds.size() != key_columns.size())
     {
         throw std::logic_error{"entityfy ORM partial update requires a primary key column"};
     }
 
     output.sql.append(" WHERE ");
-    output.sql.append(detail::quote_identifier(primary_key.name));
-    output.sql.append(" = ?");
+    output.sql.append(detail::primary_key_predicate_sql(key_columns));
+    std::ranges::move(key_binds, std::back_inserter(output.binds));
     return output;
 }
 
@@ -1127,15 +1227,16 @@ template <typename Model>
     return select_one_statement(describe_model<Model>(target), std::move(filter));
 }
 
+template <typename Model>
+[[nodiscard]] statement select_by_key_statement(const model_descriptor<Model>& model, const row_key& key)
+{
+    return select_one_statement(model, detail::primary_key_filter(model, key));
+}
+
 template <typename Model, typename Id>
 [[nodiscard]] statement select_by_id_statement(const model_descriptor<Model>& model, const Id& id)
 {
-    const auto primary_key = primary_key_column(model);
-
-    condition filter;
-    filter.sql = detail::quote_identifier(primary_key.name) + " = ?";
-    filter.binds.emplace_back(detail::to_sql_value(id));
-    return select_one_statement(model, std::move(filter));
+    return select_by_key_statement(model, detail::single_part_key(id));
 }
 
 template <typename Model, typename Id>
@@ -1186,15 +1287,31 @@ template <typename Model>
     return delete_statement(describe_model<Model>(target), std::move(filter));
 }
 
+template <typename Model>
+[[nodiscard]] statement delete_by_key_statement(const model_descriptor<Model>& model, const row_key& key)
+{
+    return delete_statement(model, detail::primary_key_filter(model, key));
+}
+
+template <typename Model>
+[[nodiscard]] statement delete_by_key_statement(
+    const model_descriptor<Model>& model,
+    const row_key& key,
+    std::string_view token_column,
+    const sql_value& token)
+{
+    auto filter = detail::primary_key_filter(model, key);
+    filter.sql.append(" AND ");
+    filter.sql.append(detail::quote_identifier(token_column));
+    filter.sql.append(" = ?");
+    filter.binds.emplace_back(token);
+    return delete_statement(model, std::move(filter));
+}
+
 template <typename Model, typename Id>
 [[nodiscard]] statement delete_by_id_statement(const model_descriptor<Model>& model, const Id& id)
 {
-    const auto primary_key = primary_key_column(model);
-
-    condition filter;
-    filter.sql = detail::quote_identifier(primary_key.name) + " = ?";
-    filter.binds.emplace_back(detail::to_sql_value(id));
-    return delete_statement(model, std::move(filter));
+    return delete_by_key_statement(model, detail::single_part_key(id));
 }
 
 template <typename Model, typename Id>
@@ -1204,14 +1321,7 @@ template <typename Model, typename Id>
     std::string_view token_column,
     const sql_value& token)
 {
-    const auto primary_key = primary_key_column(model);
-
-    condition filter;
-    filter.sql = detail::quote_identifier(primary_key.name) + " = ? AND " +
-                 detail::quote_identifier(token_column) + " = ?";
-    filter.binds.emplace_back(detail::to_sql_value(id));
-    filter.binds.emplace_back(token);
-    return delete_statement(model, std::move(filter));
+    return delete_by_key_statement(model, detail::single_part_key(id), token_column, token);
 }
 
 template <typename Model, typename Id>

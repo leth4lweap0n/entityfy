@@ -1,9 +1,11 @@
 #pragma once
 
+#include <entityfy/key.hpp>
 #include <entityfy/meta.hpp>
 #include <entityfy/schema.hpp>
 #include <entityfy/value.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 #include <stdexcept>
@@ -43,28 +45,64 @@ template <typename Model>
     return model;
 }
 
+// Reads the entity's primary key as a row_key, in descriptor order. The
+// descriptor indices are the key definition; the flag scan is the fallback for
+// a hand-built descriptor.
 template <typename Model>
-[[nodiscard]] sql_value primary_key_value(const Model& object, const model_descriptor<Model>& model)
+[[nodiscard]] row_key primary_key_of(const Model& object, const model_descriptor<Model>& model)
 {
+    std::vector<std::size_t> key_indices = model.primary_key_indices;
+
+    if(key_indices.empty())
+    {
+        for(std::size_t index = 0; index < model.columns.size(); ++index)
+        {
+            if(model.columns[index].flags.primary_key)
+            {
+                key_indices.push_back(index);
+            }
+        }
+    }
+
+    std::vector<sql_value> parts;
+    parts.reserve(key_indices.size());
+
+    std::size_t next = 0;
     std::size_t descriptor_index = 0;
-    std::optional<sql_value> output;
 
     detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
-        const auto& descriptor = model.columns[descriptor_index];
-        if(descriptor.flags.primary_key)
+        if(next < key_indices.size() && key_indices[next] == descriptor_index)
         {
-            output = to_sql_value(value);
+            parts.emplace_back(detail::to_sql_value(value));
+            ++next;
         }
 
         ++descriptor_index;
     });
 
-    if(!output)
+    if(parts.size() != key_indices.size())
     {
         throw std::logic_error{"entityfy ORM failed to read primary key value from model"};
     }
 
-    return std::move(*output);
+    return row_key{std::move(parts)};
+}
+
+// Single-column key value for relationship helpers (has_many/belongs_to and the
+// context's include grouping). Composite keys belong to row_key.
+template <typename Model>
+[[nodiscard]] sql_value primary_key_value(const Model& object, const model_descriptor<Model>& model)
+{
+    auto key = primary_key_of(object, model);
+
+    if(key.size() != 1)
+    {
+        throw std::logic_error{
+            "entityfy ORM model has a composite primary key; single-column key helpers need a row_key"
+        };
+    }
+
+    return key.part(0);
 }
 
 } // namespace entityfy::detail

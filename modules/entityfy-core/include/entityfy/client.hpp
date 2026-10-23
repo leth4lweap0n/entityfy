@@ -9,6 +9,7 @@
 #include <entityfy/table.hpp>
 
 #include <algorithm>
+#include <concepts>
 #include <cstdint>
 #include <cstddef>
 #include <functional>
@@ -408,13 +409,28 @@ public:
         return this->template table<Model>().update_many(patch, std::move(options));
     }
 
+    // General key API: mirrors table_client.
+    template <typename Model>
+    [[nodiscard]] std::optional<Model> find(const row_key& key)
+    {
+        return this->template table<Model>().find(key);
+    }
+
+    template <typename Model>
+    [[nodiscard]] std::uint64_t remove_by_key(const row_key& key)
+    {
+        return this->template table<Model>().remove_by_key(key);
+    }
+
     template <typename Model, typename Id>
+        requires(!std::same_as<std::remove_cvref_t<Id>, row_key>)
     [[nodiscard]] std::optional<Model> find(Id&& id)
     {
         return this->template table<Model>().find(std::forward<Id>(id));
     }
 
     template <typename Model, typename Id>
+        requires(!std::same_as<std::remove_cvref_t<Id>, row_key>)
     [[nodiscard]] std::optional<Model> find_unique(Id&& id)
     {
         return this->template table<Model>().find_unique(std::forward<Id>(id));
@@ -445,6 +461,7 @@ public:
     }
 
     template <typename Model, typename Id>
+        requires(!std::same_as<std::remove_cvref_t<Id>, row_key>)
     [[nodiscard]] std::uint64_t remove_by_id(Id&& id)
     {
         return this->template table<Model>().remove_by_id(std::forward<Id>(id));

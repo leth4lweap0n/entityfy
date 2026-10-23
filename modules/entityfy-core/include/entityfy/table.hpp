@@ -8,11 +8,13 @@
 #include <entityfy/statement.hpp>
 
 #include <algorithm>
+#include <concepts>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -336,6 +338,7 @@ public:
     template <typename Related, typename ForeignKey>
     [[nodiscard]] std::vector<Related> has_many(const Model& parent, ForeignKey Related::* foreign_key)
     {
+        require_single_column_key("has_many");
         const auto key = detail::primary_key_value(parent, model_);
         return table_client<Related>{*backend_}.find_many(where(foreign_key).eq(key));
     }
@@ -343,6 +346,7 @@ public:
     template <typename Related, typename ForeignKey>
     [[nodiscard]] std::optional<Related> has_one(const Model& parent, ForeignKey Related::* foreign_key)
     {
+        require_single_column_key("has_one");
         const auto key = detail::primary_key_value(parent, model_);
         return table_client<Related>{*backend_}.find_one(where(foreign_key).eq(key));
     }
@@ -350,10 +354,33 @@ public:
     template <typename Parent, typename ForeignKey>
     [[nodiscard]] std::optional<Parent> belongs_to(const Model& child, ForeignKey Model::* foreign_key)
     {
-        return table_client<Parent>{*backend_}.find(child.*foreign_key);
+        table_client<Parent> parents{*backend_};
+
+        if(primary_key_columns(parents.descriptor()).size() != 1)
+        {
+            throw std::logic_error{
+                "entityfy ORM belongs_to requires the parent model to have a single-column primary key; composite foreign "
+                "keys are not supported yet"
+            };
+        }
+
+        return parents.find(child.*foreign_key);
     }
 
 private:
+    // Composite foreign keys are phase P1.5; until they land the navigation
+    // helpers reject a composite parent key instead of guessing a column.
+    void require_single_column_key(std::string_view operation) const
+    {
+        if(primary_key_columns(model_).size() != 1)
+        {
+            throw std::logic_error{
+                "entityfy ORM " + std::string{operation} +
+                " requires a single-column primary key; composite foreign keys are not supported yet"
+            };
+        }
+    }
+
     void apply_schema_statements(const std::vector<statement>& statements)
     {
         for(const auto& ddl: statements)
@@ -400,13 +427,28 @@ private:
     }
 
 public:
+    // General key API: composite and non-integral keys go through row_key.
+    [[nodiscard]] std::optional<Model> find(const row_key& key)
+    {
+        return collect_one(select_by_key_statement(model_, key));
+    }
+
+    [[nodiscard]] std::uint64_t remove_by_key(const row_key& key)
+    {
+        return backend_->execute(delete_by_key_statement(model_, key)).rows_affected;
+    }
+
+    // Single-value convenience for one-column keys (int64, string, ...). It
+    // builds a one-part row_key internally.
     template <typename Id>
+        requires(!std::same_as<std::remove_cvref_t<Id>, row_key>)
     [[nodiscard]] std::optional<Model> find(Id&& id)
     {
         return collect_one(select_by_id_statement(model_, std::forward<Id>(id)));
     }
 
     template <typename Id>
+        requires(!std::same_as<std::remove_cvref_t<Id>, row_key>)
     [[nodiscard]] std::optional<Model> find_unique(Id&& id)
     {
         return find(std::forward<Id>(id));
@@ -423,6 +465,7 @@ public:
     }
 
     template <typename Id>
+        requires(!std::same_as<std::remove_cvref_t<Id>, row_key>)
     [[nodiscard]] std::uint64_t remove_by_id(Id&& id)
     {
         return backend_->execute(delete_by_id_statement(model_, std::forward<Id>(id))).rows_affected;
