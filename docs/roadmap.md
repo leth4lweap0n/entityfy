@@ -21,7 +21,8 @@
 - **Manual change tracking**: `set_auto_detect(false)` + `mark_modified(entity)`; a save visits only
   the changed entities (measured 5,5 µs at 50.000 tracked rows against 10,6 ms with auto detection)
 - **No-tracking reads**: `query().select(...)` (tuples) and `as_no_tracking()` (full entities by
-  value, EF Core `AsNoTracking`); measured 332 ns/row against 460 ns/row tracked
+  value, EF Core `AsNoTracking`); measured 332 ns/row against 460 ns/row tracked.
+  `to_list()` returns a read-only result, so mutating a row is a compile error
 - FK dependency order: INSERT parent-first, DELETE child-first (`ON DELETE RESTRICT` supported)
 - Nested transactions/savepoints, retry policy, batch splitting
 - EF Core style surface: `db_context` / `db_set<T>` with `save_changes()`, `add()`, `find()`,
@@ -55,16 +56,12 @@
 
 1. **Dirty-column update** — because core keeps no snapshot, `table_client::update` writes all
    columns; partial UPDATE exists only in the context layer.
-2. **Compile-time no-tracking view** — `as_no_tracking()` returns `std::vector<T>` by value, so
-   mutating a returned entity compiles and is silently ignored (the EF Core `AsNoTracking`
-   footgun). A const-only wrapper would make that a compile error; it needs a view type that
-   keeps the value movable, so it is a design decision, not a rename.
-3. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
+2. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
    in practice covered by `entityfy::value_converter<T>` (a composite type is written to a single
    column), but owned types **split across** columns (as in EF, e.g. `address_city`) and a TPH
    discriminator do not exist yet.
-4. **Additional providers** — MySQL / SQL Server.
-5. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
+3. **Additional providers** — MySQL / SQL Server.
+4. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
    **from the live schema** (the DB → model direction exists); the reverse direction (model → DB)
    is covered by the `snapshot` + `apply` commands, with no separate generation command.
 

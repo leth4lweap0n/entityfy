@@ -368,6 +368,13 @@ public:
         return backend_->query(input);
     }
 
+    // Streams rows without collecting them; the consumer owns what it keeps and
+    // returns false to stop. See detail::backend::query_each.
+    void query_each(const statement& input, const std::function<bool(const detail::row&)>& consumer)
+    {
+        backend_->query_each(input, consumer);
+    }
+
     // Prepared statement cache. The SQLite backend keeps compiled statements
     // around (least recently used eviction); backends without statement reuse
     // report a capacity of zero.

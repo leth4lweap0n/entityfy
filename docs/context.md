@@ -114,10 +114,10 @@ for(const auto& model: ctx.model())
   identity map entry (measured: 332 ns/row against 460 ns/row tracked, see
   [benchmarks.md](benchmarks.md)). `first()` and `count()` are available too.
 
-  **Caveat - this is a runtime property, not a type-level one.** `user` is a plain struct, so
-  `rows[0].name = "x"` compiles; the write simply never reaches the database, and
-  `save_changes()` has nothing to save for it. That matches EF Core's `AsNoTracking` footgun. A
-  compile-time guarantee would need a const-only view type (not implemented; see the roadmap).
+  `to_list()` returns an owning, **read-only** result (`no_tracking_result<T>`): `rows[0]` is
+  `const T&`, so `rows[0].name = "x"` does not compile. `first()` returns a copy instead - editing
+  that copy is ordinary C++ on a value and never reaches the database. That is the deliberate
+  difference from EF Core's `AsNoTracking`, where the same mistake is a silent no-op.
 - state is read with `users.state(entity)`: `unchanged`, `added`, `modified`, `removed`,
   `detached`.
 - `users.refresh(entity)` reloads the entity from the database.

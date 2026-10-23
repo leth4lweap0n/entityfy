@@ -12,6 +12,7 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -1031,6 +1032,8 @@ status run_no_tracking_checks()
     require(users.size() == tracked_before, "no-tracking filter did not grow the tracker");
 
     const auto every = users.as_no_tracking().order_by(&rc_user::name).to_list();
+    static_assert(std::is_const_v<std::remove_reference_t<decltype(every[0])>>,
+                  "no-tracking rows are const, so mutating one does not compile");
     require(every.size() == 3, "no-tracking to_list returns every row");
     require(every.front().name == "User 1" && every.back().name == "User 3", "no-tracking ordering");
     require(users.size() == tracked_before, "no-tracking to_list did not grow the tracker");

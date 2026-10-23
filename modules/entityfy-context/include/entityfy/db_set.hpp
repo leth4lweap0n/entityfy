@@ -7,6 +7,7 @@
 #include <deque>
 #include <map>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1585,6 +1586,63 @@ private:
     db_context* owner_;
 };
 
+// Owning, read-only result of a no-tracking read. Handing out const references
+// makes "edit the entity and expect it to be saved" a compile error instead of
+// EF Core's silent no-op; taking a copy is still allowed and is then just a
+// copy, as in any other value type.
+template <typename T>
+class no_tracking_result
+{
+public:
+    explicit no_tracking_result(std::vector<T> rows)
+        : rows_{std::move(rows)}
+    {
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept
+    {
+        return rows_.size();
+    }
+
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return rows_.empty();
+    }
+
+    [[nodiscard]] const T& operator[](std::size_t index) const noexcept
+    {
+        return rows_[index];
+    }
+
+    [[nodiscard]] const T& front() const noexcept
+    {
+        return rows_.front();
+    }
+
+    [[nodiscard]] const T& back() const noexcept
+    {
+        return rows_.back();
+    }
+
+    [[nodiscard]] const T* begin() const noexcept
+    {
+        return rows_.data();
+    }
+
+    [[nodiscard]] const T* end() const noexcept
+    {
+        return rows_.data() + rows_.size();
+    }
+
+    [[nodiscard]] std::span<const T> rows() const noexcept
+    {
+        return rows_;
+    }
+
+private:
+    std::vector<T> rows_;
+};
+
 // The value-returning counterpart of db_query_builder: same filters and paging,
 // but every row is materialized into a std::vector<T> and never attached to the
 // tracker. Reads only; there is no save path from here.
@@ -1628,38 +1686,35 @@ public:
         return copy;
     }
 
-    [[nodiscard]] std::vector<T> to_list() const
+    [[nodiscard]] no_tracking_result<T> to_list() const
     {
         const auto model = entityfy::describe_model<T>(owner_->database().target_dialect());
         const auto command = entityfy::select_statement(model, options_);
 
         owner_->log(command.sql);
 
-        const auto rows = owner_->database().query(command);
-
         std::vector<T> output;
-        output.reserve(rows.size());
+        owner_->database().query_each(command, [&](const entityfy::detail::row& current) {
+            output.push_back(entityfy::detail::materialize_row<T>(current));
+            return true;
+        });
 
-        for(const auto& row: rows)
-        {
-            output.push_back(entityfy::detail::materialize_row<T>(row));
-        }
-
-        return output;
+        return no_tracking_result<T>{std::move(output)};
     }
 
+    // A copy owned by the caller: mutating it never reaches the database.
     [[nodiscard]] std::optional<T> first() const
     {
         auto copy = *this;
         copy.options_.limit = 1;
 
-        auto rows = copy.to_list();
+        const auto rows = copy.to_list();
         if(rows.empty())
         {
             return std::nullopt;
         }
 
-        return std::move(rows.front());
+        return rows.front();
     }
 
     [[nodiscard]] std::uint64_t count() const

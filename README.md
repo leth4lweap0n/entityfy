@@ -111,8 +111,9 @@ for(const auto& [email, name]: ctx.users.query()
 }
 ```
 
-Both are read-only: changing a value returned from either path compiles but never reaches the
-database (measured tracking overhead: 1,39x per loaded row, see
+Both are read-only. `as_no_tracking().to_list()` hands out `const` rows, so editing one is a
+compile error; `first()` returns a copy, and editing the copy simply never reaches the database
+(measured tracking overhead: 1,39-1,52x per loaded row, see
 [docs/benchmarks.md](docs/benchmarks.md)).
 
 ### When not to open a context
