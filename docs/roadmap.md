@@ -78,6 +78,10 @@
 - **Migration-provider statement cache: decided against by measurement** - each migration
   statement is unique (an LRU cannot hit); prepare costs 10,5 us (SQLite DDL) / 81 us (PG round
   trip) once per statement. Numbers and rationale in `docs/benchmarks.md`
+- **PostgreSQL `xmin` token**: `[[= entityfy::xmin]]` maps a member onto the `xmin` system column;
+  DDL/inserts/updates skip it, selects and the concurrency `WHERE` read it, and the value is read
+  back after writes. Covered on PostgreSQL by an out-of-band update conflict without an
+  application token column
 - **Statement cache for MySQL and SQL Server**: `MYSQL_STMT` handles and ODBC statements stay in
   an LRU (default capacity 32), resetting the result set/parameter bindings between uses; measured
   by the backend cache tests (size, capacity changes, results after disabling)
@@ -96,14 +100,11 @@
 ## Next
 
 The focus is SQLite and PostgreSQL. The other backends stay buildable and tested but get no new
-features for now (see [Deferred](#deferred-other-providers)). Each entry records the surface that
-has to change so a session can pick it up without redoing the analysis. Everything above this
-section is implemented and covered by the test suite.
+features for now (see [Deferred](#deferred-other-providers)). Everything above this section is
+implemented and covered by the test suite.
 
-1. **PostgreSQL `xmin` token (P2)** — the store-generated token EF Core users get from Npgsql, so
-   a model can use the system column instead of an application column. Surface:
-   `postgresql_backend.cpp` select/update paths, model mapping. Acceptance: a model using the
-   system column conflicts after an out-of-band update without an application column.
+No open SQLite/PostgreSQL items. The next round picks from [Deferred](#deferred-other-providers)
+if the focus changes.
 
 ## Deferred: other providers
 

@@ -167,6 +167,20 @@ struct [[= entityfy::table{"rc_token_model"}]] rc_token_model
     std::int64_t revision = 0;
 };
 
+// PostgreSQL system column as the concurrency token: the model has no
+// application column for it.
+struct [[= entityfy::table{"rc_xmin_rows"}]] rc_xmin_row
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::not_null]]
+    std::string body;
+
+    [[= entityfy::xmin]]
+    std::uint32_t revision = 0;
+};
+
 // EF Core style context: the sets are declared once, the framework derives
 // everything else (table, columns, primary key, foreign keys) from reflection.
 struct ef_context : entityfy::db_context
@@ -1473,6 +1487,53 @@ status run_postgres_checks()
 
     entityfy::db_context ctx{uri};
     ctx.execute("SET client_min_messages TO WARNING");
+    // --- xmin system column as the concurrency token ---
+    ctx.execute("DROP TABLE IF EXISTS \"rc_xmin_rows\" CASCADE");
+    ctx.migrate<rc_xmin_row>();
+    require(ctx.database().inspect_table("rc_xmin_rows").columns.size() == 2,
+            "pg xmin model creates only the application columns");
+
+    {
+        entityfy::db_context writer{uri};
+        auto writer_set = writer.set<rc_xmin_row>();
+        auto& row = writer_set.add(rc_xmin_row{.body = "first"});
+        require(writer.save_changes().inserted == 1, "pg xmin insert");
+        require(row.revision != 0, "pg xmin token refreshed after the insert");
+
+        // The write path must not assign the system column itself; the
+        // refreshed token is what makes the next update match.
+        row.body = "second";
+        require(writer.save_changes().updated == 1, "pg xmin update after insert uses the refreshed token");
+
+        const auto after_first_update = row.revision;
+        row.body = "third";
+        require(writer.save_changes().updated == 1, "pg xmin consecutive update keeps working");
+        require(row.revision != after_first_update, "pg xmin token changes with every update");
+
+        entityfy::db_context stale{uri};
+        auto stale_set = stale.set<rc_xmin_row>();
+        auto* stale_row = stale_set.find(row.id);
+        require(stale_row != nullptr, "pg xmin stale context loads the row");
+
+        row.body = "winner";
+        require(writer.save_changes().updated == 1, "pg xmin winner update");
+
+        stale_row->body = "loser";
+        bool xmin_conflict = false;
+        try
+        {
+            stale.save_changes();
+        }
+        catch(const entityfy::concurrency_error&)
+        {
+            xmin_conflict = true;
+        }
+
+        require(xmin_conflict, "pg xmin conflict after an out-of-band update");
+    }
+
+    ctx.execute("DROP TABLE IF EXISTS \"rc_xmin_rows\" CASCADE");
+
     ctx.execute("DROP TABLE IF EXISTS \"rc_children\" CASCADE");
     ctx.execute("DROP TABLE IF EXISTS \"rc_parents\" CASCADE");
     ctx.execute("DROP TABLE IF EXISTS \"rc_tags\" CASCADE");

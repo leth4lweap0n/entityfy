@@ -50,6 +50,11 @@ template <typename Model>
 
     for(const auto& descriptor: model.columns)
     {
+        if(descriptor.flags.system)
+        {
+            continue;
+        }
+
         const bool exists = std::ranges::any_of(existing_columns, [&](std::string_view existing) {
             return existing == descriptor.name;
         });

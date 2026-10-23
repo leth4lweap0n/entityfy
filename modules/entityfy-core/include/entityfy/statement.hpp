@@ -290,14 +290,21 @@ template <typename Model>
     output.sql.append(detail::quote_identifier(model.table_name));
     output.sql.append(" (");
 
-    for(std::size_t index = 0; index < model.columns.size(); ++index)
+    bool first = true;
+    for(const auto& descriptor: model.columns)
     {
-        if(index != 0)
+        if(descriptor.flags.system)
+        {
+            continue;
+        }
+
+        if(!first)
         {
             output.sql.append(", ");
         }
 
-        output.sql.append(detail::column_definition(model.columns[index], model.target, false));
+        first = false;
+        output.sql.append(detail::column_definition(descriptor, model.target, false));
     }
 
     output.sql.push_back(')');
@@ -349,7 +356,7 @@ template <typename Model>
 
     for(const auto& column: model.columns)
     {
-        if(column.flags.primary_key || (!column.flags.indexed && !column.flags.unique))
+        if(column.flags.system || column.flags.primary_key || (!column.flags.indexed && !column.flags.unique))
         {
             continue;
         }
@@ -393,7 +400,7 @@ template <typename Model>
 
     for(const auto& descriptor: model.columns)
     {
-        if(!descriptor.generated_on_insert)
+        if(!descriptor.generated_on_insert && !descriptor.flags.system)
         {
             inserted_descriptors.emplace_back(descriptor);
         }
@@ -430,7 +437,7 @@ template <typename Model>
     std::size_t descriptor_index = 0;
     detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
         const auto& descriptor = model.columns[descriptor_index];
-        if(!descriptor.generated_on_insert)
+        if(!descriptor.generated_on_insert && !descriptor.flags.system)
         {
             if(descriptor.flags.discriminator && !model.type_tag.empty())
             {
@@ -462,7 +469,7 @@ template <typename Model>
 
     for(const auto& descriptor: model.columns)
     {
-        if(!descriptor.generated_on_insert)
+        if(!descriptor.generated_on_insert && !descriptor.flags.system)
         {
             inserted.emplace_back(descriptor);
         }
@@ -536,7 +543,7 @@ template <typename Model>
         std::size_t descriptor_index = 0;
         detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
             const auto& descriptor = model.columns[descriptor_index];
-            if(!descriptor.generated_on_insert)
+            if(!descriptor.generated_on_insert && !descriptor.flags.system)
             {
                 if(descriptor.flags.discriminator && !model.type_tag.empty())
                 {
@@ -565,6 +572,11 @@ template <typename Model>
 
     for(const auto& descriptor: model.columns)
     {
+        if(descriptor.flags.system)
+        {
+            continue;
+        }
+
         if(!descriptor.generated_on_insert || descriptor.flags.primary_key)
         {
             inserted_descriptors.emplace_back(descriptor);
@@ -614,7 +626,8 @@ template <typename Model>
         std::string matched;
         for(const auto& descriptor: model.columns)
         {
-            if(descriptor.flags.primary_key || (descriptor.generated_on_insert && !descriptor.flags.updated_at))
+            if(descriptor.flags.system || descriptor.flags.primary_key ||
+               (descriptor.generated_on_insert && !descriptor.flags.updated_at))
             {
                 continue;
             }
@@ -674,7 +687,7 @@ template <typename Model>
         std::size_t descriptor_index = 0;
         detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
             const auto& descriptor = model.columns[descriptor_index];
-            if(!descriptor.generated_on_insert || descriptor.flags.primary_key)
+            if(!descriptor.flags.system && (!descriptor.generated_on_insert || descriptor.flags.primary_key))
             {
                 if(descriptor.flags.discriminator && !model.type_tag.empty())
                 {
@@ -698,7 +711,8 @@ template <typename Model>
 
         for(const auto& descriptor: model.columns)
         {
-            if(descriptor.flags.primary_key || (descriptor.generated_on_insert && !descriptor.flags.updated_at))
+            if(descriptor.flags.system || descriptor.flags.primary_key ||
+               (descriptor.generated_on_insert && !descriptor.flags.updated_at))
             {
                 continue;
             }
@@ -740,7 +754,8 @@ template <typename Model>
 
         for(const auto& descriptor: model.columns)
         {
-            if(descriptor.flags.primary_key || (descriptor.generated_on_insert && !descriptor.flags.updated_at))
+            if(descriptor.flags.system || descriptor.flags.primary_key ||
+               (descriptor.generated_on_insert && !descriptor.flags.updated_at))
             {
                 continue;
             }
@@ -778,7 +793,7 @@ template <typename Model>
     std::size_t descriptor_index = 0;
     detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
         const auto& descriptor = model.columns[descriptor_index];
-        if(!descriptor.generated_on_insert || descriptor.flags.primary_key)
+        if(!descriptor.flags.system && (!descriptor.generated_on_insert || descriptor.flags.primary_key))
         {
             if(descriptor.flags.discriminator && !model.type_tag.empty())
             {
@@ -818,6 +833,12 @@ template <typename Model>
 
     detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
         const auto& descriptor = model.columns[descriptor_index];
+
+        if(descriptor.flags.system)
+        {
+            ++descriptor_index;
+            return;
+        }
 
         if(descriptor.flags.primary_key)
         {
@@ -966,7 +987,7 @@ template <typename Model>
     detail::for_each_leaf_field(patch, [&](std::string_view, std::string_view, const auto& value) {
         const auto& descriptor = model.columns[descriptor_index];
 
-        if(descriptor.flags.primary_key || descriptor.flags.discriminator ||
+        if(descriptor.flags.system || descriptor.flags.primary_key || descriptor.flags.discriminator ||
            (descriptor.generated_on_insert && !descriptor.flags.updated_at))
         {
             ++descriptor_index;

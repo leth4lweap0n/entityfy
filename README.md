@@ -208,9 +208,10 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
   a save visit only the entities that changed - measured 5,5 µs at 50.000 tracked rows against
   10,6 ms with auto detection (see [docs/benchmarks.md](docs/benchmarks.md)).
 - **Optimistic concurrency**: a `version` member (or `[[= entityfy::concurrency_token]]`) drives
-  `WHERE id AND token` updates and deletes; `concurrency_error` exposes the conflicting entries and
-  the current database row, and `database_values` / `accept_changes` / `attach(value, original)`
-  resolve conflicts (EF Core parity).
+  `WHERE id AND token` updates and deletes; on PostgreSQL `[[= entityfy::xmin]]` maps the system
+  column as the token without an application column. `concurrency_error` exposes the conflicting
+  entries and the current database row, and `database_values` / `accept_changes` /
+  `attach(value, original)` resolve conflicts (EF Core parity).
 - Control over tracking through `state(entity)`, `refresh`, `detach`, `clear`.
 - **FK dependency order**: insert/update parent-first, delete child-first. In tables using
   `ON DELETE RESTRICT`, a parent and its child can be deleted in the same save.

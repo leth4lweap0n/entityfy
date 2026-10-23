@@ -2,7 +2,61 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
 #include <string>
+
+namespace
+{
+
+struct [[= entityfy::table{"pg_systoken_model"}]] pg_systoken_model
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::not_null]]
+    std::string name;
+
+    [[= entityfy::xmin]]
+    std::uint32_t revision = 0;
+};
+
+} // namespace
+
+TEST_CASE("xmin maps the PostgreSQL system column", "[schema][postgresql]")
+{
+    const auto model = entityfy::describe_model<pg_systoken_model>(entityfy::dialect::postgresql);
+    REQUIRE(model.columns.size() == 3);
+
+    const auto revision_column = std::ranges::find_if(
+        model.columns, [](const entityfy::column_descriptor& column) { return column.name == "xmin"; });
+    REQUIRE(revision_column != model.columns.end());
+
+    const auto& revision = *revision_column;
+    REQUIRE(revision.flags.system);
+    REQUIRE(revision.sql_type == "xid");
+    REQUIRE_FALSE(revision.generated_on_insert);
+
+    const auto create = entityfy::create_table(model);
+    REQUIRE(create.sql.find("xmin") == std::string::npos);
+
+    const auto select = entityfy::select_statement(model);
+    REQUIRE(select.sql.find("\"xmin\"") != std::string::npos);
+
+    const pg_systoken_model row{.id = 1, .name = "one", .revision = 0};
+
+    const auto insert = entityfy::insert_statement(row, model);
+    REQUIRE(insert.sql.find("xmin") == std::string::npos);
+    REQUIRE(insert.binds.size() == 1);
+
+    const auto many = entityfy::insert_many_statement(std::vector<pg_systoken_model>{row}, model);
+    REQUIRE(many.sql.find("xmin") == std::string::npos);
+    REQUIRE(many.binds.size() == 1);
+
+    const auto update = entityfy::update_statement(row, model);
+    REQUIRE(update.sql.find("xmin") == std::string::npos);
+
+    REQUIRE(entityfy::create_index_statements(model).empty());
+}
 
 TEST_CASE("annotations produce model descriptors and DDL", "[schema]")
 {

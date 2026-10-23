@@ -136,6 +136,14 @@ struct concurrency_token_t
 {
 };
 
+// Maps the member onto PostgreSQL's `xmin` system column and makes it the
+// optimistic concurrency token. PostgreSQL only: the column is never created,
+// inserted or assigned, reads come from `xmin` and the value is refreshed
+// after every write. Use a plain integral member (std::uint32_t is natural).
+struct xmin_t
+{
+};
+
 struct created_at_t
 {
 };
@@ -206,6 +214,7 @@ inline constexpr not_null_t       not_null{};
 inline constexpr nullable_t       nullable{};
 inline constexpr ignore_t         ignore{};
 inline constexpr concurrency_token_t concurrency_token{};
+inline constexpr xmin_t              xmin{};
 inline constexpr ignore_t         ignored{};
 inline constexpr created_at_t     created_at{};
 inline constexpr updated_at_t     updated_at{};

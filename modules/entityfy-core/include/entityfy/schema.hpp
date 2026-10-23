@@ -31,6 +31,9 @@ struct column_flags
     bool created_at = false;
     bool updated_at = false;
     bool discriminator = false;
+    // A database system column (PostgreSQL `xmin`): selected and compared,
+    // never created, inserted or assigned.
+    bool system = false;
 };
 
 struct reference_descriptor
@@ -196,6 +199,7 @@ consteval column_flags annotated_column_flags()
     flags.created_at = meta::has_annotation<created_at_t, ReflectedField>();
     flags.updated_at = meta::has_annotation<updated_at_t, ReflectedField>();
     flags.discriminator = meta::has_annotation<discriminator_t, ReflectedField>();
+    flags.system = meta::has_annotation<xmin_t, ReflectedField>();
 
     if(flags.auto_increment)
     {
@@ -634,6 +638,32 @@ consteval void validate_scalar_field_annotations()
         );
     }
 
+    if constexpr(meta::has_annotation<xmin_t, ReflectedField>())
+    {
+        static_assert(
+            !is_optional_v<field_type> && std::is_integral_v<storage_type> && !std::same_as<storage_type, bool>,
+            "entityfy ORM [[= entityfy::xmin]] requires a non-optional integral field such as std::uint32_t."
+        );
+        static_assert(
+            !meta::has_annotation<primary_key_t, ReflectedField>() &&
+                !meta::has_annotation<auto_increment_t, ReflectedField>(),
+            "entityfy ORM [[= entityfy::xmin]] cannot be combined with the primary key."
+        );
+        static_assert(
+            !meta::has_annotation<created_at_t, ReflectedField>() &&
+                !meta::has_annotation<updated_at_t, ReflectedField>(),
+            "entityfy ORM [[= entityfy::xmin]] cannot be combined with created_at/updated_at."
+        );
+        static_assert(
+            !meta::has_annotation<references, ReflectedField>(),
+            "entityfy ORM [[= entityfy::xmin]] maps the PostgreSQL system column and cannot be a foreign key."
+        );
+        static_assert(
+            !meta::has_annotation<column, ReflectedField>(),
+            "entityfy ORM [[= entityfy::xmin]] maps the system column \"xmin\"; remove [[= entityfy::column{...}]]."
+        );
+    }
+
     if constexpr(meta::has_annotation<created_at_t, ReflectedField>() || meta::has_annotation<updated_at_t, ReflectedField>())
     {
         static_assert(
@@ -754,6 +784,10 @@ consteval void validate_owned_struct()
             !meta::has_annotation<created_at_t, meta_field>() && !meta::has_annotation<updated_at_t, meta_field>(),
             "entityfy ORM owned types cannot declare created_at/updated_at; put timestamps on the owning model."
         );
+        static_assert(
+            !meta::has_annotation<xmin_t, meta_field>(),
+            "entityfy ORM owned types cannot declare [[= entityfy::xmin]]; put the system token on the owning model."
+        );
         validate_field_annotations<owned_type, meta_field>();
     });
 }
@@ -838,6 +872,17 @@ struct static_column_metadata
 template <typename Field, auto ReflectedField>
 consteval static_column_metadata static_describe_field()
 {
+    if constexpr(meta::has_annotation<xmin_t, ReflectedField>())
+    {
+        return static_column_metadata{
+            .name = annotation_text{"xmin"},
+            .flags = annotated_column_flags<Field, ReflectedField>(),
+            .default_sql = default_value{},
+            .check_sql = check{},
+            .reference = references{},
+        };
+    }
+
     return static_column_metadata{
         .name = annotated_column_name<ReflectedField>(),
         .flags = annotated_column_flags<Field, ReflectedField>(),
@@ -874,7 +919,9 @@ template <typename Type>
         auto descriptor = column_descriptor{
             .name = std::string{prefix} + std::string{metadata.name.view()},
             .flags = metadata.flags,
-            .sql_type = detail::annotated_sql_type_for<field_type, meta_field>(target),
+            .sql_type = metadata.flags.system
+                            ? std::string{"xid"}
+                            : detail::annotated_sql_type_for<field_type, meta_field>(target),
             .default_sql = detail::default_sql_for<field_type, meta_field>(),
         };
 

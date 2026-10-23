@@ -2,6 +2,7 @@
 
 #include <entityfy/concurrency.hpp>
 #include <entityfy/db_context.hpp>
+#include <entityfy/value.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -69,7 +70,8 @@ consteval std::meta::info concurrency_token_member(std::meta::info type)
 {
     for(const auto member: std::meta::nonstatic_data_members_of(type, std::meta::access_context::unchecked()))
     {
-        if(!std::meta::annotations_of_with_type(member, ^^entityfy::concurrency_token_t).empty())
+        if(!std::meta::annotations_of_with_type(member, ^^entityfy::concurrency_token_t).empty() ||
+           !std::meta::annotations_of_with_type(member, ^^entityfy::xmin_t).empty())
         {
             return member;
         }
@@ -82,6 +84,19 @@ template <typename T>
 consteval std::meta::info concurrency_token_member()
 {
     return concurrency_token_member(^^T);
+}
+
+// The column a member maps to. The xmin annotation replaces the member name
+// with the PostgreSQL system column, matching describe_model().
+template <auto Member>
+consteval entityfy::annotation_text member_column_name()
+{
+    if constexpr(!std::meta::annotations_of_with_type(Member, ^^entityfy::xmin_t).empty())
+    {
+        return entityfy::annotation_text{"xmin"};
+    }
+
+    return annotated_column_name<Member>();
 }
 
 consteval bool is_ignored_member(std::meta::info member)
@@ -161,6 +176,14 @@ bool is_persisted_column(const entityfy::model_descriptor<T>& model, std::string
 }
 
 template <typename T>
+bool is_system_column(const entityfy::model_descriptor<T>& model, std::string_view name)
+{
+    return std::ranges::any_of(model.columns, [&](const entityfy::column_descriptor& column) {
+        return column.name == name && column.flags.system;
+    });
+}
+
+template <typename T>
 [[nodiscard]] concurrency_entry make_concurrency_entry(
     db_context& owner,
     const entityfy::model_descriptor<T>& model,
@@ -181,7 +204,7 @@ template <typename T>
     entityfy::statement lookup;
     lookup.sql = "SELECT * FROM " + entityfy::detail::quote_identifier(model.table_name) + " WHERE " +
                  entityfy::detail::quote_identifier(primary_key_column(model).name) + " = ?";
-    lookup.binds.emplace_back(entityfy::to_sql_value(key));
+    lookup.binds.emplace_back(entityfy::detail::to_sql_value(key));
 
     auto rows = owner.database().query(lookup);
     if(!rows.empty())
@@ -212,7 +235,7 @@ template <typename Model>
 
             if(std::string_view{annotated_column_name<meta_field>().view()} == column)
             {
-                result = entityfy::to_sql_value(entity.[:meta_field:]);
+                result = entityfy::detail::to_sql_value(entity.[:meta_field:]);
             }
         }
     });
@@ -399,6 +422,13 @@ struct set_state final : saveable
 
     save_result delete_removed(db_context& owner) override;
     save_result save(db_context& owner) override;
+
+    template <auto TokenMember>
+    void reload_system_token(db_context& owner,
+                             T& entity,
+                             const entityfy::model_descriptor<T>& model,
+                             std::string_view token_column,
+                             std::int64_t key);
 
     T& add(T value)
     {
@@ -719,7 +749,7 @@ save_result set_state<T>::delete_removed(db_context& owner)
 
     if constexpr(has_token_member)
     {
-        token_column = std::string{annotated_column_name<token_member>().view()};
+        token_column = std::string{member_column_name<token_member>().view()};
         has_token = is_persisted_column(model, token_column);
     }
 
@@ -740,7 +770,7 @@ save_result set_state<T>::delete_removed(db_context& owner)
             {
                 if(has_token)
                 {
-                    original_token = entityfy::to_sql_value(item.original.[:token_member:]);
+                    original_token = entityfy::detail::to_sql_value(item.original.[:token_member:]);
                 }
             }
 
@@ -770,6 +800,30 @@ save_result set_state<T>::delete_removed(db_context& owner)
 }
 
 template <typename T>
+template <auto TokenMember>
+void set_state<T>::reload_system_token(db_context& owner,
+                                       T& entity,
+                                       const entityfy::model_descriptor<T>& model,
+                                       std::string_view token_column,
+                                       std::int64_t key)
+{
+    const auto primary_key = entityfy::primary_key_column(model);
+    entityfy::statement lookup;
+    lookup.sql = "SELECT " + entityfy::detail::quote_identifier(token_column) + " FROM " +
+                 entityfy::detail::quote_identifier(model.table_name) + " WHERE " +
+                 entityfy::detail::quote_identifier(primary_key.name) + " = ?";
+    lookup.binds.push_back(entityfy::detail::to_sql_value(key));
+
+    const auto rows = owner.database().query(lookup);
+    if(rows.empty() || rows.front().empty())
+    {
+        return;
+    }
+
+    entityfy::detail::assign_sql_value(rows.front().front(), entity.[:TokenMember:]);
+}
+
+template <typename T>
 save_result set_state<T>::save(db_context& owner)
 {
     save_result result;
@@ -784,14 +838,17 @@ save_result set_state<T>::save(db_context& owner)
 
     // Resolved once: an aliased [[= entityfy::column{"..."}]] or a
     // [[= entityfy::concurrency_token]] member must drive the SET and WHERE
-    // clauses.
+    // clauses. A system token ([[= entityfy::xmin]]) is assigned by the server,
+    // so it is only compared and then read back instead of incremented.
     std::string token_column;
     bool has_token = false;
+    bool system_token = false;
 
     if constexpr(has_token_member)
     {
-        token_column = std::string{annotated_column_name<token_member>().view()};
+        token_column = std::string{member_column_name<token_member>().view()};
         has_token = is_persisted_column(model, token_column);
+        system_token = has_token && is_system_column(model, token_column);
     }
 
     bool generated_primary_key = false;
@@ -820,8 +877,8 @@ save_result set_state<T>::save(db_context& owner)
     template for (constexpr auto member: std::define_static_array(
                       std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::unchecked())))
     {
-        const std::string column{annotated_column_name<member>().view()};
-        if(!is_persisted_column(model, column) || generated_column(column))
+        const std::string column{member_column_name<member>()};
+        if(!is_persisted_column(model, column) || generated_column(column) || is_system_column(model, column))
         {
             continue;
         }
@@ -901,7 +958,7 @@ save_result set_state<T>::save(db_context& owner)
                 {
                     if constexpr(!is_ignored_member(member))
                     {
-                        const std::string column{annotated_column_name<member>().view()};
+                        const std::string column{member_column_name<member>()};
 
                         if(std::ranges::find(insert_columns, column) == insert_columns.end())
                         {
@@ -914,7 +971,7 @@ save_result set_state<T>::save(db_context& owner)
                         }
 
                         sql += "?";
-                        binds.push_back(entityfy::to_sql_value(entity.[:member:]));
+                        binds.push_back(entityfy::detail::to_sql_value(entity.[:member:]));
                         first_column = false;
                     }
                 }
@@ -940,6 +997,16 @@ save_result set_state<T>::save(db_context& owner)
                 const std::size_t index = added_indices[row];
                 auto& item = *items[index];
                 mark_undo(index);
+
+                if constexpr(has_token_member)
+                {
+                    if(system_token)
+                    {
+                        reload_system_token<token_member>(
+                            owner, item.entity, model, token_column, key_of(item.entity));
+                    }
+                }
+
                 item.original = item.entity;
                 item.state = entity_state::unchanged;
 
@@ -1037,6 +1104,15 @@ save_result set_state<T>::save(db_context& owner)
                 assign_generated_id(item.entity, generated);
             }
 
+            if constexpr(has_token_member)
+            {
+                if(system_token)
+                {
+                    reload_system_token<token_member>(
+                        owner, item.entity, model, token_column, key_of(item.entity));
+                }
+            }
+
             item.original = item.entity;
             item.state = entity_state::unchanged;
 
@@ -1094,7 +1170,7 @@ save_result set_state<T>::save(db_context& owner)
             }
 
             sql += entityfy::detail::quote_identifier(annotated_column_name<member>().view()) + " = ?";
-            binds.push_back(entityfy::to_sql_value(current));
+            binds.push_back(entityfy::detail::to_sql_value(current));
         }
 
         if(first)
@@ -1109,7 +1185,7 @@ save_result set_state<T>::save(db_context& owner)
 
         if constexpr(has_token_member)
         {
-            if(has_token)
+            if(has_token && !system_token)
             {
                 sql += ", " + entityfy::detail::quote_identifier(token_column) + " = " +
                        entityfy::detail::quote_identifier(token_column) + " + 1";
@@ -1117,7 +1193,7 @@ save_result set_state<T>::save(db_context& owner)
         }
 
         sql += " WHERE " + entityfy::detail::quote_identifier(primary_key_column) + " = ?";
-        binds.push_back(entityfy::to_sql_value(item.entity.[:primary_key:]));
+        binds.push_back(entityfy::detail::to_sql_value(item.entity.[:primary_key:]));
 
         sql_value original_token{};
 
@@ -1125,7 +1201,7 @@ save_result set_state<T>::save(db_context& owner)
         {
             if(has_token)
             {
-                original_token = entityfy::to_sql_value(item.original.[:token_member:]);
+                original_token = entityfy::detail::to_sql_value(item.original.[:token_member:]);
                 sql += " AND " + entityfy::detail::quote_identifier(token_column) + " = ?";
                 binds.push_back(original_token);
             }
@@ -1154,8 +1230,18 @@ save_result set_state<T>::save(db_context& owner)
                 static_assert(std::is_integral_v<token_type>,
                               "entityfy: the concurrency token must be an integral type");
 
-                item.entity.[:token_member:] =
-                    static_cast<token_type>(item.entity.[:token_member:] + static_cast<token_type>(1));
+                if(system_token)
+                {
+                    // The server assigned a new xmin; read it so the next save
+                    // compares against the current value.
+                    reload_system_token<token_member>(
+                        owner, item.entity, model, token_column, key_of(item.entity));
+                }
+                else
+                {
+                    item.entity.[:token_member:] =
+                        static_cast<token_type>(item.entity.[:token_member:] + static_cast<token_type>(1));
+                }
             }
         }
 

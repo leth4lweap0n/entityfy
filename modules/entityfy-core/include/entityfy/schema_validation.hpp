@@ -479,6 +479,11 @@ template <typename Model>
 
     for(const auto& expected_column: model.columns)
     {
+        if(expected_column.flags.system)
+        {
+            continue;
+        }
+
         const auto* actual_column = detail::find_column(table, expected_column.name);
         if(actual_column == nullptr)
         {
@@ -571,7 +576,8 @@ template <typename Model>
     {
         for(const auto& expected_column: model.columns)
         {
-            if(expected_column.flags.primary_key || (!expected_column.flags.indexed && !expected_column.flags.unique))
+            if(expected_column.flags.system || expected_column.flags.primary_key ||
+               (!expected_column.flags.indexed && !expected_column.flags.unique))
             {
                 continue;
             }

@@ -215,8 +215,29 @@ UPDATE "users" SET "name" = ?, "version" = "version" + 1
 WHERE "id" = ? AND "version" = ?;
 ```
 
-and deletes carry the token too, so a stale delete cannot silently win. When a statement affects
-zero rows `entityfy::concurrency_error` is thrown with one entry per conflict:
+and deletes carry the token too, so a stale delete cannot silently win.
+
+On PostgreSQL the token can be the `xmin` system column instead of an application column:
+
+```cpp
+struct user
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    // No "revision" column is created; reads come from "xmin".
+    [[= entityfy::xmin]]
+    std::uint32_t revision = 0;
+};
+```
+
+`migrate<user>()` creates only the application columns, `SELECT` includes `"xmin"`, and updates
+turn into `UPDATE "users" SET "name" = ? WHERE "id" = ? AND "xmin" = ?`. The server assigns the new
+`xmin`, so the context reads it back after every insert and update; the next save compares against
+the current value without the application column. `xmin` is 32-bit and can wrap, and the mapping
+is PostgreSQL-only.
+
+When a statement affects zero rows `entityfy::concurrency_error` is thrown with one entry per conflict:
 
 | field | meaning |
 |---|---|
