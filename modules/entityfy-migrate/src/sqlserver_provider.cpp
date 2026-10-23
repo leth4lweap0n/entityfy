@@ -69,10 +69,13 @@ std::string truncate_identifier(std::string value)
     return value;
 }
 
-[[nodiscard]] std::wstring utf8_to_utf16(std::string_view input)
+// SQLWCHAR is wchar_t on Windows but unsigned short on Unix; std::wstring is
+// not portable there. A trailing NUL makes SQL_NTS work, and the size excludes
+// it for binding.
+[[nodiscard]] std::vector<SQLWCHAR> utf8_to_utf16(std::string_view input)
 {
-    std::wstring output;
-    output.reserve(input.size());
+    std::vector<SQLWCHAR> output;
+    output.reserve(input.size() + 1);
 
     for(std::size_t index = 0; index < input.size();)
     {
@@ -101,14 +104,14 @@ std::string truncate_identifier(std::string value)
         }
         else
         {
-            output.push_back(static_cast<wchar_t>(0xFFFD));
+            output.push_back(static_cast<SQLWCHAR>(0xFFFD));
             ++index;
             continue;
         }
 
         if(index + length > input.size())
         {
-            output.push_back(static_cast<wchar_t>(0xFFFD));
+            output.push_back(static_cast<SQLWCHAR>(0xFFFD));
             break;
         }
 
@@ -121,20 +124,21 @@ std::string truncate_identifier(std::string value)
 
         if(code <= 0xFFFF)
         {
-            output.push_back(static_cast<wchar_t>(code));
+            output.push_back(static_cast<SQLWCHAR>(code));
         }
         else
         {
             code -= 0x10000;
-            output.push_back(static_cast<wchar_t>(0xD800 + (code >> 10U)));
-            output.push_back(static_cast<wchar_t>(0xDC00 + (code & 0x3FFU)));
+            output.push_back(static_cast<SQLWCHAR>(0xD800 + (code >> 10U)));
+            output.push_back(static_cast<SQLWCHAR>(0xDC00 + (code & 0x3FFU)));
         }
     }
 
+    output.push_back(0);
     return output;
 }
 
-[[nodiscard]] std::string utf16_to_utf8(const wchar_t* input, std::size_t length)
+[[nodiscard]] std::string utf16_to_utf8(const SQLWCHAR* input, std::size_t length)
 {
     std::string output;
     output.reserve(length);
@@ -300,14 +304,14 @@ public:
             ";UID=" + options.user + ";PWD=" + options.password + ";DATABASE=" + options.database +
             ";TrustServerCertificate=yes;Encrypt=yes";
 
-        const auto wide = utf8_to_utf16(connection_string);
+        auto wide = utf8_to_utf16(connection_string);
         SQLWCHAR   output[1024]{};
         SQLSMALLINT output_length = 0;
 
         if(!succeeded(SQLDriverConnectW(
                connection_,
                nullptr,
-               const_cast<SQLWCHAR*>(wide.c_str()),
+               wide.data(),
                SQL_NTS,
                output,
                static_cast<SQLSMALLINT>(sizeof(output) / sizeof(output[0])),
@@ -348,9 +352,9 @@ public:
             throw std::runtime_error{"entityfy/migrate:sqlserver: statement allocation failed"};
         }
 
-        const auto wide = utf8_to_utf16(sql);
+        auto wide = utf8_to_utf16(sql);
 
-        if(!succeeded(SQLExecDirectW(statement, const_cast<SQLWCHAR*>(wide.c_str()), SQL_NTS)))
+        if(!succeeded(SQLExecDirectW(statement, wide.data(), SQL_NTS)))
         {
             const auto message = diagnostics(SQL_HANDLE_STMT, statement);
             SQLFreeHandle(SQL_HANDLE_STMT, statement);
@@ -405,8 +409,8 @@ public:
             throw std::runtime_error{"entityfy/migrate:sqlserver: statement allocation failed"};
         }
 
-        const auto wide = utf8_to_utf16(sql);
-        SQLRETURN  result = SQLPrepareW(statement, const_cast<SQLWCHAR*>(wide.c_str()), SQL_NTS);
+        auto wide = utf8_to_utf16(sql);
+        SQLRETURN  result = SQLPrepareW(statement, wide.data(), SQL_NTS);
 
         if(!succeeded(result))
         {
@@ -415,14 +419,14 @@ public:
             throw std::runtime_error{"entityfy/migrate:sqlserver: prepare failed: " + message};
         }
 
-        std::vector<std::wstring> texts;
+        std::vector<std::vector<SQLWCHAR>> texts;
         texts.reserve(params.size());
         std::vector<SQLLEN> indicators(params.size(), 0);
 
         for(std::size_t index = 0; index < params.size(); ++index)
         {
             texts.push_back(utf8_to_utf16(params[index]));
-            indicators[index] = static_cast<SQLLEN>(texts.back().size() * sizeof(wchar_t));
+            indicators[index] = static_cast<SQLLEN>((texts.back().size() - 1) * sizeof(SQLWCHAR));
         }
 
         for(std::size_t index = 0; index < params.size(); ++index)
@@ -433,7 +437,7 @@ public:
                    SQL_PARAM_INPUT,
                    SQL_C_WCHAR,
                    SQL_WVARCHAR,
-                   static_cast<SQLULEN>(texts[index].size()),
+                   static_cast<SQLULEN>(texts[index].size() - 1),
                    0,
                    texts[index].data(),
                    indicators[index],
@@ -482,8 +486,8 @@ public:
 
             for(SQLSMALLINT index = 0; index < columns; ++index)
             {
-                std::wstring value;
-                wchar_t      buffer[2048];
+                std::vector<SQLWCHAR> value;
+                SQLWCHAR              buffer[2048];
                 SQLLEN       indicator = 0;
                 bool         is_null = false;
 
@@ -521,9 +525,9 @@ public:
                         break;
                     }
 
-                    const auto characters = indicator > 0 ? static_cast<std::size_t>(indicator / static_cast<SQLLEN>(sizeof(wchar_t)))
+                    const auto characters = indicator > 0 ? static_cast<std::size_t>(indicator / static_cast<SQLLEN>(sizeof(SQLWCHAR)))
                                                           : std::size_t{0};
-                    value.append(buffer, characters);
+                    value.insert(value.end(), buffer, buffer + characters);
 
                     if(chunk != SQL_SUCCESS_WITH_INFO)
                     {

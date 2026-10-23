@@ -88,10 +88,14 @@ struct sqlserver_connection_options
     return options;
 }
 
-[[nodiscard]] std::wstring utf8_to_utf16(std::string_view input)
+// SQLWCHAR is wchar_t on Windows but unsigned short on Unix; a std::wstring is
+// therefore not portable (wchar_t is 32-bit there). The returned vector carries
+// a trailing NUL so SQL_NTS works, and its size excludes that sentinel for
+// binding.
+[[nodiscard]] std::vector<SQLWCHAR> utf8_to_utf16(std::string_view input)
 {
-    std::wstring output;
-    output.reserve(input.size());
+    std::vector<SQLWCHAR> output;
+    output.reserve(input.size() + 1);
 
     for(std::size_t index = 0; index < input.size();)
     {
@@ -120,14 +124,14 @@ struct sqlserver_connection_options
         }
         else
         {
-            output.push_back(static_cast<wchar_t>(0xFFFD));
+            output.push_back(static_cast<SQLWCHAR>(0xFFFD));
             ++index;
             continue;
         }
 
         if(index + length > input.size())
         {
-            output.push_back(static_cast<wchar_t>(0xFFFD));
+            output.push_back(static_cast<SQLWCHAR>(0xFFFD));
             break;
         }
 
@@ -140,20 +144,21 @@ struct sqlserver_connection_options
 
         if(code <= 0xFFFF)
         {
-            output.push_back(static_cast<wchar_t>(code));
+            output.push_back(static_cast<SQLWCHAR>(code));
         }
         else
         {
             code -= 0x10000;
-            output.push_back(static_cast<wchar_t>(0xD800 + (code >> 10U)));
-            output.push_back(static_cast<wchar_t>(0xDC00 + (code & 0x3FFU)));
+            output.push_back(static_cast<SQLWCHAR>(0xD800 + (code >> 10U)));
+            output.push_back(static_cast<SQLWCHAR>(0xDC00 + (code & 0x3FFU)));
         }
     }
 
+    output.push_back(0);
     return output;
 }
 
-[[nodiscard]] std::string utf16_to_utf8(const wchar_t* input, std::size_t length)
+[[nodiscard]] std::string utf16_to_utf8(const SQLWCHAR* input, std::size_t length)
 {
     std::string output;
     output.reserve(length);
@@ -296,7 +301,7 @@ struct diagnostics
 
 struct sqlserver_parameters
 {
-    std::deque<std::wstring>      texts;
+    std::deque<std::vector<SQLWCHAR>> texts;
     std::deque<SQLBIGINT>         integers;
     std::deque<SQLUBIGINT>        unsigned_integers;
     std::deque<double>            reals;
@@ -369,8 +374,8 @@ struct sqlserver_parameters
                     output.c_types[index] = SQL_C_WCHAR;
                     output.sql_types[index] = SQL_WVARCHAR;
                     output.buffers[index] = output.texts.back().data();
-                    output.lengths[index] = static_cast<SQLLEN>(output.texts.back().size() * sizeof(wchar_t));
-                    output.column_sizes[index] = static_cast<SQLULEN>(output.texts.back().size());
+                    output.lengths[index] = static_cast<SQLLEN>((output.texts.back().size() - 1) * sizeof(SQLWCHAR));
+                    output.column_sizes[index] = static_cast<SQLULEN>(output.texts.back().size() - 1);
                     // For input strings the indicator carries the byte length.
                     output.indicators[index] = output.lengths[index];
                 }
@@ -482,8 +487,8 @@ struct sqlserver_parameters
 
         default:
         {
-            std::wstring output;
-            wchar_t      buffer[2048];
+            std::vector<SQLWCHAR> output;
+            SQLWCHAR              buffer[2048];
 
             while(true)
             {
@@ -504,9 +509,9 @@ struct sqlserver_parameters
                     break;
                 }
 
-                const auto characters = indicator > 0 ? static_cast<std::size_t>(indicator / static_cast<SQLLEN>(sizeof(wchar_t)))
+                const auto characters = indicator > 0 ? static_cast<std::size_t>(indicator / static_cast<SQLLEN>(sizeof(SQLWCHAR)))
                                                       : std::size_t{0};
-                output.append(buffer, characters);
+                output.insert(output.end(), buffer, buffer + characters);
 
                 if(result != SQL_SUCCESS_WITH_INFO)
                 {
@@ -538,14 +543,14 @@ public:
             ";UID=" + options.user + ";PWD=" + options.password + ";DATABASE=" + options.database +
             ";TrustServerCertificate=yes;Encrypt=yes";
 
-        const auto wide = utf8_to_utf16(connection_string);
+        auto wide = utf8_to_utf16(connection_string);
         SQLWCHAR   output[1024]{};
         SQLSMALLINT output_length = 0;
 
         if(!succeeded(SQLDriverConnectW(
                connection_,
                nullptr,
-               const_cast<SQLWCHAR*>(wide.c_str()),
+               wide.data(),
                SQL_NTS,
                output,
                static_cast<SQLSMALLINT>(std::size(output)),
@@ -966,8 +971,8 @@ private:
             throw std::runtime_error{"entityfy SQL Server statement allocation failed"};
         }
 
-        const auto wide = utf8_to_utf16(sql);
-        const auto result = SQLExecDirectW(statement_handle, const_cast<SQLWCHAR*>(wide.c_str()), SQL_NTS);
+        auto wide = utf8_to_utf16(sql);
+        const auto result = SQLExecDirectW(statement_handle, wide.data(), SQL_NTS);
 
         if(!succeeded(result))
         {
@@ -987,9 +992,9 @@ private:
             throw std::runtime_error{"entityfy SQL Server statement allocation failed"};
         }
 
-        const auto wide = utf8_to_utf16(input.sql);
+        auto wide = utf8_to_utf16(input.sql);
 
-        if(!succeeded(SQLExecDirectW(statement_handle, const_cast<SQLWCHAR*>(wide.c_str()), SQL_NTS)))
+        if(!succeeded(SQLExecDirectW(statement_handle, wide.data(), SQL_NTS)))
         {
             const auto message = classify_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
             SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
@@ -1062,9 +1067,9 @@ private:
                 throw std::runtime_error{"entityfy SQL Server statement allocation failed"};
             }
 
-            const auto wide = utf8_to_utf16(input.sql);
+            auto wide = utf8_to_utf16(input.sql);
 
-            if(!succeeded(SQLPrepareW(statement_handle, const_cast<SQLWCHAR*>(wide.c_str()), SQL_NTS)))
+            if(!succeeded(SQLPrepareW(statement_handle, wide.data(), SQL_NTS)))
             {
                 const auto message = classify_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
                 SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
