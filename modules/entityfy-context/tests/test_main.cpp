@@ -1,3 +1,4 @@
+#include <entityfy/concurrency.hpp>
 #include <entityfy/db_context.hpp>
 #include <entityfy/db_context_pool.hpp>
 
@@ -152,6 +153,18 @@ struct [[= entityfy::table{"rc_alias_version"}]] rc_alias_version
 
     [[= entityfy::column{"row_version"}]]
     std::int64_t version = 0;
+};
+
+struct [[= entityfy::table{"rc_token_model"}]] rc_token_model
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::not_null]]
+    std::string body;
+
+    [[= entityfy::concurrency_token, = entityfy::not_null]]
+    std::int64_t revision = 0;
 };
 
 // EF Core style context: the sets are declared once, the framework derives
@@ -565,6 +578,194 @@ status run_concurrency_checks()
     }
 
     std::filesystem::remove(path);
+    return status::passed;
+}
+
+status run_concurrency_resolution_checks()
+{
+    const char* path = "rc_concurrency_resolution.db";
+    std::filesystem::remove(path);
+
+    {
+        entityfy::db_context writer{"sqlite://rc_concurrency_resolution.db"};
+        writer.migrate<rc_user>();
+
+        auto writer_set = writer.set<rc_user>();
+        auto& created = writer_set.add(rc_user{.email = "resolve@test.com", .name = "Initial"});
+        writer.save_changes();
+        const auto id = created.id;
+
+        entityfy::db_context stale{"sqlite://rc_concurrency_resolution.db"};
+        auto stale_set = stale.set<rc_user>();
+        auto* stale_row = stale_set.find(id);
+        require(stale_row != nullptr, "stale context loads the entity");
+        require(stale_row->version == 0, "stale context sees version 0");
+
+        auto* winner = writer_set.find(id);
+        require(winner != nullptr, "writer tracks the entity");
+        winner->name = "Winner";
+        writer.save_changes();
+
+        stale_row->name = "Loser";
+
+        bool conflict = false;
+        try
+        {
+            stale.save_changes();
+        }
+        catch(const entityfy::concurrency_error& error)
+        {
+            conflict = true;
+            require(error.entries().size() == 1, "one conflicting entry");
+
+            const auto& entry = error.entries().front();
+            require(entry.table == "rc_users", "entry names the table");
+            require(entry.key == id, "entry carries the key");
+            require(entry.token_column == "version", "entry names the token column");
+            require(as_integer(entry.original_token) == 0, "entry carries the stale token");
+            require(entry.row_exists(), "entry carries the database row");
+
+            const auto name = std::find(entry.columns.begin(), entry.columns.end(), std::string{"name"});
+            require(name != entry.columns.end(), "entry columns include name");
+            const auto position = static_cast<std::size_t>(std::distance(entry.columns.begin(), name));
+            require(std::get<std::string>(entry.database_values[position]) == "Winner",
+                    "entry exposes the winner's value");
+        }
+
+        require(conflict, "structured concurrency error raised");
+
+        const auto database_row = stale_set.database_values(*stale_row);
+        require(database_row.has_value(), "database_values returns the current row");
+        require(database_row->name == "Winner" && database_row->version == 1, "database row is current");
+
+        stale_set.accept_changes(*stale_row, *database_row);
+        stale_row->name = "Resolved";
+        require(stale.save_changes().updated == 1, "client wins save succeeds");
+
+        auto rows = writer.database().table<rc_user>().find_many();
+        require(rows.size() == 1 && rows.front().name == "Resolved", "client wins value persisted");
+        require(rows.front().version == 2, "token incremented after resolution");
+    }
+
+    std::filesystem::remove(path);
+    return status::passed;
+}
+
+status run_attach_and_delete_conflict_checks()
+{
+    const char* path = "rc_attach_conflict.db";
+    std::filesystem::remove(path);
+
+    {
+        entityfy::db_context writer{"sqlite://rc_attach_conflict.db"};
+        writer.migrate<rc_user>();
+
+        auto set = writer.set<rc_user>();
+        auto& created = set.add(rc_user{.email = "attach@test.com", .name = "Initial"});
+        writer.save_changes();
+        const auto id = created.id;
+
+        // A detached copy taken before the update keeps the stale token.
+        auto stale_copy = *writer.database().find<rc_user>(id);
+
+        auto* tracked = set.find(id);
+        tracked->name = "Winner";
+        writer.save_changes();
+
+        entityfy::db_context detached{"sqlite://rc_attach_conflict.db"};
+        auto detached_set = detached.set<rc_user>();
+        auto attached = stale_copy;
+        attached.name = "Attached";
+        attached.version = 99; // the current value must not replace the snapshot
+        detached_set.attach(attached, stale_copy);
+
+        bool conflict = false;
+        try
+        {
+            detached.save_changes();
+        }
+        catch(const entityfy::concurrency_error& error)
+        {
+            conflict = true;
+            require(error.entries().size() == 1, "attach conflict reports one entry");
+            require(as_integer(error.entries().front().original_token) == 0,
+                    "attach uses the provided original token");
+        }
+
+        require(conflict, "stale attached entity conflicts");
+
+        // Delete conflict: the removed row carries the token too.
+        auto* to_remove = set.find(id);
+        require(to_remove != nullptr, "writer tracks the entity for removal");
+        writer.save_changes();
+        to_remove->name = "Before delete";
+        writer.save_changes();
+
+        entityfy::db_context stale_delete{"sqlite://rc_attach_conflict.db"};
+        auto stale_remove_set = stale_delete.set<rc_user>();
+        auto* stale_remove = stale_remove_set.find(id);
+        require(stale_remove != nullptr, "stale context loads the deletable entity");
+
+        to_remove->name = "Concurrent update";
+        writer.save_changes();
+
+        stale_remove_set.remove(*stale_remove);
+
+        bool delete_conflict = false;
+        try
+        {
+            stale_delete.save_changes();
+        }
+        catch(const entityfy::concurrency_error& error)
+        {
+            delete_conflict = true;
+            require(error.entries().size() == 1, "delete conflict reports one entry");
+            require(error.entries().front().row_exists(), "delete conflict carries the current row");
+        }
+
+        require(delete_conflict, "stale delete conflicts");
+    }
+
+    std::filesystem::remove(path);
+    return status::passed;
+}
+
+status run_token_annotation_checks()
+{
+    std::filesystem::remove("rc_token_model.db");
+
+    {
+        entityfy::db_context writer{"sqlite://rc_token_model.db"};
+        writer.migrate<rc_token_model>();
+        auto writer_set = writer.set<rc_token_model>();
+        auto& row = writer_set.add(rc_token_model{.body = "v0"});
+        writer.save_changes();
+
+        entityfy::db_context stale_ctx{"sqlite://rc_token_model.db"};
+        auto stale_set = stale_ctx.set<rc_token_model>();
+        auto* stale_row = stale_set.find(row.id);
+        require(stale_row != nullptr, "stale context loads annotated token entity");
+
+        auto* winner = writer_set.find(row.id);
+        winner->body = "winner";
+        writer.save_changes();
+
+        stale_row->body = "loser";
+        bool conflict = false;
+        try
+        {
+            stale_ctx.save_changes();
+        }
+        catch(const entityfy::concurrency_error& error)
+        {
+            conflict = true;
+            require(error.entries().front().token_column == "revision", "annotation selects the token column");
+        }
+
+        require(conflict, "annotated token detects the conflict");
+    }
+
+    std::filesystem::remove("rc_token_model.db");
     return status::passed;
 }
 
@@ -1384,12 +1585,51 @@ status run_postgres_checks()
     {
         concurrent.save_changes();
     }
-    catch(const std::exception&)
+    catch(const entityfy::concurrency_error& error)
     {
         conflict = true;
+        require(error.entries().size() == 1, "pg conflict entry count");
+        require(error.entries().front().row_exists(), "pg conflict carries the database row");
+        require(error.entries().front().token_column == "version", "pg conflict names the token column");
     }
 
     require(conflict, "pg optimistic concurrency conflict");
+
+    // Client wins: take the database row as the original snapshot, keep the edit.
+    const auto database_row = concurrent_users.database_values(*stale);
+    require(database_row.has_value() && database_row->name == "Ada Winner", "pg database values are current");
+    concurrent_users.accept_changes(*stale, *database_row);
+    stale->name = "Ada Resolved";
+    require(concurrent.save_changes().updated == 1, "pg client wins resolves the conflict");
+    users.refresh(*fetched);
+    require(fetched->name == "Ada Resolved", "pg refresh picks up the resolved value");
+
+    // Stale delete: the token is part of the DELETE as well.
+    {
+        auto* tracked_grace = users.find(grace.id);
+        require(tracked_grace != nullptr, "pg writer tracks grace");
+
+        entityfy::db_context other{uri};
+        auto other_users = other.set<rc_user>();
+        auto* stale_grace = other_users.find(grace.id);
+        require(stale_grace != nullptr, "pg stale context loads grace");
+
+        tracked_grace->name = "Grace Winner";
+        ctx.save_changes();
+
+        other_users.remove(*stale_grace);
+        bool delete_conflict = false;
+        try
+        {
+            other.save_changes();
+        }
+        catch(const entityfy::concurrency_error&)
+        {
+            delete_conflict = true;
+        }
+
+        require(delete_conflict, "pg stale delete conflicts");
+    }
 
     users.remove(*fetched);
     saved = ctx.save_changes();
@@ -1728,6 +1968,9 @@ int main()
         {"sqlite", run_sqlite_checks},
         {"rollback", run_rollback_checks},
         {"concurrency", run_concurrency_checks},
+        {"concurrency_resolution", run_concurrency_resolution_checks},
+        {"attach_delete_conflict", run_attach_and_delete_conflict_checks},
+        {"token_annotation", run_token_annotation_checks},
         {"multi_conflict", run_multi_conflict_checks},
         {"tracking_edges", run_tracking_edge_checks},
         {"transaction", run_transaction_checks},

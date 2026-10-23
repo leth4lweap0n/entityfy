@@ -20,6 +20,11 @@
 - Identity map, snapshot-based change tracking, partial UPDATE
 - **Manual change tracking**: `set_auto_detect(false)` + `mark_modified(entity)`; a save visits only
   the changed entities (measured 5,5 µs at 50.000 tracked rows against 10,6 ms with auto detection)
+- **Optimistic concurrency parity (P0/P1)**: structured `concurrency_error` with the conflicting
+  entries (token, current database row), `database_values` / `accept_changes` (client wins and
+  per-member merge) / `attach(value, original)`, `[[= entityfy::concurrency_token]]` on any integral
+  member, the token checked by deletes, and cancelling a pending insert no longer issues a DELETE;
+  covered on SQLite and PostgreSQL
 - **No-tracking reads**: `query().select(...)` (tuples) and `as_no_tracking()` (full entities by
   value, EF Core `AsNoTracking`); measured 332 ns/row against 460 ns/row tracked.
   `to_list()` returns a read-only result, so mutating a row is a compile error
@@ -79,51 +84,32 @@ features for now (see [Deferred](#deferred-other-providers)). Each entry records
 has to change so a session can pick it up without redoing the analysis. Everything above this
 section is implemented and covered by the test suite.
 
-### Change tracker: EF Core concurrency parity
+### Change tracker
 
-1. **Structured concurrency error (P0)** — an update/delete that affects zero rows currently throws
-   a plain `std::runtime_error` with the key in the message. Surface:
-   `modules/entityfy-context/include/entityfy/db_set.hpp` (save/delete paths),
-   a new `concurrency_error` with `entries()` carrying table, key, original values and the current
-   database row. Acceptance: a stale save throws `concurrency_error` whose entry exposes the
-   winner's values; existing suites keep passing.
-2. **Resolution APIs (P0)** — no way to resolve a conflict without losing work: `refresh()`
-   overwrites the entity and resets it to unchanged. Surface: `db_set<T>` plus
-   `docs/context.md`. Add `database_values(entity)` (read without overwriting),
-   `accept_changes(entity, database_row)` (client wins: original snapshot := DB row) and a
-   per-member overload for merges. Acceptance: client-wins and merge scenarios save successfully
-   and are covered by the context suite.
-3. **Delete token check (P0)** — deletes use `DELETE ... WHERE id = ?` only, so a stale delete wins.
-   Surface: `entityfy::delete_by_id_statement` (core) plus the context delete path. Acceptance:
-   a stale delete throws `concurrency_error`; a delete of an already removed row reports it.
-4. **Token selection and attach (P1)** — the token member must be named `version`; disconnected
-   entities cannot carry a separate original snapshot. Surface: annotations, `db_set<T>`.
-   Add `[[= entityfy::concurrency_token]]` for any integral member and
-   `attach(value, original)`. Acceptance: a model whose token is named `revision` conflicts
-   correctly, and a stale attached entity conflicts.
-5. **PostgreSQL `xmin` token (P2)** — the store-generated token EF Core users get from Npgsql.
-   Surface: `postgresql_backend.cpp` select/update paths, model mapping. Acceptance: a model using
-   the system column conflicts after an out-of-band update without an application column.
+1. **PostgreSQL `xmin` token (P2)** — the store-generated token EF Core users get from Npgsql, so
+   a model can use the system column instead of an application column. Surface:
+   `postgresql_backend.cpp` select/update paths, model mapping. Acceptance: a model using the
+   system column conflicts after an out-of-band update without an application column.
 
 ### SQLite and PostgreSQL
 
-6. **`as_no_tracking()` with eager loading** — a no-tracking query currently rejects `include`;
+2. **`as_no_tracking()` with eager loading** — a no-tracking query currently rejects `include`;
    the include path in `db_set` would have to carry read-only pairs and merge them by key.
    Surface: `modules/entityfy-context/include/entityfy/db_set.hpp`. Acceptance: an eager-loaded
    no-tracking read returns the same rows as the tracked variant, with a scenario.
-7. **Deduplicate the context read path** — `include`/`join` still collect `vector<row>` before
+3. **Deduplicate the context read path** — `include`/`join` still collect `vector<row>` before
    materializing. Surface: the same file. Acceptance: rows are built in the consumer, all suites
    green, delta recorded in `docs/benchmarks.md`.
-8. **PostgreSQL pipeline mode / batching** — with the statement cache in place the per-call round
+4. **PostgreSQL pipeline mode / batching** — with the statement cache in place the per-call round
    trip dominates. Surface: `postgresql_backend.cpp` batch path. Acceptance: batched writes use a
    pipeline, the benchmark table records before/after, the PostgreSQL suite stays green.
-9. **Type-based transient errors and retry** — retries match message text ("deadlock detected",
+5. **Type-based transient errors and retry** — retries match message text ("deadlock detected",
    "database is locked"). Surface: `postgresql_backend.cpp`, `sqlite_backend.cpp`, `error.hpp`,
    `db_context` retry predicate. Acceptance: PostgreSQL `40001`/`40P01` and SQLite
    `SQLITE_BUSY`/`SQLITE_LOCKED` map to dedicated error types and the retry policy keys off them.
-10. **Statement cache in the migration providers** — SQLite/PostgreSQL only for now; decide by
-    measurement. Acceptance: the measurement lands in `docs/benchmarks.md` and the outcome
-    (implementation or documented decision) is recorded.
+6. **Statement cache in the migration providers** — SQLite/PostgreSQL only for now; decide by
+   measurement. Acceptance: the measurement lands in `docs/benchmarks.md` and the outcome
+   (implementation or documented decision) is recorded.
 
 ## Deferred: other providers
 

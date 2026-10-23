@@ -203,6 +203,10 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
 - **Manual change tracking**: `ctx.set_auto_detect(false)` plus `users.mark_modified(entity)` makes
   a save visit only the entities that changed - measured 5,5 µs at 50.000 tracked rows against
   10,6 ms with auto detection (see [docs/benchmarks.md](docs/benchmarks.md)).
+- **Optimistic concurrency**: a `version` member (or `[[= entityfy::concurrency_token]]`) drives
+  `WHERE id AND token` updates and deletes; `concurrency_error` exposes the conflicting entries and
+  the current database row, and `database_values` / `accept_changes` / `attach(value, original)`
+  resolve conflicts (EF Core parity).
 - Control over tracking through `state(entity)`, `refresh`, `detach`, `clear`.
 - **FK dependency order**: insert/update parent-first, delete child-first. In tables using
   `ON DELETE RESTRICT`, a parent and its child can be deleted in the same save.
@@ -296,7 +300,7 @@ ctest --preset release
 ```
 
 50 CTest entries in the default build: 48 core Catch2 test cases (233 assertions) and the
-migrate/context test binaries - which contain 11 and 20 scenarios respectively. Each opt-in
+migrate/context test binaries - which contain 11 and 21 scenarios respectively. Each opt-in
 backend (`ENTITYFY_ENABLE_MYSQL`, `ENTITYFY_ENABLE_SQLSERVER`) adds three core cases (two backend
 tests and a statement cache test) and one scenario to the migrate and context binaries
 (53 entries with MySQL, 50 with SQL Server).

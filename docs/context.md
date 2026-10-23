@@ -179,6 +179,71 @@ const auto removed = ctx.posts.query().where(entityfy::where(&post::id) == 7).re
 const auto updated = ctx.posts.query().assign(&post::score, 10).update_all();
 ```
 
+## Concurrency
+
+Optimistic concurrency is opt-in through a token column: the member named `version`, or any
+persisted integral member annotated with `[[= entityfy::concurrency_token]]`.
+
+```cpp
+struct user
+{
+    // ...
+    [[= entityfy::not_null]]
+    std::int64_t version = 0;
+
+    // or: [[= entityfy::concurrency_token, = entityfy::not_null]] std::int64_t revision = 0;
+};
+```
+
+Updates turn into
+
+```sql
+UPDATE "users" SET "name" = ?, "version" = "version" + 1
+WHERE "id" = ? AND "version" = ?;
+```
+
+and deletes carry the token too, so a stale delete cannot silently win. When a statement affects
+zero rows `entityfy::concurrency_error` is thrown with one entry per conflict:
+
+| field | meaning |
+|---|---|
+| `table`, `key` | the row that conflicted |
+| `token_column`, `original_token` | the token column and the stale value (monostate without a token) |
+| `columns`, `database_values` | the row as it exists now; empty when it was deleted (`row_exists()`) |
+
+Resolving a conflict:
+
+```cpp
+try
+{
+    ctx.save_changes();
+}
+catch(const entityfy::concurrency_error& error)
+{
+    const auto& entry = error.entries().front();
+
+    // store wins: reload the row (values replaced, entity becomes unchanged)
+    users.refresh(user);
+
+    // client wins: keep the edit, take the database row as the new original snapshot
+    const auto database_row = users.database_values(user);
+    users.accept_changes(user, *database_row);
+    ctx.save_changes();
+
+    // merge: move only one member's original value to the database row
+    users.accept_changes(user, *database_row, &user::email);
+}
+```
+
+`attach(value, original)` preserves a separate snapshot for disconnected entities, so a stale
+token survives the round trip and is checked on the next save. `save_changes()` still runs in one
+transaction: a conflict rolls the whole batch back and restores the in-memory token values, so the
+resolution above can be retried in the same context.
+
+**Honest limits:** `remove_all()` / `update_all()` bypass the tracker and the token; the retry
+policy covers transient errors only, a concurrency conflict is never retried automatically; the
+token must map to a single persisted column.
+
 ## Batch, retry, transaction
 
 ```cpp

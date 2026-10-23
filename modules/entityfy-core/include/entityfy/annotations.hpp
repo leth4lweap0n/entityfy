@@ -129,6 +129,13 @@ struct ignore_t
 {
 };
 
+// Marks the member used for optimistic concurrency checks. Any integral,
+// persisted member works; without the annotation the member named "version"
+// keeps working.
+struct concurrency_token_t
+{
+};
+
 struct created_at_t
 {
 };
@@ -198,6 +205,7 @@ inline constexpr indexed_t        index{};
 inline constexpr not_null_t       not_null{};
 inline constexpr nullable_t       nullable{};
 inline constexpr ignore_t         ignore{};
+inline constexpr concurrency_token_t concurrency_token{};
 inline constexpr ignore_t         ignored{};
 inline constexpr created_at_t     created_at{};
 inline constexpr updated_at_t     updated_at{};

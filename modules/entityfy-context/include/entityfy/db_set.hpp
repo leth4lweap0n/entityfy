@@ -1,5 +1,6 @@
 #pragma once
 
+#include <entityfy/concurrency.hpp>
 #include <entityfy/db_context.hpp>
 
 #include <algorithm>
@@ -64,6 +65,25 @@ consteval std::meta::info find_member(std::meta::info type, std::string_view nam
     return std::meta::info{};
 }
 
+consteval std::meta::info concurrency_token_member(std::meta::info type)
+{
+    for(const auto member: std::meta::nonstatic_data_members_of(type, std::meta::access_context::unchecked()))
+    {
+        if(!std::meta::annotations_of_with_type(member, ^^entityfy::concurrency_token_t).empty())
+        {
+            return member;
+        }
+    }
+
+    return find_member(type, "version");
+}
+
+template <typename T>
+consteval std::meta::info concurrency_token_member()
+{
+    return concurrency_token_member(^^T);
+}
+
 consteval bool is_ignored_member(std::meta::info member)
 {
     return !std::meta::annotations_of_with_type(member, ^^entityfy::ignore_t).empty();
@@ -97,7 +117,7 @@ consteval auto update_members()
             continue;
         }
 
-        if(member == find_primary_key(^^T) || member == find_member(^^T, "version"))
+        if(member == find_primary_key(^^T) || member == concurrency_token_member<T>())
         {
             continue;
         }
@@ -138,6 +158,38 @@ bool is_persisted_column(const entityfy::model_descriptor<T>& model, std::string
     return std::ranges::any_of(model.columns, [&](const entityfy::column_descriptor& column) {
         return column.name == name;
     });
+}
+
+template <typename T>
+[[nodiscard]] concurrency_entry make_concurrency_entry(
+    db_context& owner,
+    const entityfy::model_descriptor<T>& model,
+    std::int64_t key,
+    std::string_view token_column,
+    const sql_value& original_token)
+{
+    concurrency_entry entry;
+    entry.table = model.table_name;
+    entry.key = key;
+    entry.token_column = std::string{token_column};
+    entry.original_token = original_token;
+    for(const auto& column: owner.database().inspect_table(model.table_name).columns)
+    {
+        entry.columns.push_back(column.name);
+    }
+
+    entityfy::statement lookup;
+    lookup.sql = "SELECT * FROM " + entityfy::detail::quote_identifier(model.table_name) + " WHERE " +
+                 entityfy::detail::quote_identifier(primary_key_column(model).name) + " = ?";
+    lookup.binds.emplace_back(entityfy::to_sql_value(key));
+
+    auto rows = owner.database().query(lookup);
+    if(!rows.empty())
+    {
+        entry.database_values = std::move(rows.front());
+    }
+
+    return entry;
 }
 
 // Reads the value of a persisted column from an in memory entity. The column
@@ -372,6 +424,15 @@ struct set_state final : saveable
 
     T& attach(T value)
     {
+        T original = value;
+        return attach(std::move(value), std::move(original));
+    }
+
+    // Attaches a detached entity together with the snapshot it was loaded
+    // with, so a stale concurrency token is preserved and checked on save
+    // (EF Core: Attach with original values).
+    T& attach(T value, T original)
+    {
         const std::int64_t key = key_of(value);
 
         if(key != 0)
@@ -382,9 +443,8 @@ struct set_state final : saveable
             }
         }
 
-        items.push_back(std::make_unique<tracked>(tracked{.entity = std::move(value)}));
+        items.push_back(std::make_unique<tracked>(tracked{.entity = std::move(value), .original = std::move(original)}));
         auto& item = *items.back();
-        item.original = item.entity;
         item.state = entity_state::unchanged;
 
         if(key != 0)
@@ -393,6 +453,49 @@ struct set_state final : saveable
         }
 
         return item.entity;
+    }
+
+    // Reads the row as it exists now without touching the tracked entity.
+    [[nodiscard]] std::optional<T> database_values(db_context& owner, const T& value)
+    {
+        const std::int64_t key = key_of(value);
+        if(key == 0)
+        {
+            return std::nullopt;
+        }
+
+        return owner.database().template find<T>(key);
+    }
+
+    // Client wins: the original snapshot becomes the database row while the
+    // current (edited) values stay, so the next save matches the token.
+    void accept_changes(const T& value, const T& database_row)
+    {
+        auto& item = mutable_item(value, "accept_changes");
+
+        if(item.state == entity_state::added || item.state == entity_state::removed ||
+           item.state == entity_state::detached)
+        {
+            throw std::runtime_error{"entityfy: accept_changes() requires a saved, tracked entity"};
+        }
+
+        item.original = database_row;
+        item.marked_modified = false;
+    }
+
+    // Per-member variant for merges: only that member's original value moves.
+    template <typename Member>
+    void accept_changes(const T& value, const T& database_row, Member T::* member)
+    {
+        auto& item = mutable_item(value, "accept_changes");
+
+        if(item.state == entity_state::added || item.state == entity_state::removed ||
+           item.state == entity_state::detached)
+        {
+            throw std::runtime_error{"entityfy: accept_changes() requires a saved, tracked entity"};
+        }
+
+        item.original.*member = database_row.*member;
     }
 
     void remove(const T& value)
@@ -404,6 +507,18 @@ struct set_state final : saveable
         }
 
         auto& item = *items[*index];
+
+        // A pending insert that is removed again never reached the database;
+        // cancelling it must not issue a DELETE (and cannot affect zero rows).
+        if(item.state == entity_state::added)
+        {
+            item.state = entity_state::detached;
+            std::erase(added_indices_, *index);
+            forget_index(*index);
+            needs_compaction_ = true;
+            return;
+        }
+
         if(item.state != entity_state::removed)
         {
             item.state = entity_state::removed;
@@ -449,8 +564,8 @@ struct set_state final : saveable
         }
 
         const auto model = entityfy::describe_model<T>(entityfy::dialect::sqlite);
-        constexpr auto version_member = find_member(^^T, "version");
-        constexpr bool has_version_member = version_member != std::meta::info{};
+        constexpr auto token_member = concurrency_token_member<T>();
+        constexpr bool has_token_member = token_member != std::meta::info{};
 
         bool modified = false;
 
@@ -464,9 +579,9 @@ struct set_state final : saveable
                     continue;
                 }
 
-                if constexpr(has_version_member)
+                if constexpr(has_token_member)
                 {
-                    if constexpr(member == version_member)
+                    if constexpr(member == token_member)
                     {
                         continue;
                     }
@@ -499,6 +614,17 @@ struct set_state final : saveable
         items[*index]->state = entity_state::detached;
         forget_index(*index);
         needs_compaction_ = true;
+    }
+
+    [[nodiscard]] tracked& mutable_item(const T& value, std::string_view operation)
+    {
+        const auto index = index_of(value);
+        if(!index)
+        {
+            throw std::runtime_error{"entityfy: " + std::string{operation} + "() called for an untracked entity"};
+        }
+
+        return *items[*index];
     }
 
     void refresh(db_context& owner, T& value)
@@ -585,6 +711,18 @@ save_result set_state<T>::delete_removed(db_context& owner)
     save_result result;
     const auto model = entityfy::describe_model<T>(owner.database().target_dialect());
 
+    constexpr auto token_member = concurrency_token_member<T>();
+    constexpr bool has_token_member = token_member != std::meta::info{};
+
+    std::string token_column;
+    bool has_token = false;
+
+    if constexpr(has_token_member)
+    {
+        token_column = std::string{annotated_column_name<token_member>().view()};
+        has_token = is_persisted_column(model, token_column);
+    }
+
     for(const std::size_t index: removed_indices_)
     {
         auto& item = *items[index];
@@ -596,9 +734,31 @@ save_result set_state<T>::delete_removed(db_context& owner)
         const std::int64_t key = key_of(item.entity);
         if(key != 0)
         {
-            auto command = entityfy::delete_by_id_statement(model, key);
+            sql_value original_token{};
+
+            if constexpr(has_token_member)
+            {
+                if(has_token)
+                {
+                    original_token = entityfy::to_sql_value(item.original.[:token_member:]);
+                }
+            }
+
+            auto command = has_token
+                               ? entityfy::delete_by_id_statement(model, key, token_column, original_token)
+                               : entityfy::delete_by_id_statement(model, key);
             owner.log(command.sql);
-            result.removed += static_cast<std::size_t>(owner.database().execute(command).rows_affected);
+
+            const auto removed = owner.database().execute(command);
+            if(removed.rows_affected == 0)
+            {
+                throw entityfy::concurrency_error{
+                    has_token ? "entityfy: optimistic concurrency conflict for delete of key " + std::to_string(key)
+                              : "entityfy: delete affected zero rows for key " + std::to_string(key),
+                    {make_concurrency_entry(owner, model, key, token_column, original_token)}};
+            }
+
+            result.removed += static_cast<std::size_t>(removed.rows_affected);
         }
 
         mark_undo(index);
@@ -619,18 +779,19 @@ save_result set_state<T>::save(db_context& owner)
     constexpr auto primary_key = find_primary_key(^^T);
     const std::string primary_key_column{annotated_column_name<find_primary_key(^^T)>().view()};
 
-    constexpr auto version_member = find_member(^^T, "version");
-    constexpr bool has_version_member = version_member != std::meta::info{};
+    constexpr auto token_member = concurrency_token_member<T>();
+    constexpr bool has_token_member = token_member != std::meta::info{};
 
-    // Resolved once: an aliased [[= entityfy::column{"..."}]] on the member
-    // named "version" must be used in the SET and WHERE clauses.
-    std::string version_column;
-    bool has_version = false;
+    // Resolved once: an aliased [[= entityfy::column{"..."}]] or a
+    // [[= entityfy::concurrency_token]] member must drive the SET and WHERE
+    // clauses.
+    std::string token_column;
+    bool has_token = false;
 
-    if constexpr(find_member(^^T, "version") != std::meta::info{})
+    if constexpr(has_token_member)
     {
-        version_column = std::string{annotated_column_name<find_member(^^T, "version")>().view()};
-        has_version = is_persisted_column(model, version_column);
+        token_column = std::string{annotated_column_name<token_member>().view()};
+        has_token = is_persisted_column(model, token_column);
     }
 
     bool generated_primary_key = false;
@@ -946,24 +1107,27 @@ save_result set_state<T>::save(db_context& owner)
 
         mark_undo(index);
 
-        if constexpr(has_version_member)
+        if constexpr(has_token_member)
         {
-            if(has_version)
+            if(has_token)
             {
-                sql += ", " + entityfy::detail::quote_identifier(version_column) + " = " +
-                       entityfy::detail::quote_identifier(version_column) + " + 1";
+                sql += ", " + entityfy::detail::quote_identifier(token_column) + " = " +
+                       entityfy::detail::quote_identifier(token_column) + " + 1";
             }
         }
 
         sql += " WHERE " + entityfy::detail::quote_identifier(primary_key_column) + " = ?";
         binds.push_back(entityfy::to_sql_value(item.entity.[:primary_key:]));
 
-        if constexpr(has_version_member)
+        sql_value original_token{};
+
+        if constexpr(has_token_member)
         {
-            if(has_version)
+            if(has_token)
             {
-                sql += " AND " + entityfy::detail::quote_identifier(version_column) + " = ?";
-                binds.push_back(entityfy::to_sql_value(item.original.[:version_member:]));
+                original_token = entityfy::to_sql_value(item.original.[:token_member:]);
+                sql += " AND " + entityfy::detail::quote_identifier(token_column) + " = ?";
+                binds.push_back(original_token);
             }
         }
 
@@ -974,22 +1138,24 @@ save_result set_state<T>::save(db_context& owner)
 
         if(updated.rows_affected == 0)
         {
-            throw std::runtime_error{has_version
-                                         ? "entityfy: optimistic concurrency conflict for key " +
-                                               std::to_string(key_of(item.entity))
-                                         : "entityfy: update affected zero rows for key " +
-                                               std::to_string(key_of(item.entity))};
+            const auto key = key_of(item.entity);
+
+            throw entityfy::concurrency_error{
+                has_token ? "entityfy: optimistic concurrency conflict for key " + std::to_string(key)
+                          : "entityfy: update affected zero rows for key " + std::to_string(key),
+                {make_concurrency_entry(owner, model, key, token_column, original_token)}};
         }
 
-        if constexpr(has_version_member)
+        if constexpr(has_token_member)
         {
-            if(has_version)
+            if(has_token)
             {
-                using version_type = std::remove_cvref_t<decltype(item.entity.[:version_member:])>;
-                static_assert(std::is_integral_v<version_type>, "entityfy: version column must be an integral type");
+                using token_type = std::remove_cvref_t<decltype(item.entity.[:token_member:])>;
+                static_assert(std::is_integral_v<token_type>,
+                              "entityfy: the concurrency token must be an integral type");
 
-                item.entity.[:version_member:] =
-                    static_cast<version_type>(item.entity.[:version_member:] + static_cast<version_type>(1));
+                item.entity.[:token_member:] =
+                    static_cast<token_type>(item.entity.[:token_member:] + static_cast<token_type>(1));
             }
         }
 
@@ -1088,6 +1254,13 @@ public:
         return state()->attach(std::move(value));
     }
 
+    // Attaches an entity together with the snapshot it was loaded with, so a
+    // stale concurrency token survives the round trip.
+    T& attach(T value, T original)
+    {
+        return state()->attach(std::move(value), std::move(original));
+    }
+
     // Marks a tracked entity as removed.
     void remove(const T& value)
     {
@@ -1107,6 +1280,26 @@ public:
     void refresh(T& value)
     {
         state()->refresh(*owner_, value);
+    }
+
+    // Reads the current database row without touching the tracked entity.
+    [[nodiscard]] std::optional<T> database_values(const T& value)
+    {
+        return state()->database_values(*owner_, value);
+    }
+
+    // Client wins: keep the edited values, take the database row as the new
+    // original snapshot so the next save matches the concurrency token.
+    void accept_changes(const T& value, const T& database_row)
+    {
+        state()->accept_changes(value, database_row);
+    }
+
+    // Merge: only the named member's original value moves to the database row.
+    template <typename Member>
+    void accept_changes(const T& value, const T& database_row, Member T::* member)
+    {
+        state()->accept_changes(value, database_row, member);
     }
 
     // Manual change tracking: marks a tracked entity as modified. With

@@ -1177,6 +1177,23 @@ template <typename Model, typename Id>
 }
 
 template <typename Model, typename Id>
+[[nodiscard]] statement delete_by_id_statement(
+    const model_descriptor<Model>& model,
+    const Id& id,
+    std::string_view token_column,
+    const sql_value& token)
+{
+    const auto primary_key = primary_key_column(model);
+
+    condition filter;
+    filter.sql = detail::quote_identifier(primary_key.name) + " = ? AND " +
+                 detail::quote_identifier(token_column) + " = ?";
+    filter.binds.emplace_back(detail::to_sql_value(id));
+    filter.binds.emplace_back(token);
+    return delete_statement(model, std::move(filter));
+}
+
+template <typename Model, typename Id>
 [[nodiscard]] statement delete_by_id_statement(const Id& id, dialect target)
 {
     return delete_by_id_statement(describe_model<Model>(target), id);
