@@ -5,9 +5,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1579,6 +1583,37 @@ status run_pool_checks()
     return status::passed;
 }
 
+// Holds a save inside its first logged statement until release() is called, so
+// a test can observe the context while a save is genuinely in flight.
+struct save_hold
+{
+    void wait_until_entered()
+    {
+        std::unique_lock lock{mutex};
+        cv.wait(lock, [this] { return entered; });
+    }
+
+    void release()
+    {
+        const std::lock_guard lock{mutex};
+        released = true;
+        cv.notify_all();
+    }
+
+    void operator()(std::string_view)
+    {
+        std::unique_lock lock{mutex};
+        entered = true;
+        cv.notify_all();
+        cv.wait(lock, [this] { return released; });
+    }
+
+    std::mutex              mutex;
+    std::condition_variable cv;
+    bool                    entered = false;
+    bool                    released = false;
+};
+
 status run_async_checks()
 {
     entityfy::db_context ctx{"sqlite://:memory:"};
@@ -1597,6 +1632,121 @@ status run_async_checks()
     const auto second = ctx.save_changes_async().get();
     require(second.inserted == 1, "second async save inserts another row");
     require(ctx.database().table<rc_tag>().count() == 2, "both async saves are visible");
+
+    // Hold the worker inside the save, so the gate is observably taken.
+    save_hold hold;
+    ctx.set_logger([&hold](std::string_view sql) { hold(sql); });
+
+    tags.add(rc_tag{.id = 3, .name = "gated"});
+    auto held = ctx.save_changes_async();
+    hold.wait_until_entered();
+
+    bool sync_rejected = false;
+    try
+    {
+        (void)ctx.save_changes();
+    }
+    catch(const std::logic_error&)
+    {
+        sync_rejected = true;
+    }
+    require(sync_rejected, "a sync save is rejected while an async save is in flight");
+
+    bool async_rejected = false;
+    try
+    {
+        auto ignored = ctx.save_changes_async();
+        (void)ignored;
+    }
+    catch(const std::logic_error&)
+    {
+        async_rejected = true;
+    }
+    require(async_rejected, "a concurrent async save is rejected instead of queued");
+
+    hold.release();
+
+    const auto held_result = held.get();
+    require(held_result.inserted == 1, "the held async save inserts its row");
+    require(ctx.database().table<rc_tag>().count() == 3, "the held async save is visible");
+
+    ctx.set_logger(nullptr);
+
+    // Both entry points work again once the completed save released the gate.
+    tags.add(rc_tag{.id = 4, .name = "after gate sync"});
+    require(ctx.save_changes().inserted == 1, "a sync save works after the gate is free");
+
+    tags.add(rc_tag{.id = 5, .name = "after gate async"});
+    require(ctx.save_changes_async().get().inserted == 1, "an async save works after the gate is free");
+    require(ctx.database().table<rc_tag>().count() == 5, "every save after the gate is visible");
+
+    // A save that throws must release the gate too, not only a successful one.
+    {
+        entityfy::db_context failing{"sqlite://:memory:"};
+        failing.migrate<rc_user>();
+
+        auto users = failing.set<rc_user>();
+        users.add(rc_user{.email = "duplicate@example.com", .name = "first"});
+        auto& second_user = users.add(rc_user{.email = "duplicate@example.com", .name = "second"});
+
+        auto failed = failing.save_changes_async();
+
+        bool save_failed = false;
+        try
+        {
+            (void)failed.get();
+        }
+        catch(const std::exception&)
+        {
+            save_failed = true;
+        }
+        require(save_failed, "an async save surfaces its error through the task");
+
+        second_user.email = "unique@example.com";
+        require(failing.save_changes().inserted == 2, "the gate is free after a failed async save");
+    }
+
+    return status::passed;
+}
+
+status run_async_drain_checks()
+{
+    struct destroying_context final : entityfy::db_context
+    {
+        using entityfy::db_context::db_context;
+
+        ~destroying_context()
+        {
+            started.set_value();
+        }
+
+        std::promise<void> started;
+    };
+
+    auto ctx = std::make_unique<destroying_context>("sqlite://:memory:");
+    ctx->migrate<rc_tag>();
+    ctx->set<rc_tag>().add(rc_tag{.id = 1, .name = "drained"});
+
+    save_hold hold;
+    ctx->set_logger([&hold](std::string_view sql) { hold(sql); });
+
+    auto pending = ctx->save_changes_async();
+    hold.wait_until_entered();
+
+    auto destruction_started = ctx->started.get_future();
+
+    // Destruction begins while the worker is still blocked inside the save; the
+    // executor must join it before the members the save uses are torn down.
+    std::thread destroyer{[&ctx] { ctx.reset(); }};
+    destruction_started.wait();
+
+    hold.release();
+    destroyer.join();
+
+    require(ctx == nullptr, "the context is destroyed");
+
+    const auto result = pending.get();
+    require(result.inserted == 1, "destroying the context drains the in-flight save");
 
     return status::passed;
 }
@@ -2783,6 +2933,7 @@ int main()
         {"dependency", run_dependency_checks},
         {"pool", run_pool_checks},
         {"async", run_async_checks},
+        {"async_drain", run_async_drain_checks},
         {"postgres", run_postgres_checks},
         {"mysql", run_mysql_checks},
         {"sqlserver", run_sqlserver_checks},

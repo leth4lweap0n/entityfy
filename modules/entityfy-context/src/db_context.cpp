@@ -1,15 +1,61 @@
 #include <entityfy/db_context.hpp>
 
 #include <algorithm>
+#include <exception>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace entityfy
 {
 namespace
 {
+
+// One in-flight save per context. Save attempts that overlap the holder fail
+// instead of queueing behind it. The holder is release-on-scope-exit, unless
+// the work moves to the async worker, which then owns the release.
+class save_gate
+{
+public:
+    explicit save_gate(std::atomic<bool>& flag)
+        : flag_{&flag}
+    {
+        bool idle = false;
+
+        if(!flag_->compare_exchange_strong(idle, true, std::memory_order_acq_rel))
+        {
+            throw std::logic_error{"a save is already in progress"};
+        }
+    }
+
+    ~save_gate()
+    {
+        release();
+    }
+
+    save_gate(const save_gate&) = delete;
+    save_gate& operator=(const save_gate&) = delete;
+
+    void release() noexcept
+    {
+        if(std::atomic<bool>* flag = std::exchange(flag_, nullptr))
+        {
+            flag->store(false, std::memory_order_release);
+        }
+    }
+
+    // The gate stays closed, but this handle no longer releases it.
+    void disarm() noexcept
+    {
+        flag_ = nullptr;
+    }
+
+private:
+    std::atomic<bool>* flag_;
+};
 
 bool is_transient(const std::exception& error)
 {
@@ -46,16 +92,63 @@ db_context::~db_context()
 
 save_result db_context::save_changes()
 {
+    const save_gate gate{save_in_progress_};
     const std::lock_guard lock{save_mutex_};
     return save_changes_with_retry();
 }
 
-std::future<save_result> db_context::save_changes_async()
+entityfy::task<save_result> db_context::save_changes_async()
 {
-    return std::async(std::launch::async, [this] {
-        const std::lock_guard lock{save_mutex_};
-        return save_changes_with_retry();
+    save_gate gate{save_in_progress_};
+
+    auto pair = entityfy::make_task<save_result>();
+    auto completer = std::make_shared<entityfy::task_completer<save_result>>(std::move(pair.completer));
+
+    // The job owns the gate only once submit accepted it. Until then the gate
+    // handle below releases on every exit path, including a failed submit.
+    save_executor().submit([this, completer] {
+        std::exception_ptr error;
+        save_result        result;
+
+        try
+        {
+            const std::lock_guard lock{save_mutex_};
+            result = save_changes_with_retry();
+        }
+        catch(...)
+        {
+            error = std::current_exception();
+        }
+
+        // Free the gate before publishing, so a caller that observes
+        // completion can start the next save immediately.
+        save_in_progress_.store(false, std::memory_order_release);
+
+        if(error)
+        {
+            completer->set_exception(std::move(error));
+        }
+        else
+        {
+            completer->set_value(std::move(result));
+        }
     });
+
+    gate.disarm();
+
+    return std::move(pair.value);
+}
+
+entityfy::thread_pool_executor& db_context::save_executor()
+{
+    const std::lock_guard lock{executor_mutex_};
+
+    if(!save_executor_)
+    {
+        save_executor_ = std::make_unique<entityfy::thread_pool_executor>(1, 16);
+    }
+
+    return *save_executor_;
 }
 
 save_result db_context::save_changes_with_retry()

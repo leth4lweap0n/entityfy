@@ -1,12 +1,14 @@
 #pragma once
 
 #include <entityfy/entityfy.hpp>
+#include <entityfy/executor.hpp>
 #include <entityfy/lazy.hpp>
+#include <entityfy/task.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -148,10 +150,11 @@ public:
     // Applies all tracked changes inside a single transaction.
     save_result save_changes();
 
-    // Runs the same operation on a worker thread. Saves are serialized by
-    // an internal mutex; the context cannot be used concurrently from
-    // other threads (same rule as EF Core).
-    [[nodiscard]] std::future<save_result> save_changes_async();
+    // Runs the same operation on a lazily created single-worker executor. One
+    // save per context at a time: a save that overlaps this one throws
+    // std::logic_error instead of being queued. This is a thread offload, not
+    // native I/O asynchrony.
+    [[nodiscard]] entityfy::task<save_result> save_changes_async();
 
     // Drops the tracked entities and the identity map; the DB connection is kept.
     // Handles bound to the dropped state report context_cleared afterwards.
@@ -296,6 +299,9 @@ private:
     [[nodiscard]] save_result save_changes_once();
     [[nodiscard]] save_result save_changes_with_retry();
 
+    // Creates the single worker that runs async saves on first use.
+    [[nodiscard]] entityfy::thread_pool_executor& save_executor();
+
     entityfy::client                                        database_;
     // Shared with the lazy handles bound by this context; never reassigned.
     std::shared_ptr<detail::lazy_link>                      lazy_link_;
@@ -309,6 +315,12 @@ private:
     retry_policy                                           retry_{};
     std::size_t                                            batch_parameter_limit_ = 1000;
     std::mutex                                             save_mutex_;
+    std::mutex                                             executor_mutex_;
+    std::atomic<bool>                                      save_in_progress_{false};
+    // Declared last on purpose: members are destroyed in reverse order, so the
+    // executor joins its worker (draining an in-flight save) before the sets,
+    // the connection and the gate are destroyed.
+    std::unique_ptr<entityfy::thread_pool_executor>        save_executor_;
 };
 
 } // namespace entityfy
