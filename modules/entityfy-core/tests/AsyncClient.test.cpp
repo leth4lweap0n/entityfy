@@ -65,29 +65,21 @@ struct [[= entityfy::table{"async_client_items"}]] async_item
 
 #ifdef ENTITYFY_ENABLE_SQLITE
 
-TEST_CASE("sqlite client reports unsupported async capability", "[async][client][sqlite]")
+TEST_CASE("sqlite client reports thread-offload async capability", "[async][client][sqlite]")
 {
     entityfy::client db{"sqlite://:memory:"};
 
-    REQUIRE(db.async_mode() == entityfy::async_capability::unsupported);
+    REQUIRE(db.async_mode() == entityfy::async_capability::thread_offload);
 
-    REQUIRE_THROWS_AS(db.execute_async(entityfy::statement{.sql = "SELECT 1"}).get(), std::logic_error);
-    REQUIRE_THROWS_AS(db.query_async(entityfy::statement{.sql = "SELECT 1"}).get(), std::logic_error);
-    REQUIRE_THROWS_AS(
-        db.execute_batch_async(std::vector<entityfy::statement>{entityfy::statement{.sql = "SELECT 1"}}).get(),
-        std::logic_error
-    );
-    REQUIRE_THROWS_AS(
-        db.query_each_async(entityfy::statement{.sql = "SELECT 1"}, [](const entityfy::detail::row&) { return true; }).get(),
-        std::logic_error
-    );
+    const auto rows = db.query_async(entityfy::statement{.sql = "SELECT 1"}).get();
+    REQUIRE(rows.size() == 1);
+    REQUIRE(rows.front().size() == 1);
 
-    // The client reports the backend's own rejection, not a second message of
-    // its own.
-    REQUIRE_THROWS_WITH(
-        db.execute_async(entityfy::statement{.sql = "SELECT 1"}).get(),
-        "async execution is not supported by this backend"
-    );
+    const auto batch = db.execute_batch_async(std::vector<entityfy::statement>{
+        entityfy::statement{.sql = "SELECT 1"},
+        entityfy::statement{.sql = "SELECT 2"},
+    }).get();
+    REQUIRE(batch.size() == 2);
 }
 
 #endif // ENTITYFY_ENABLE_SQLITE

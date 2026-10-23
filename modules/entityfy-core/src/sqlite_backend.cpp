@@ -1,9 +1,11 @@
 #include <entityfy/detail/backend.hpp>
 #include <entityfy/error.hpp>
+#include <entityfy/executor.hpp>
 #include <entityfy/statement.hpp>
 
 #include <sl3.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -11,6 +13,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <type_traits>
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
@@ -139,6 +142,37 @@ public:
     [[nodiscard]] dialect target_dialect() const noexcept override
     {
         return dialect::sqlite;
+    }
+
+    // ---------------------------------------------------------------------
+    // Asynchronous execution
+    //
+    // One SQLite connection is a serialized resource, so the async surface
+    // offloads the existing synchronous entry points to one bounded worker.
+    // The worker queue keeps submission order, and the connection mutex keeps
+    // async jobs and synchronous calls ordered with each other. Cancellation
+    // is cooperative: it prevents a queued job from starting, but a statement
+    // already inside SQLite cannot be interrupted.
+    // ---------------------------------------------------------------------
+    [[nodiscard]] async_capability async_mode() const noexcept override
+    {
+        return async_capability::thread_offload;
+    }
+
+    entityfy::task<execution_result> execute_async(const entityfy::statement& input) override
+    {
+        return offload<execution_result>([this, input] { return execute(input); });
+    }
+
+    entityfy::task<std::vector<row>> query_async(const entityfy::statement& input) override
+    {
+        return offload<std::vector<row>>([this, input] { return query(input); });
+    }
+
+    entityfy::task<std::vector<execution_result>> execute_batch_async(
+        const std::vector<entityfy::statement>& statements) override
+    {
+        return offload<std::vector<execution_result>>([this, statements] { return execute_batch(statements); });
     }
 
     execution_result execute(const entityfy::statement& input) override
@@ -399,6 +433,69 @@ public:
     }
 
 private:
+    static constexpr std::size_t async_queue_capacity = 64;
+
+    // One worker over a bounded FIFO queue, created on the first async call so a
+    // synchronous-only user never pays for a thread. The member is declared
+    // last: destruction drains and joins the worker before the statement cache
+    // and the connection disappear.
+    [[nodiscard]] entityfy::thread_pool_executor& async_pool()
+    {
+        const std::lock_guard lock{async_pool_mutex_};
+
+        if(!async_pool_)
+        {
+            async_pool_ = std::make_unique<entityfy::thread_pool_executor>(1, async_queue_capacity);
+        }
+
+        return *async_pool_;
+    }
+
+    // Registers the task, its cancel hook and exactly one queued job. The job
+    // calls the synchronous entry point, so SQL generation, conversion and error
+    // classification stay in one place.
+    template <typename T, typename Work>
+        requires (!std::is_void_v<T>)
+    [[nodiscard]] entityfy::task<T> offload(Work work)
+    {
+        auto pair = entityfy::make_task<T>();
+        auto completer = std::make_shared<entityfy::task_completer<T>>(std::move(pair.completer));
+        auto cancel = std::make_shared<std::atomic<bool>>(false);
+
+        // The hook only touches the shared flag, so a cancellation that races
+        // the backend's destruction never reaches the backend itself.
+        completer->set_cancel_hook([cancel] { cancel->store(true, std::memory_order_release); });
+
+        try
+        {
+            async_pool().submit([work = std::move(work), completer, cancel]() mutable {
+                // Cooperative cancellation: a queued job that was cancelled
+                // never touches SQLite. A statement that already started runs to
+                // completion, because one SQLite step cannot be interrupted.
+                if(cancel->load(std::memory_order_acquire))
+                {
+                    completer->set_cancelled();
+                    return;
+                }
+
+                try
+                {
+                    completer->set_value(work());
+                }
+                catch(...)
+                {
+                    completer->set_exception(std::current_exception());
+                }
+            });
+        }
+        catch(...)
+        {
+            completer->set_exception(std::current_exception());
+        }
+
+        return std::move(pair.value);
+    }
+
     // Least recently used cache of compiled statements. An unordered_map gives
     // O(1) lookup; ordering is kept in a list (front = oldest, back = newest).
     [[nodiscard]] sl3::Command& command_for(const std::string& sql)
@@ -438,6 +535,12 @@ private:
     std::list<std::pair<std::string, std::unique_ptr<sl3::Command>>> cache_;
     std::unordered_map<std::string, decltype(cache_.begin())> index_;
     std::unique_ptr<sl3::Command>                    scratch_;
+
+    // The pool is declared after every member its jobs use, so its drain+join
+    // runs while the cache, the mutex and the connection are still alive, and
+    // before the connection is closed.
+    std::mutex                                       async_pool_mutex_;
+    std::unique_ptr<entityfy::thread_pool_executor>  async_pool_;
 };
 
 std::unique_ptr<backend> make_sqlite_backend(std::string path)
