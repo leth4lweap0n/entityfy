@@ -165,6 +165,13 @@ struct blob_t
 {
 };
 
+// Marks a struct-typed member whose own persisted fields are flattened into the
+// owning table with a "<member>_" prefix, e.g. `[[= entityfy::owned]] address address;`
+// persists `address_city`, `address_zip`, ...
+struct owned_t
+{
+};
+
 using map = column;
 using db_type = sql_type;
 using default_sql = default_value;
@@ -189,5 +196,6 @@ inline constexpr uuid_t           uuid{};
 inline constexpr json_t           json{};
 inline constexpr text_t           text{};
 inline constexpr blob_t           blob{};
+inline constexpr owned_t          owned{};
 
 } // namespace entityfy

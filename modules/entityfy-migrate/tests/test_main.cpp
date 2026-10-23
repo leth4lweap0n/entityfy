@@ -12,6 +12,7 @@ entityfy_test::status test_scaffold();
 entityfy_test::status test_postgres();
 entityfy_test::status test_history_table();
 entityfy_test::status test_rename_table();
+entityfy_test::status test_owned_model();
 
 int main()
 {
@@ -33,6 +34,7 @@ int main()
         {"postgres", test_postgres},
         {"history_table", test_history_table},
         {"rename_table", test_rename_table},
+        {"owned_model", test_owned_model},
     };
 
     int passed = 0;

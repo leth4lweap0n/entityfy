@@ -294,8 +294,8 @@ the ratios are more stable.
 ctest --preset release
 ```
 
-41 CTest entries: 39 core Catch2 test cases (149 assertions) and the migrate/context test
-binaries - which contain 9 and 17 scenarios respectively.
+45 CTest entries: 43 core Catch2 test cases (182 assertions) and the migrate/context test
+binaries - which contain 10 and 17 scenarios respectively.
 PostgreSQL tests run when `ENTITYFY_PG_URI` is provided; with `ENTITYFY_REQUIRE_PG=1` a skipped
 test counts as a failure. Tests write to a temporary workspace and do not pollute the source tree.
 
@@ -407,8 +407,8 @@ through `sl3`, and there is no second copy of SQLite.
 
 - `save_changes_async()` is a thread offload, not I/O asynchrony.
 - The core does not perform dirty-column updates; partial UPDATE lives in the context layer.
-- Column-split owned types and TPH inheritance are not supported. Composite/JSON values are
-  stored through `value_converter`.
+- TPH inheritance is not supported. Composite/JSON values are stored through `value_converter`,
+  and `[[= entityfy::owned]]` value objects are split into prefixed columns.
 - There are no MySQL or SQL Server providers.
 - Row reading is costly through `vector<vector<sql_value>>`; single-row reads need a separate
   path.

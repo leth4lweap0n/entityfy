@@ -49,6 +49,9 @@
 - A single SQLite dependency (sl3); the duplicated `third_party/sqlite` copy was removed
 - Unified test registration under CTest (core + migration + context)
 - `entityfy_bench`: SQLite comparative benchmark + PostgreSQL mode (libpq baseline)
+- **Owned value objects**: `[[= entityfy::owned]]` splits a struct across prefixed columns,
+  through `describe_model`, DDL, INSERT/UPDATE/UPSERT, `insert_many`, the row mapper and
+  migrations; nested owned values and inner annotations supported
 - **Partial UPDATE in core**: `update_partial(entity, &T::a, ...)` writes only the named columns
 - **Streaming row materialization**: `find`/`find_one`/`find_many`/`exists` materialize in place
   without an intermediate row vector (measured: no significant single-row gain, small gain for
@@ -61,16 +64,10 @@ surface that has to change, so a session can pick one up without redoing the
 analysis. Everything above this section is implemented and covered by the test
 suite.
 
-1. **Owned types split across columns** — `describe_model` maps one member to one column today:
-   the statement builders advance a column index per persistent field and `materialize_row`
-   assigns field by field. An `[[= entityfy::owned]] address_t address` would have to flatten into
-   `address_city` / `address_street`, which touches `describe_model` (column flattening), the
-   insert/update/select builders (one member -> several columns), `materialize_row` (nested
-   assignment) and the migration snapshot/diff/scaffold. Acceptance: round trip, migration diff and
-   scaffold output for an owned model.
-2. **TPH inheritance** — needs a discriminator column, polymorphic `find_many`/`include` and a model
-   registry that can answer "which derived type is this row". Depends on the metadata work in 1.
-3. **Additional providers (MySQL, SQL Server)** — one backend each plus dialect differences
+1. **TPH inheritance** — needs a discriminator column, polymorphic `find_many`/`include` and a
+   model registry that can answer "which derived type is this row". The column-flattening walkers
+   from owned types are the metadata foundation for it.
+2. **Additional providers (MySQL, SQL Server)** — one backend each plus dialect differences
    (identifier quoting, generated keys, upsert syntax, batch limits) and a CI service container per
    provider. Acceptance: core, migrate and context suites run against the provider in CI.
 

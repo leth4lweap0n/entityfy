@@ -20,7 +20,7 @@ template <typename Model>
     Model       model{};
     std::size_t index = 0;
 
-    meta::for_each_persistent_field<ignore_t>(model, [&](meta::field meta_field, auto& value) {
+    detail::for_each_leaf_field(model, [&](std::string_view prefix, std::string_view name, auto& value) {
         if(index >= row.size())
         {
             throw std::runtime_error{"entityfy ORM result row has fewer columns than the model schema"};
@@ -32,7 +32,9 @@ template <typename Model>
         }
         catch(const std::exception& error)
         {
-            throw std::runtime_error{"entityfy ORM failed to read column `" + std::string{meta_field.name} + "`: " + error.what()};
+            std::string column_name{prefix};
+            column_name.append(name);
+            throw std::runtime_error{"entityfy ORM failed to read column `" + column_name + "`: " + error.what()};
         }
 
         ++index;
@@ -47,7 +49,7 @@ template <typename Model>
     std::size_t descriptor_index = 0;
     std::optional<sql_value> output;
 
-    meta::for_each_persistent_field<ignore_t>(object, [&](meta::field, const auto& value) {
+    detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
         const auto& descriptor = model.columns[descriptor_index];
         if(descriptor.flags.primary_key)
         {

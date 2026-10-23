@@ -55,6 +55,7 @@ if(ENTITYFY_BUILD_TESTS)
         tests/test_scaffold.cpp
         tests/test_postgres.cpp
         tests/test_table_ops.cpp
+        tests/test_owned_model.cpp
     )
     target_link_libraries(entityfy_migrate_tests PRIVATE entityfy::migrate)
     target_include_directories(entityfy_migrate_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples)

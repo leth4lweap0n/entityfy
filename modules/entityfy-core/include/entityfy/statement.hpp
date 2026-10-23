@@ -298,7 +298,7 @@ template <typename Model>
     output.sql.push_back(')');
 
     std::size_t descriptor_index = 0;
-    meta::for_each_persistent_field<ignore_t>(object, [&](meta::field, const auto& value) {
+    detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
         const auto& descriptor = model.columns[descriptor_index];
         if(!descriptor.generated_on_insert)
         {
@@ -385,7 +385,7 @@ template <typename Model>
         output.sql.append(")");
 
         std::size_t descriptor_index = 0;
-        meta::for_each_persistent_field<ignore_t>(object, [&](meta::field, const auto& value) {
+        detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
             const auto& descriptor = model.columns[descriptor_index];
             if(!descriptor.generated_on_insert)
             {
@@ -475,7 +475,7 @@ template <typename Model>
     }
 
     std::size_t descriptor_index = 0;
-    meta::for_each_persistent_field<ignore_t>(object, [&](meta::field, const auto& value) {
+    detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
         const auto& descriptor = model.columns[descriptor_index];
         if(!descriptor.generated_on_insert || descriptor.flags.primary_key)
         {
@@ -508,7 +508,7 @@ template <typename Model>
     std::size_t descriptor_index = 0;
     std::optional<sql_value> key_bind;
 
-    meta::for_each_persistent_field<ignore_t>(object, [&](meta::field, const auto& value) {
+    detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
         const auto& descriptor = model.columns[descriptor_index];
 
         if(descriptor.flags.primary_key)
@@ -640,7 +640,7 @@ template <typename Model>
     bool        first = true;
     std::size_t descriptor_index = 0;
 
-    meta::for_each_persistent_field<ignore_t>(patch, [&](meta::field, const auto& value) {
+    detail::for_each_leaf_field(patch, [&](std::string_view, std::string_view, const auto& value) {
         const auto& descriptor = model.columns[descriptor_index];
 
         if(descriptor.flags.primary_key || (descriptor.generated_on_insert && !descriptor.flags.updated_at))

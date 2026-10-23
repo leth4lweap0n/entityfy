@@ -54,11 +54,46 @@ struct [[= entityfy::table{"users"}]] user
 | `entityfy::created_at`, `entityfy::updated_at` | Automatic timestamp |
 | `entityfy::references{"table", "column", "ON DELETE", "ON UPDATE"}` | Foreign key |
 | `entityfy::column{"sql_name"}` | Explicit SQL column name (default: the member name); used by DDL and by every statement the core and context layers build |
+| `entityfy::owned` | A struct value object whose own persisted fields are flattened into the table |
 | `entityfy::ignore` / `entityfy::ignored` | Not a column, a transient field |
 
 Supported field types: `bool`, integral, floating point, enum, `std::string`,
 `std::vector<std::byte>`, `std::optional<T>`, chrono types (`sys_days`,
 `system_clock::time_point`, durations).
+
+### Owned value objects
+
+`[[= entityfy::owned]]` stores a value object in the owning row: every persisted field of the
+struct becomes its own column, prefixed with the member name.
+
+```cpp
+struct address
+{
+    [[= entityfy::varchar{80}, = entityfy::not_null]] std::string city;
+    [[= entityfy::varchar{16}]]                        std::string postal_code;
+    [[= entityfy::ignore]]                             std::string formatted;  // not persisted
+};
+
+struct [[= entityfy::table{"people"}]] person
+{
+    [[= entityfy::id, = entityfy::auto_increment]] std::int64_t id = 0;
+    [[= entityfy::owned]]                          address      home;
+};
+
+// columns: id, home_city, home_postal_code
+```
+
+- The prefix is the member name, or its `entityfy::column{...}` annotation when present
+  (`[[= entityfy::column{"addr"}]] address home;` gives `addr_city`).
+- Owned values may nest: an owned member inside an owned struct keeps extending the prefix
+  (`home_point_latitude`). Inner fields keep their own type annotations (`varchar`, `unique`,
+  `references`, `check`, ...).
+- Owned structs are value objects: they cannot declare a primary key, `auto_increment`,
+  `created_at` or `updated_at`, and the member itself cannot be `std::optional<T>`.
+- `describe_model`, DDL, INSERT/UPDATE/UPSERT, `insert_many`, the row mapper, migrations and
+  scaffold all walk the same flattened column list.
+- A member pointer such as `&person::home` does not name a single column, so `where()` /
+  `order_by()` reject it; use the flattened SQL column name as a string instead.
 
 ## Connection and schema
 

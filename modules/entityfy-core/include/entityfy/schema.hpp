@@ -89,6 +89,74 @@ consteval annotation_text annotated_column_name()
     return annotation.name;
 }
 
+// Column name as a static C string, honoring [[= entityfy::column{...}]].
+// The returned pointer points at static storage, so the view stays valid.
+template <auto ReflectedField>
+consteval const char* static_column_name()
+{
+    const auto annotation = meta::annotation_or<column, ReflectedField>(column{});
+    if(!annotation.name.empty())
+    {
+        return std::define_static_string(annotation.name.view());
+    }
+
+    return std::define_static_string(std::meta::identifier_of(ReflectedField));
+}
+
+// Walks the persisted columns of a model in lake order. An [[= entityfy::owned]]
+// member contributes one column per persisted leaf field of its own type,
+// named "<member>_<field>"; nested owned members keep extending that prefix.
+// The callback receives <meta_field, field_type>(prefix, is_root).
+template <typename Type, typename Function>
+constexpr void for_each_column_reflection(Function&& function, std::string_view prefix = {}, bool root = true)
+{
+    using model_type = std::remove_cvref_t<Type>;
+
+    template for(constexpr auto meta_field: meta::type<model_type>::fields())
+    {
+        if constexpr(!meta::has_annotation<ignore_t, meta_field>())
+        {
+            using field_type = meta::field_type_t<model_type, meta_field>;
+
+            if constexpr(meta::has_annotation<owned_t, meta_field>())
+            {
+                const std::string nested_prefix =
+                    std::string{prefix} + std::string{static_column_name<meta_field>()} + "_";
+                for_each_column_reflection<field_type>(function, nested_prefix, false);
+            }
+            else
+            {
+                function.template operator()<meta_field, field_type>(prefix, root);
+            }
+        }
+    }
+}
+
+// Runtime twin of for_each_column_reflection: visits the same leaves in the same
+// order and hands out (prefix, leaf name, value). The name is a static string.
+template <typename Object, typename Function>
+constexpr void for_each_leaf_field(Object&& object, Function&& function, std::string_view prefix = {})
+{
+    using object_type = std::remove_cvref_t<Object>;
+
+    template for(constexpr auto meta_field: meta::type<object_type>::fields())
+    {
+        if constexpr(!meta::has_annotation<ignore_t, meta_field>())
+        {
+            if constexpr(meta::has_annotation<owned_t, meta_field>())
+            {
+                const std::string nested_prefix =
+                    std::string{prefix} + std::string{static_column_name<meta_field>()} + "_";
+                for_each_leaf_field(object.[:meta_field:], function, nested_prefix);
+            }
+            else
+            {
+                function(prefix, std::string_view{static_column_name<meta_field>()}, object.[:meta_field:]);
+            }
+        }
+    }
+}
+
 template <typename Field, auto ReflectedField>
 consteval column_flags annotated_column_flags()
 {
@@ -386,8 +454,12 @@ consteval bool has_implicit_id_key()
     return found;
 }
 
+template <typename Type>
+consteval void validate_owned_struct();
+
+// Scalar (non-owned) field: the annotations map one member to one column.
 template <typename Model, auto ReflectedField>
-consteval void validate_field_annotations()
+consteval void validate_scalar_field_annotations()
 {
     using field_type = meta::field_type_t<Model, ReflectedField>;
     using storage_type = column_storage_type_t<field_type>;
@@ -515,6 +587,76 @@ consteval void validate_field_annotations()
     }
 }
 
+template <typename Model, auto ReflectedField>
+consteval void validate_field_annotations()
+{
+    using field_type = meta::field_type_t<Model, ReflectedField>;
+
+    if constexpr(meta::has_annotation<owned_t, ReflectedField>())
+    {
+        static_assert(
+            !is_optional_v<field_type>,
+            "entityfy ORM [[= entityfy::owned]] requires a plain struct member; wrap the flattened columns instead of the "
+            "owned object."
+        );
+        validate_owned_struct<field_type>();
+    }
+    else
+    {
+        validate_scalar_field_annotations<Model, ReflectedField>();
+    }
+}
+
+// Value object stored across several columns of the owning table.
+template <typename Type>
+consteval void validate_owned_struct()
+{
+    using owned_type = std::remove_cvref_t<Type>;
+
+    static_assert(
+        std::default_initializable<owned_type>,
+        "entityfy ORM owned types must be default-initializable so rows can be materialized."
+    );
+    static_assert(
+        meta::field_count<owned_type>() > 0,
+        "entityfy ORM owned types must contain at least one persistent non-static data member."
+    );
+    static_assert(
+        persistent_field_count<owned_type>() > 0,
+        "entityfy ORM owned types must contain at least one persisted field; remove entityfy::ignore from one field."
+    );
+
+    meta::for_each_persistent_field_reflection<owned_type, ignore_t>([]<auto meta_field>() {
+        static_assert(
+            !meta::has_annotation<primary_key_t, meta_field>(),
+            "entityfy ORM owned types cannot declare a primary key; the owning model owns the key."
+        );
+        static_assert(
+            !meta::has_annotation<auto_increment_t, meta_field>(),
+            "entityfy ORM owned types cannot declare an auto-increment column."
+        );
+        static_assert(
+            !meta::has_annotation<created_at_t, meta_field>() && !meta::has_annotation<updated_at_t, meta_field>(),
+            "entityfy ORM owned types cannot declare created_at/updated_at; put timestamps on the owning model."
+        );
+        validate_field_annotations<owned_type, meta_field>();
+    });
+}
+
+template <typename Type>
+consteval std::size_t flattened_column_count()
+{
+    std::size_t count = 0;
+
+    for_each_column_reflection<std::remove_cvref_t<Type>>(
+        [&]<auto, typename>(std::string_view, bool) {
+            ++count;
+        }
+    );
+
+    return count;
+}
+
 template <typename Type>
 consteval void validate_model()
 {
@@ -577,16 +719,16 @@ template <typename Type>
     detail::validate_model<model_type>();
 
     std::vector<column_descriptor> descriptors;
-    descriptors.reserve(detail::persistent_field_count<model_type>());
+    descriptors.reserve(detail::flattened_column_count<model_type>());
 
     constexpr auto explicit_primary_keys = detail::explicit_primary_key_count<model_type>();
 
-    meta::for_each_persistent_field_reflection<model_type, ignore_t>([&]<auto meta_field>() {
-        using field_type = meta::field_type_t<model_type, meta_field>;
+    detail::for_each_column_reflection<model_type>([&]<auto meta_field, typename field_type>(
+        std::string_view prefix, bool is_root) {
         constexpr auto metadata = detail::static_describe_field<field_type, meta_field>();
 
         auto descriptor = column_descriptor{
-            .name = std::string{metadata.name.view()},
+            .name = std::string{prefix} + std::string{metadata.name.view()},
             .flags = metadata.flags,
             .sql_type = detail::annotated_sql_type_for<field_type, meta_field>(target),
             .default_sql = detail::default_sql_for<field_type, meta_field>(),
@@ -620,7 +762,7 @@ template <typename Type>
 
         if constexpr(explicit_primary_keys == 0)
         {
-            if(std::string_view{meta::field_name<meta_field>()} == "id")
+            if(is_root && std::string_view{meta::field_name<meta_field>()} == "id")
             {
                 descriptor.flags.primary_key = true;
                 descriptor.flags.not_null = true;
@@ -705,9 +847,37 @@ template <typename Type>
 }
 
 template <typename Model, typename Member>
+[[nodiscard]] bool member_is_owned(Member Model::* member)
+{
+    Model probe{};
+    bool  owned = false;
+
+    meta::for_each_field_reflection<Model>([&]<auto meta_field>() {
+        using current_field_type = meta::field_type_t<Model, meta_field>;
+
+        if constexpr(std::same_as<current_field_type, std::remove_cvref_t<Member>>)
+        {
+            if(std::addressof(probe.*member) == std::addressof(probe.[:meta_field:]))
+            {
+                owned = meta::has_annotation<owned_t, meta_field>();
+            }
+        }
+    });
+
+    return owned;
+}
+
+template <typename Model, typename Member>
 [[nodiscard]] std::string column_name(Member Model::* member)
 {
     detail::validate_model<Model>();
+
+    if(member_is_owned(member))
+    {
+        throw std::logic_error{
+            "entityfy ORM column_name() received an owned field; an owned field spans several columns, so name them as strings"
+        };
+    }
 
     const auto resolved = meta::resolve_member_column<ignore_t, Model>(member, []<auto meta_field>() {
         return std::string{detail::annotated_column_name<meta_field>().view()};
