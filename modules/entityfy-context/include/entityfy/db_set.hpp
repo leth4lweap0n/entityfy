@@ -319,6 +319,122 @@ template <typename Child, typename Parent>
                              parent_model.table_name};
 }
 
+// Lazy members of a model, resolved once at compile time. The list drives the
+// binding; a model without lazy members expands to nothing, so tracking it
+// costs exactly what it cost before lazy loading existed.
+template <typename T>
+consteval auto lazy_members()
+{
+    std::vector<std::meta::info> members;
+
+    template for (constexpr auto member: meta::type<T>::fields())
+    {
+        if(entityfy::is_lazy_v<meta::field_type_t<T, member>>)
+        {
+            members.push_back(member);
+        }
+    }
+
+    return std::define_static_array(members);
+}
+
+template <typename T>
+consteval std::size_t lazy_member_count()
+{
+    return lazy_members<T>().size();
+}
+
+// Name used in diagnostics: a broken lazy member must name itself, because the
+// model it sits on may have several.
+template <auto Member>
+consteval std::string_view lazy_member_name()
+{
+    return std::meta::identifier_of(Member);
+}
+
+// The relation from a child model to a parent model, resolved through the
+// "references" annotation. This slice binds single-column foreign keys only, so
+// a relation that points anywhere but the parent's primary key is an explicit
+// error instead of a silently wrong key.
+template <typename Child>
+[[nodiscard]] const entityfy::relation_descriptor& lazy_child_relation(
+    const entityfy::model_descriptor<Child>& child_model,
+    std::string_view parent_table,
+    std::string_view member_name,
+    std::string_view parent_key_column)
+{
+    for(const auto& relation: child_model.relations)
+    {
+        if(relation.referenced_table != parent_table)
+        {
+            continue;
+        }
+
+        if(relation.referenced_column != parent_key_column)
+        {
+            throw std::logic_error{"entityfy: lazy member `" + std::string{member_name} + "` links " +
+                                   child_model.table_name + " to `" + relation.referenced_column + "` of " +
+                                   std::string{parent_table} + ", but only the primary key `" +
+                                   std::string{parent_key_column} + "` is supported"};
+        }
+
+        return relation;
+    }
+
+    throw std::logic_error{"entityfy: lazy member `" + std::string{member_name} + "` has no relation from " +
+                           child_model.table_name + " to " + std::string{parent_table}};
+}
+
+// Loader bound into a collection handle: selects the rows of Element that
+// reference the owner's key and tracks each row through the context, so a
+// repeated load converges on the identity map instead of duplicating entities.
+template <typename Owner, auto Member, typename Element>
+[[nodiscard]] std::vector<Element*> load_children(db_context* owner, std::span<const sql_value> keys)
+{
+    if(owner == nullptr)
+    {
+        throw std::logic_error{"entityfy: lazy member `" + std::string{lazy_member_name<Member>()} +
+                               "` cannot load without a context"};
+    }
+
+    if(keys.size() != 1)
+    {
+        throw std::logic_error{"entityfy: lazy member `" + std::string{lazy_member_name<Member>()} +
+                               "` expects exactly one owner key part"};
+    }
+
+    const auto dialect = owner->database().target_dialect();
+    const auto owner_model = entityfy::describe_model<Owner>(dialect);
+    const auto child_model = entityfy::describe_model<Element>(dialect);
+    const auto owner_keys = entityfy::primary_key_columns(owner_model);
+
+    if(owner_keys.size() != 1)
+    {
+        throw std::logic_error{"entityfy: composite foreign keys are not supported yet (P1.5): lazy member `" +
+                               std::string{lazy_member_name<Member>()} + "` on " + owner_model.table_name};
+    }
+
+    const auto& relation = lazy_child_relation<Element>(
+        child_model, owner_model.table_name, lazy_member_name<Member>(), owner_keys.front().name);
+
+    entityfy::condition filter;
+    filter.sql = entityfy::detail::quote_identifier(relation.local_column) + " = ?";
+    filter.binds.push_back(keys.front());
+
+    auto command = entityfy::select_statement(child_model, std::move(filter));
+    owner->log(command.sql);
+
+    std::vector<Element*> output;
+    auto child_set = owner->template set<Element>();
+
+    owner->database().query_each(command, [&](const entityfy::detail::row& row) {
+        output.push_back(&child_set.attach(entityfy::detail::materialize_row<Element>(row)));
+        return true;
+    });
+
+    return output;
+}
+
 template <typename T>
 struct set_state final : saveable
 {
@@ -368,6 +484,9 @@ struct set_state final : saveable
     // True when the database assigns the key (exactly one auto increment key
     // column). Only then does the default key mean "not assigned yet".
     bool                                       generated_key_ = false;
+    // Set once the relations of the lazy members have been resolved: the lookup
+    // only depends on reflection, so it is not repeated per bound entity.
+    bool                                       lazy_relations_validated_ = false;
     std::string                                table_name_;
     std::vector<std::string>                   referenced_tables_;
 
@@ -526,6 +645,7 @@ struct set_state final : saveable
         }
 
         added_indices_.push_back(items.size() - 1);
+        bind_lazy_members(item.entity);
         return item.entity;
     }
 
@@ -546,6 +666,9 @@ struct set_state final : saveable
         {
             if(const auto found = identity.find(key); found != identity.end())
             {
+                // Identity map hit: rebind the tracked entity so the handle
+                // follows this context; bind() keeps the cache it already has.
+                bind_lazy_members(items[found->second]->entity);
                 return items[found->second]->entity;
             }
         }
@@ -559,7 +682,83 @@ struct set_state final : saveable
             identity[key] = items.size() - 1;
         }
 
+        bind_lazy_members(item.entity);
         return item.entity;
+    }
+
+    // Binds every collection-shaped lazy member of the entity to this context
+    // and the entity's key. A payload a handle already holds is kept: rows
+    // supplied by an include stay authoritative. A model without lazy members
+    // compiles to nothing.
+    void bind_lazy_members(T& entity)
+    {
+        if constexpr(lazy_member_count<T>() != 0)
+        {
+            if(!lazy_relations_validated_)
+            {
+                validate_lazy_relations();
+            }
+
+            template for (constexpr auto member: lazy_members<T>())
+            {
+                using field_type = meta::field_type_t<T, member>;
+
+                if constexpr(field_type::is_collection)
+                {
+                    bind_lazy_collection<member>(entity);
+                }
+            }
+        }
+    }
+
+    // Resolves the relation of every collection member once per set. The lookup
+    // only depends on reflection, so a bulk load does not pay for it per entity;
+    // a missing relation or a composite key stays an explicit error.
+    void validate_lazy_relations()
+    {
+        template for (constexpr auto member: lazy_members<T>())
+        {
+            using field_type = meta::field_type_t<T, member>;
+
+            if constexpr(field_type::is_collection)
+            {
+                using element_type = typename field_type::element_type;
+
+                if(model_.primary_key_indices.size() != 1)
+                {
+                    throw std::logic_error{"entityfy: composite foreign keys are not supported yet (P1.5): lazy "
+                                           "member `" +
+                                           std::string{lazy_member_name<member>()} + "` on " + model_.table_name};
+                }
+
+                const auto child_model = entityfy::describe_model<element_type>(owner_->database().target_dialect());
+                const auto owner_keys = entityfy::primary_key_columns(model_);
+
+                (void)lazy_child_relation<element_type>(
+                    child_model, model_.table_name, lazy_member_name<member>(), owner_keys.front().name);
+            }
+        }
+
+        lazy_relations_validated_ = true;
+    }
+
+    // Binds one collection handle: the context link, its generation, the owner
+    // key it filters on, and the loader that fills it on first access.
+    template <auto Member>
+    void bind_lazy_collection(T& entity)
+    {
+        using field_type = meta::field_type_t<T, Member>;
+        using element_type = typename field_type::element_type;
+
+        const row_key key = key_of(entity);
+
+        std::vector<sql_value> keys;
+        keys.push_back(key.part(0));
+
+        entity.[:Member:].bind(owner_->lazy_link(),
+                               owner_->lazy_generation(),
+                               std::move(keys),
+                               &load_children<T, Member, element_type>);
     }
 
     // Reads the row as it exists now without touching the tracked entity.
@@ -763,6 +962,10 @@ struct set_state final : saveable
         item.marked_modified = false;
         identity[key] = *index;
         forget_index(*index);
+
+        // The refreshed row replaced the handle (and its cache) with a default
+        // constructed one, so it is bound again to this context.
+        bind_lazy_members(item.entity);
     }
 
     void forget_index(std::size_t index)
@@ -1169,6 +1372,8 @@ save_result set_state<T>::save(db_context& owner)
                 }
 
                 assign_generated_id(item.entity, generated);
+                // The row now has the key its lazy members must query with.
+                bind_lazy_members(item.entity);
             }
 
             if constexpr(has_token_member)

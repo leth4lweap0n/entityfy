@@ -207,6 +207,58 @@ struct [[= entityfy::table{"ck_slugs"}]] ck_slug
     std::string name;
 };
 
+// Lazy loading: the collection is a plain [[= entityfy::ignore]] handle. The
+// context binds it to the owner's key and filters on the foreign key declared
+// by the "references" annotation, so no member pointer is needed.
+struct [[= entityfy::table{"lz_posts"}]] lz_post
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::indexed, = entityfy::not_null, = entityfy::references{"lz_users"}]]
+    std::int64_t user_id = 0;
+
+    [[= entityfy::not_null, = entityfy::varchar{200}]]
+    std::string title;
+};
+
+struct [[= entityfy::table{"lz_users"}]] lz_user
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::not_null, = entityfy::varchar{120}]]
+    std::string name;
+
+    [[= entityfy::ignore]]
+    entityfy::lazy<std::vector<lz_post>> posts;
+};
+
+static_assert(entityfy::detail::is_ignored_member(^^lz_user::posts), "posts must be ignored");
+
+// Composite owner keys cannot be expressed by a one-column foreign key yet
+// (P1.5), so binding them is an explicit error instead of a wrong key.
+struct [[= entityfy::table{"lz_pair_posts"}]] lz_pair_post
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::indexed, = entityfy::not_null, = entityfy::references{"lz_pair_rows"}]]
+    std::int64_t pair_id = 0;
+};
+
+struct [[= entityfy::table{"lz_pair_rows"}]] lz_pair_row
+{
+    [[= entityfy::primary_key]]
+    std::int64_t id = 0;
+
+    [[= entityfy::primary_key]]
+    std::int64_t region = 0;
+
+    [[= entityfy::ignore]]
+    entityfy::lazy<std::vector<lz_pair_post>> children;
+};
+
 // EF Core style context: the sets are declared once, the framework derives
 // everything else (table, columns, primary key, foreign keys) from reflection.
 struct ef_context : entityfy::db_context
@@ -2254,6 +2306,181 @@ status run_sqlserver_checks()
     return status::passed;
 }
 
+status run_lazy_loading_checks()
+{
+    constexpr const char* path = "rc_lazy.db";
+    std::filesystem::remove(path);
+
+    std::int64_t ada_id = 0;
+    {
+        // Seed rows and close the context, so the checks below bind the handles
+        // through attach() (a materialized row) instead of add().
+        entityfy::db_context seed{"sqlite://rc_lazy.db"};
+        seed.migrate<lz_user>();
+        seed.migrate<lz_post>();
+
+        auto users = seed.set<lz_user>();
+        auto posts = seed.set<lz_post>();
+
+        auto& ada = users.add(lz_user{.name = "Ada"});
+        seed.save_changes();
+        require(ada.id != 0, "seed owner got a generated id");
+        ada_id = ada.id;
+
+        posts.add(lz_post{.user_id = ada.id, .title = "first"});
+        posts.add(lz_post{.user_id = ada.id, .title = "second"});
+        require(seed.save_changes().inserted == 2, "seed children inserted");
+    }
+
+    entityfy::db_context ctx{"sqlite://rc_lazy.db"};
+
+    std::vector<std::string> statements;
+    ctx.set_logger([&](std::string_view sql) { statements.emplace_back(sql); });
+
+    auto users = ctx.set<lz_user>();
+    auto posts = ctx.set<lz_post>();
+
+    statements.clear();
+    auto* ada = users.find(ada_id);
+    require(ada != nullptr, "owner found");
+    require(ada->posts.is_attached(), "find() binds the lazy collection");
+    require_not(ada->posts.is_loaded(), "find() does not load the lazy collection");
+    require(ada->posts.keys().size() == 1 && as_integer(ada->posts.keys().front()) == ada_id,
+            "the handle is bound to the owner key");
+
+    statements.clear();
+    const auto& loaded = ada->posts.get();
+    require(loaded.size() == 2, "first access loads every child");
+    require(statements.size() == 1, "first access issues exactly one statement");
+    require(statements.front().rfind("SELECT", 0) == 0, "the statement is a select");
+    require(statements.front().find("\"user_id\" = ?") != std::string::npos,
+            "the collection filters on the foreign key");
+    require(ada->posts.is_loaded(), "the payload is cached");
+
+    std::vector<std::string> titles;
+    for(const auto* post: loaded)
+    {
+        titles.push_back(post->title);
+        require(posts.find(post->id) == post, "loaded children are tracked by the context");
+    }
+    std::ranges::sort(titles);
+    require(titles.size() == 2 && titles[0] == "first" && titles[1] == "second", "both children are loaded");
+
+    statements.clear();
+    const auto& again = ada->posts.get();
+    require(&again == &loaded && again.size() == 2, "second access returns the cache");
+    require(statements.empty(), "second access issues no SQL");
+
+    require(users.state(*ada) == entityfy::entity_state::unchanged, "a lazy load leaves the owner unchanged");
+
+    const auto after_load = ctx.save_changes();
+    require(after_load.updated == 0 && after_load.inserted == 0 && after_load.removed == 0,
+            "a lazy load does not dirty the tracker");
+
+    // refresh() swaps in a fresh row, so the handle is bound again (with an
+    // empty cache) and still loads through the owner key.
+    users.refresh(*ada);
+    require(ada->posts.is_attached(), "refresh() rebinds the handle");
+    require_not(ada->posts.is_loaded(), "refresh() drops the cached payload");
+    const auto& reloaded = ada->posts.get();
+    require(reloaded.size() == 2, "the rebound handle loads the children again");
+
+    // No-tracking rows are plain values: their handles are never bound.
+    const auto untracked = users.as_no_tracking().where(entityfy::where(&lz_user::id) == ada_id).to_list();
+    require(untracked.size() == 1, "no-tracking read returns the owner");
+    lz_user untracked_copy = untracked.front();
+    require_not(untracked_copy.posts.is_attached(), "a no-tracking row has an unbound handle");
+
+    bool not_attached = false;
+    try
+    {
+        (void)untracked_copy.posts.get();
+    }
+    catch(const entityfy::lazy_error& error)
+    {
+        not_attached = error.reason() == entityfy::lazy_error_reason::not_attached;
+    }
+    require(not_attached, "no-tracking access reports lazy_error::not_attached");
+
+    // The context owns the binding: a handle that outlives it must not follow
+    // the dangling owner.
+    lz_user orphan;
+    {
+        entityfy::db_context scoped{"sqlite://:memory:"};
+        scoped.migrate<lz_user>();
+        scoped.migrate<lz_post>();
+
+        auto& added = scoped.set<lz_user>().add(lz_user{.name = "Scoped"});
+        scoped.save_changes();
+        orphan = added;
+    }
+
+    require_not(orphan.posts.is_attached(), "a destroyed context detaches the handle");
+
+    bool destroyed = false;
+    try
+    {
+        (void)orphan.posts.get();
+    }
+    catch(const entityfy::lazy_error& error)
+    {
+        destroyed = error.reason() == entityfy::lazy_error_reason::context_destroyed;
+    }
+    require(destroyed, "a destroyed context reports lazy_error::context_destroyed");
+
+    // clear() keeps the context but drops the state the handle pointed at.
+    entityfy::db_context cleared{"sqlite://:memory:"};
+    cleared.migrate<lz_user>();
+    cleared.migrate<lz_post>();
+
+    auto& tracked = cleared.set<lz_user>().add(lz_user{.name = "Cleared"});
+    cleared.save_changes();
+
+    lz_user cleared_copy = tracked;
+    cleared.clear();
+
+    bool context_cleared = false;
+    try
+    {
+        (void)cleared_copy.posts.get();
+    }
+    catch(const entityfy::lazy_error& error)
+    {
+        context_cleared = error.reason() == entityfy::lazy_error_reason::context_cleared;
+    }
+    require(context_cleared, "clear() reports lazy_error::context_cleared");
+
+    // A generated key is assigned during save, after the handle was bound, so
+    // the handle has to follow the id the database assigned.
+    auto& fresh = users.add(lz_user{.name = "Fresh"});
+    ctx.save_changes();
+    require(fresh.id != 0, "generated id assigned");
+    require(fresh.posts.is_attached(), "save() binds the added entity");
+    require(fresh.posts.keys().size() == 1 && as_integer(fresh.posts.keys().front()) == fresh.id,
+            "the handle follows the generated key");
+
+    statements.clear();
+    const auto& no_children = fresh.posts.get();
+    require(no_children.empty(), "an owner without children loads an empty collection");
+    require(statements.size() == 1, "the empty collection is one statement, not an error");
+
+    // Composite owner keys are rejected up front instead of binding a key the
+    // one-column relation cannot express (P1.5).
+    auto pairs = ctx.set<lz_pair_row>();
+    bool composite = false;
+    try
+    {
+        pairs.add(lz_pair_row{.id = 1, .region = 2});
+    }
+    catch(const std::logic_error& error)
+    {
+        composite = std::string{error.what()}.find("P1.5") != std::string::npos;
+    }
+    require(composite, "a composite owner key is an explicit logic_error");
+
+    return status::passed;
+}
+
 } // namespace
 
 int main()
@@ -2283,6 +2510,7 @@ int main()
         {"column_alias", run_column_alias_checks},
         {"column_alias_version", run_column_alias_version_checks},
         {"no_tracking", run_no_tracking_checks},
+        {"lazy_loading", run_lazy_loading_checks},
         {"manual_tracking", run_manual_tracking_checks},
         {"batch", run_batch_checks},
         {"dependency", run_dependency_checks},

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <entityfy/entityfy.hpp>
+#include <entityfy/lazy.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -111,7 +112,10 @@ class db_context
 public:
     explicit db_context(std::string uri)
         : database_{std::move(uri)}
+        , lazy_link_{std::make_shared<detail::lazy_link>()}
     {
+        lazy_link_->owner = this;
+
         if(database_.target_dialect() == entityfy::dialect::sqlite)
         {
             execute("PRAGMA foreign_keys = ON");
@@ -120,6 +124,10 @@ public:
 
     db_context(const db_context&) = delete;
     db_context& operator=(const db_context&) = delete;
+
+    // Marks the binding state dead, so a lazy handle that outlives the context
+    // reports context_destroyed instead of following the dangling owner.
+    ~db_context();
 
     // Generic accessor for a tracked entity set. Typed sets declared as
     // context members are the preferred form.
@@ -146,7 +154,21 @@ public:
     [[nodiscard]] std::future<save_result> save_changes_async();
 
     // Drops the tracked entities and the identity map; the DB connection is kept.
+    // Handles bound to the dropped state report context_cleared afterwards.
     void clear();
+
+    // Binding state shared with every lazy handle this context binds. Handles
+    // keep a weak reference, so a destroyed or cleared context is detected
+    // instead of dereferenced.
+    [[nodiscard]] std::shared_ptr<detail::lazy_link> lazy_link() const noexcept
+    {
+        return lazy_link_;
+    }
+
+    [[nodiscard]] std::uint64_t lazy_generation() const noexcept
+    {
+        return lazy_link_->generation;
+    }
 
     // Change detection strategy. With auto detection disabled, save_changes()
     // compares only the entities passed to db_set::mark_modified(); everything
@@ -275,6 +297,8 @@ private:
     [[nodiscard]] save_result save_changes_with_retry();
 
     entityfy::client                                        database_;
+    // Shared with the lazy handles bound by this context; never reassigned.
+    std::shared_ptr<detail::lazy_link>                      lazy_link_;
     bool                                                    auto_detect_ = true;
     std::unordered_map<std::type_index, std::shared_ptr<detail::saveable>> states_;
     std::vector<std::shared_ptr<detail::saveable>>         order_;

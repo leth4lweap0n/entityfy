@@ -39,6 +39,11 @@ bool is_transient(const std::exception& error)
 
 } // namespace
 
+db_context::~db_context()
+{
+    lazy_link_->alive = false;
+}
+
 save_result db_context::save_changes()
 {
     const std::lock_guard lock{save_mutex_};
@@ -79,6 +84,10 @@ save_result db_context::save_changes_with_retry()
 
 void db_context::clear()
 {
+    // Handles bound to the previous state must not dereference it through a
+    // stale owner pointer after the sets are gone.
+    ++lazy_link_->generation;
+
     order_.clear();
     states_.clear();
 }
