@@ -116,4 +116,5 @@ and check the pending migrations.
 ## Tests
 
 `entityfy_migrate_tests` runs the following suites: `schema`, `diff`, `json`, `sqlite`,
-`engine`, `scaffold`, `postgres`. The PostgreSQL test is enabled with `ENTITYFY_PG_URI`.
+`engine`, `scaffold`, `history_table`, `rename_table`, `owned_model`, and `postgres`
+(enabled with `ENTITYFY_PG_URI`).
