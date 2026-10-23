@@ -5,6 +5,7 @@
 
 #include <sl3.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -365,6 +366,21 @@ public:
         statement foreign_keys_statement;
         foreign_keys_statement.sql = "PRAGMA foreign_key_list(" + quote_identifier(table) + ")";
 
+        // The pragma emits one row per key column: `id` groups the rows of a
+        // constraint and `seq` orders the columns inside it. Rows are collected
+        // before grouping because the pragma does not promise an order.
+        struct key_row
+        {
+            std::int64_t id = 0;
+            std::int64_t seq = 0;
+            std::string  column;
+            std::string  referenced_table;
+            std::string  referenced_column;
+            std::string  on_update;
+            std::string  on_delete;
+        };
+
+        std::vector<key_row> key_rows;
         for(const auto& result_row: query(foreign_keys_statement))
         {
             if(result_row.size() < 7)
@@ -372,13 +388,42 @@ public:
                 continue;
             }
 
-            output.foreign_keys.emplace_back(foreign_key_info{
+            key_rows.push_back(key_row{
+                .id = value_to_i64(result_row[0]),
+                .seq = value_to_i64(result_row[1]),
                 .column = value_to_string(result_row[3]),
                 .referenced_table = value_to_string(result_row[2]),
                 .referenced_column = value_to_string(result_row[4]),
                 .on_update = value_to_string(result_row[5]),
                 .on_delete = value_to_string(result_row[6]),
             });
+        }
+
+        std::stable_sort(key_rows.begin(), key_rows.end(), [](const key_row& left, const key_row& right) {
+            return left.id != right.id ? left.id < right.id : left.seq < right.seq;
+        });
+
+        std::int64_t current_key_id = -1;
+        for(const auto& row: key_rows)
+        {
+            if(output.foreign_keys.empty() || current_key_id != row.id)
+            {
+                current_key_id = row.id;
+                output.foreign_keys.push_back(foreign_key_info{
+                    .column = row.column,
+                    .referenced_table = row.referenced_table,
+                    .referenced_column = row.referenced_column,
+                    .on_update = row.on_update,
+                    .on_delete = row.on_delete,
+                    .columns = {row.column},
+                    .referenced_columns = {row.referenced_column},
+                });
+                continue;
+            }
+
+            auto& foreign_key = output.foreign_keys.back();
+            foreign_key.columns.push_back(row.column);
+            foreign_key.referenced_columns.push_back(row.referenced_column);
         }
 
         return output;

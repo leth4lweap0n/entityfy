@@ -43,6 +43,8 @@ struct reference_descriptor
     std::string column;
     std::string on_delete;
     std::string on_update;
+    // Non-zero for a column that joins a table-level composite FOREIGN KEY.
+    int group = 0;
 };
 
 struct column_descriptor
@@ -65,6 +67,11 @@ struct relation_descriptor
     std::string referenced_column;
     std::string on_delete;
     std::string on_update;
+    // Every column of the relation in declaration order. `local_column` and
+    // `referenced_column` repeat the first entries for older call sites; a
+    // single-column relation always has one-element lists.
+    std::vector<std::string> local_columns;
+    std::vector<std::string> referenced_columns;
 };
 
 namespace detail
@@ -983,6 +990,7 @@ template <typename Type>
                 .column = std::string{metadata.reference.column.empty() ? std::string_view{"id"} : metadata.reference.column.view()},
                 .on_delete = std::string{metadata.reference.on_delete.view()},
                 .on_update = std::string{metadata.reference.on_update.view()},
+                .group = metadata.reference.group,
             };
         }
 
@@ -1031,20 +1039,85 @@ template <typename Type>
 {
     using model_type = std::remove_cvref_t<Type>;
 
+    const std::string resolved_table_name = table_name<model_type>();
     auto columns = describe<model_type>(target);
+
+    // One relation per foreign key. Columns sharing a non-zero group collapse
+    // into one relation whose column lists are appended in declaration order;
+    // the relation is created where its first column appears.
     std::vector<relation_descriptor> relations;
+    std::vector<std::pair<int, std::size_t>> group_relation_indices;
+
+    const auto make_relation = [](const column_descriptor& column) {
+        return relation_descriptor{
+            .local_column = column.name,
+            .referenced_table = column.reference.table,
+            .referenced_column = column.reference.column,
+            .on_delete = column.reference.on_delete,
+            .on_update = column.reference.on_update,
+            .local_columns = {column.name},
+            .referenced_columns = {column.reference.column},
+        };
+    };
 
     for(const auto& column: columns)
     {
-        if(column.has_reference)
+        if(!column.has_reference)
         {
-            relations.emplace_back(relation_descriptor{
-                .local_column = column.name,
-                .referenced_table = column.reference.table,
-                .referenced_column = column.reference.column,
-                .on_delete = column.reference.on_delete,
-                .on_update = column.reference.on_update,
-            });
+            continue;
+        }
+
+        const int group = column.reference.group;
+
+        if(group == 0)
+        {
+            relations.emplace_back(make_relation(column));
+            continue;
+        }
+
+        const auto known = std::ranges::find_if(
+            group_relation_indices, [group](const std::pair<int, std::size_t>& entry) { return entry.first == group; });
+
+        if(known == group_relation_indices.end())
+        {
+            group_relation_indices.emplace_back(group, relations.size());
+            relations.emplace_back(make_relation(column));
+            continue;
+        }
+
+        auto& relation = relations[known->second];
+
+        if(relation.referenced_table != column.reference.table)
+        {
+            throw std::logic_error{
+                "entityfy ORM composite reference group " + std::to_string(group) + " on `" + resolved_table_name +
+                "` mixes referenced tables `" + relation.referenced_table + "` and `" + column.reference.table +
+                "`; every column of a group must reference the same table"
+            };
+        }
+
+        if(relation.on_delete != column.reference.on_delete || relation.on_update != column.reference.on_update)
+        {
+            throw std::logic_error{
+                "entityfy ORM composite reference group " + std::to_string(group) + " on `" + resolved_table_name +
+                "` mixes ON DELETE/ON UPDATE actions; every column of a group must declare the same actions"
+            };
+        }
+
+        relation.local_columns.push_back(column.name);
+        relation.referenced_columns.push_back(column.reference.column);
+    }
+
+    // A group exists to describe a composite key; one column is a plain
+    // single-column reference and belongs in group 0.
+    for(const auto& [group, index]: group_relation_indices)
+    {
+        if(relations[index].local_columns.size() < 2)
+        {
+            throw std::logic_error{
+                "entityfy ORM composite reference group " + std::to_string(group) + " on `" + resolved_table_name +
+                "` has one column; a group is only for composite foreign keys, use group 0 for a single-column reference"
+            };
         }
     }
 
@@ -1069,7 +1142,7 @@ template <typename Type>
 
     return model_descriptor<model_type>{
         .target = target,
-        .table_name = table_name<model_type>(),
+        .table_name = resolved_table_name,
         .columns = std::move(columns),
         .relations = std::move(relations),
         .type_tag = std::string{meta::type_annotation_or<type_tag, model_type>(type_tag{}).value.view()},

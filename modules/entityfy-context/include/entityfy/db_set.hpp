@@ -17,6 +17,7 @@
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -301,6 +302,215 @@ template <typename Model>
     return {};
 }
 
+// Reads the key tuple named by `columns` from an entity, in the given order.
+// A column the entity does not persist makes the whole tuple unreadable: a
+// partial tuple would compare unequal to every real key and silently match
+// nothing, so the caller skips the row instead of matching on a suffix of it.
+template <typename Model>
+[[nodiscard]] std::optional<std::vector<sql_value>> read_key_tuple(const Model& entity, std::span<const std::string> columns)
+{
+    std::vector<sql_value> parts;
+    parts.reserve(columns.size());
+
+    for(const auto& column: columns)
+    {
+        auto value = read_column(entity, column);
+
+        if(!value)
+        {
+            return std::nullopt;
+        }
+
+        parts.push_back(std::move(*value));
+    }
+
+    return parts;
+}
+
+// Identity of a tuple read by read_key_tuple(): the parts are compared as a
+// whole key, so (1, "a") and (1, "b") never collapse into one bucket and two
+// spellings of the same value address the same row.
+[[nodiscard]] inline row_key tuple_key(const std::vector<sql_value>& parts)
+{
+    return row_key{parts};
+}
+
+// Appends the tuple to `tuples` unless its key is already required. The
+// identity set keeps the dedupe O(1) per tuple, so a query over many owners
+// stays linear in the number of rows.
+inline void append_key_tuple(
+    std::vector<std::vector<sql_value>>&        tuples,
+    std::unordered_set<row_key, row_key_hash>&  seen,
+    std::vector<sql_value>                      parts)
+{
+    if(seen.insert(row_key{parts}).second)
+    {
+        tuples.push_back(std::move(parts));
+    }
+}
+
+// Names of a model's primary key columns, in key order. The list is what a
+// relation has to reference, and the order a key tuple is bound in.
+template <typename Model>
+[[nodiscard]] std::vector<std::string> primary_key_names(const entityfy::model_descriptor<Model>& model)
+{
+    std::vector<std::string> names;
+
+    for(const auto& column: entityfy::primary_key_columns(model))
+    {
+        names.push_back(column.name);
+    }
+
+    return names;
+}
+
+// True when the relation's referenced columns name the parent's primary key in
+// key order. Only such a relation is navigable: the context resolves parents
+// through the identity map, which is keyed by the full primary key.
+[[nodiscard]] inline bool points_at_primary_key(
+    const entityfy::relation_descriptor& relation,
+    std::span<const std::string>         key_columns)
+{
+    return std::ranges::equal(relation.referenced_columns, key_columns);
+}
+
+[[noreturn]] inline void throw_non_key_relation(std::string_view child_table, std::string_view parent_table)
+{
+    throw std::runtime_error{"entityfy: relation from " + std::string{child_table} + " to " +
+                             std::string{parent_table} + " does not point at the primary key"};
+}
+
+// WHERE fragment that matches exactly one key tuple: `a = ? AND b = ?`, with
+// the identifiers quoted and the binds in column order.
+[[nodiscard]] inline condition tuple_equals(
+    std::span<const std::string> columns,
+    std::span<const sql_value>  parts)
+{
+    if(columns.size() != parts.size())
+    {
+        throw std::logic_error{"entityfy: key tuple has " + std::to_string(parts.size()) + " value(s) but " +
+                               std::to_string(columns.size()) + " column(s) were named"};
+    }
+
+    condition filter;
+    filter.binds.assign(parts.begin(), parts.end());
+
+    for(std::size_t index = 0; index < columns.size(); ++index)
+    {
+        if(index != 0)
+        {
+            filter.sql.append(" AND ");
+        }
+
+        filter.sql.append(quote_identifier(columns[index]));
+        filter.sql.append(" = ?");
+    }
+
+    return filter;
+}
+
+// WHERE fragment that matches the rows of one or more key tuples, quoted and
+// bound in column order. One tuple is a plain conjunction; several are a row
+// value IN, so the query stays one round trip no matter how many owners it
+// resolves.
+[[nodiscard]] inline condition tuple_filter(
+    dialect                            target,
+    std::span<const std::string>       columns,
+    std::span<const std::vector<sql_value>> tuples)
+{
+    if(tuples.empty())
+    {
+        throw std::logic_error{"entityfy: key filter needs at least one tuple"};
+    }
+
+    if(tuples.size() == 1)
+    {
+        return tuple_equals(columns, tuples.front());
+    }
+
+    condition filter;
+    const auto bind_all = [&] {
+        filter.binds.reserve(tuples.size() * columns.size());
+
+        for(const auto& tuple: tuples)
+        {
+            filter.binds.insert(filter.binds.end(), tuple.begin(), tuple.end());
+        }
+    };
+
+    if(target == dialect::sqlserver)
+    {
+        // T-SQL has no row value constructor in IN, so the same predicate is a
+        // disjunction of complete tuple comparisons.
+        for(std::size_t row = 0; row < tuples.size(); ++row)
+        {
+            if(row != 0)
+            {
+                filter.sql.append(" OR ");
+            }
+
+            filter.sql.push_back('(');
+
+            for(std::size_t index = 0; index < columns.size(); ++index)
+            {
+                if(index != 0)
+                {
+                    filter.sql.append(" AND ");
+                }
+
+                filter.sql.append(quote_identifier(columns[index]));
+                filter.sql.append(" = ?");
+            }
+
+            filter.sql.push_back(')');
+        }
+
+        bind_all();
+        return filter;
+    }
+
+    filter.sql.push_back('(');
+
+    for(std::size_t index = 0; index < columns.size(); ++index)
+    {
+        if(index != 0)
+        {
+            filter.sql.append(", ");
+        }
+
+        filter.sql.append(quote_identifier(columns[index]));
+    }
+
+    filter.sql.append(") IN (");
+
+    for(std::size_t row = 0; row < tuples.size(); ++row)
+    {
+        if(row != 0)
+        {
+            filter.sql.append(", ");
+        }
+
+        filter.sql.push_back('(');
+
+        for(std::size_t index = 0; index < columns.size(); ++index)
+        {
+            if(index != 0)
+            {
+                filter.sql.append(", ");
+            }
+
+            filter.sql.push_back('?');
+        }
+
+        filter.sql.push_back(')');
+    }
+
+    filter.sql.push_back(')');
+    bind_all();
+
+    return filter;
+}
+
 // Finds the relation that points from the child model to the parent model.
 // The relation is read from the "references" annotation, so no member pointer
 // has to be supplied by the caller.
@@ -408,15 +618,15 @@ consteval std::meta::info lazy_reference_member()
 }
 
 // The relation from a child model to a parent model, resolved through the
-// "references" annotation. This slice binds single-column foreign keys only, so
-// a relation that points anywhere but the parent's primary key is an explicit
-// error instead of a silently wrong key.
+// "references" annotation. The relation is navigable only when its referenced
+// columns name the parent's primary key in key order; a relation to any other
+// column set is an explicit error instead of a silently wrong key.
 template <typename Child>
 [[nodiscard]] const entityfy::relation_descriptor& lazy_child_relation(
     const entityfy::model_descriptor<Child>& child_model,
-    std::string_view parent_table,
-    std::string_view member_name,
-    std::string_view parent_key_column)
+    std::string_view                         parent_table,
+    std::string_view                         member_name,
+    std::span<const std::string>             parent_key_columns)
 {
     for(const auto& relation: child_model.relations)
     {
@@ -425,12 +635,9 @@ template <typename Child>
             continue;
         }
 
-        if(relation.referenced_column != parent_key_column)
+        if(!points_at_primary_key(relation, parent_key_columns))
         {
-            throw std::logic_error{"entityfy: lazy member `" + std::string{member_name} + "` links " +
-                                   child_model.table_name + " to `" + relation.referenced_column + "` of " +
-                                   std::string{parent_table} + ", but only the primary key `" +
-                                   std::string{parent_key_column} + "` is supported"};
+            throw_non_key_relation(child_model.table_name, parent_table);
         }
 
         return relation;
@@ -443,6 +650,8 @@ template <typename Child>
 // Loader bound into a collection handle: selects the rows of Element that
 // reference the owner's key and tracks each row through the context, so a
 // repeated load converges on the identity map instead of duplicating entities.
+// The owner key is compared as a whole tuple, so a composite key filters the
+// child by every one of its foreign key columns.
 template <typename Owner, auto Member, typename Element>
 [[nodiscard]] std::vector<Element*> load_children(db_context* owner, std::span<const sql_value> keys)
 {
@@ -452,29 +661,23 @@ template <typename Owner, auto Member, typename Element>
                                "` cannot load without a context"};
     }
 
-    if(keys.size() != 1)
-    {
-        throw std::logic_error{"entityfy: lazy member `" + std::string{lazy_member_name<Member>()} +
-                               "` expects exactly one owner key part"};
-    }
-
     const auto dialect = owner->database().target_dialect();
     const auto owner_model = entityfy::describe_model<Owner>(dialect);
     const auto child_model = entityfy::describe_model<Element>(dialect);
-    const auto owner_keys = entityfy::primary_key_columns(owner_model);
-
-    if(owner_keys.size() != 1)
-    {
-        throw std::logic_error{"entityfy: composite foreign keys are not supported yet (P1.5): lazy member `" +
-                               std::string{lazy_member_name<Member>()} + "` on " + owner_model.table_name};
-    }
+    const auto owner_keys = entityfy::detail::primary_key_names(owner_model);
 
     const auto& relation = lazy_child_relation<Element>(
-        child_model, owner_model.table_name, lazy_member_name<Member>(), owner_keys.front().name);
+        child_model, owner_model.table_name, lazy_member_name<Member>(), owner_keys);
 
-    entityfy::condition filter;
-    filter.sql = entityfy::detail::quote_identifier(relation.local_column) + " = ?";
-    filter.binds.push_back(keys.front());
+    if(keys.size() != relation.local_columns.size())
+    {
+        throw std::logic_error{"entityfy: lazy member `" + std::string{lazy_member_name<Member>()} +
+                               "` was bound to " + std::to_string(keys.size()) + " key part(s) but its relation on " +
+                               child_model.table_name + " has " +
+                               std::to_string(relation.local_columns.size()) + " foreign key column(s)"};
+    }
+
+    auto filter = entityfy::detail::tuple_equals(relation.local_columns, keys);
 
     auto command = entityfy::select_statement(child_model, std::move(filter));
     owner->log(command.sql);
@@ -493,6 +696,8 @@ template <typename Owner, auto Member, typename Element>
 // Loader bound into a reference handle: resolves the parent by the owner's
 // foreign key through the context's identity map, so the reference is the same
 // tracked entity find() would return and repeated access never duplicates rows.
+// Every key part is required: a null part means there is no parent, and a
+// partial key could not name a row.
 template <typename Owner, auto Member, typename Element>
 [[nodiscard]] Element* load_parent(db_context* owner, std::span<const sql_value> keys)
 {
@@ -502,29 +707,29 @@ template <typename Owner, auto Member, typename Element>
                                "` cannot load without a context"};
     }
 
-    if(keys.size() != 1)
+    const auto parent_model = entityfy::describe_model<Element>(owner->database().target_dialect());
+    const auto parent_keys = entityfy::primary_key_columns(parent_model);
+
+    if(keys.size() != parent_keys.size())
     {
         throw std::logic_error{"entityfy: lazy member `" + std::string{lazy_member_name<Member>()} +
-                               "` expects exactly one foreign key part"};
+                               "` was bound to " + std::to_string(keys.size()) + " foreign key part(s) but " +
+                               parent_model.table_name + " has " + std::to_string(parent_keys.size()) +
+                               " primary key column(s)"};
     }
 
     // A missing or null foreign key has no parent; querying for NULL would
     // always match nothing, so the round trip is skipped entirely.
-    if(std::holds_alternative<std::monostate>(keys.front()))
+    for(const auto& part: keys)
     {
-        return nullptr;
-    }
-
-    const auto parent_model = entityfy::describe_model<Element>(owner->database().target_dialect());
-
-    if(entityfy::primary_key_columns(parent_model).size() != 1)
-    {
-        throw std::logic_error{"entityfy: composite foreign keys are not supported yet (P1.5): lazy member `" +
-                               std::string{lazy_member_name<Member>()} + "` on " + parent_model.table_name};
+        if(std::holds_alternative<std::monostate>(part))
+        {
+            return nullptr;
+        }
     }
 
     auto parent_set = owner->template set<Element>();
-    return parent_set.find(row_key{std::vector<sql_value>{keys.front()}});
+    return parent_set.find(row_key{std::vector<sql_value>{keys.begin(), keys.end()}});
 }
 
 template <typename T>
@@ -579,10 +784,11 @@ struct set_state final : saveable
     // Set once the relations of the lazy members have been resolved: the lookup
     // only depends on reflection, so it is not repeated per bound entity.
     bool                                       lazy_relations_validated_ = false;
-    // Foreign key column of every reference-shaped lazy member, in
+    // Foreign key columns of every reference-shaped lazy member, in
     // lazy_members<T>() order. Filled by validate_lazy_relations(); collection
-    // entries stay empty because their loader filters on the owner key.
-    std::vector<std::string>                   lazy_reference_columns_;
+    // entries stay empty because their loader filters on the owner key. A
+    // composite foreign key keeps all of its columns in declaration order.
+    std::vector<std::vector<std::string>>      lazy_reference_columns_;
     std::string                                table_name_;
     std::vector<std::string>                   referenced_tables_;
 
@@ -842,10 +1048,11 @@ struct set_state final : saveable
 
     // Resolves the relation of every lazy member once per set. The lookup only
     // depends on reflection, so a bulk load does not pay for it per entity; a
-    // missing relation or a composite key stays an explicit error.
+    // missing relation or a relation to anything but the primary key stays an
+    // explicit error.
     void validate_lazy_relations()
     {
-        lazy_reference_columns_.assign(lazy_member_count<T>(), std::string{});
+        lazy_reference_columns_.assign(lazy_member_count<T>(), std::vector<std::string>{});
 
         template for (constexpr auto member: lazy_members<T>())
         {
@@ -855,37 +1062,23 @@ struct set_state final : saveable
             {
                 using element_type = typename field_type::element_type;
 
-                if(model_.primary_key_indices.size() != 1)
-                {
-                    throw std::logic_error{"entityfy: composite foreign keys are not supported yet (P1.5): lazy "
-                                           "member `" +
-                                           std::string{lazy_member_name<member>()} + "` on " + model_.table_name};
-                }
-
                 const auto child_model = entityfy::describe_model<element_type>(owner_->database().target_dialect());
-                const auto owner_keys = entityfy::primary_key_columns(model_);
+                const auto owner_keys = entityfy::detail::primary_key_names(model_);
 
                 (void)lazy_child_relation<element_type>(
-                    child_model, model_.table_name, lazy_member_name<member>(), owner_keys.front().name);
+                    child_model, model_.table_name, lazy_member_name<member>(), owner_keys);
             }
             else
             {
                 using element_type = typename field_type::element_type;
 
                 const auto parent_model = entityfy::describe_model<element_type>(owner_->database().target_dialect());
-                const auto parent_keys = entityfy::primary_key_columns(parent_model);
-
-                if(parent_keys.size() != 1)
-                {
-                    throw std::logic_error{"entityfy: composite foreign keys are not supported yet (P1.5): lazy "
-                                           "member `" +
-                                           std::string{lazy_member_name<member>()} + "` on " + model_.table_name};
-                }
+                const auto parent_keys = entityfy::detail::primary_key_names(parent_model);
 
                 const auto& relation = lazy_child_relation<T>(
-                    model_, parent_model.table_name, lazy_member_name<member>(), parent_keys.front().name);
+                    model_, parent_model.table_name, lazy_member_name<member>(), parent_keys);
 
-                lazy_reference_columns_[lazy_member_index<T, member>()] = relation.local_column;
+                lazy_reference_columns_[lazy_member_index<T, member>()] = relation.local_columns;
             }
         }
 
@@ -893,27 +1086,32 @@ struct set_state final : saveable
     }
 
     // Binds one reference handle: the context link, its generation, the
-    // owner's foreign key value, and the loader that resolves the parent on
-    // first access.
+    // owner's foreign key values in relation column order, and the loader that
+    // resolves the parent on first access.
     template <auto Member>
     void bind_lazy_reference(T& entity)
     {
         using field_type = meta::field_type_t<T, Member>;
         using element_type = typename field_type::element_type;
 
-        const std::string& foreign_key = lazy_reference_columns_[lazy_member_index<T, Member>()];
+        const std::vector<std::string>& foreign_keys = lazy_reference_columns_[lazy_member_index<T, Member>()];
 
         std::vector<sql_value> keys;
-        if(const auto value = entityfy::detail::read_column(entity, foreign_key))
+        keys.reserve(foreign_keys.size());
+
+        for(const auto& foreign_key: foreign_keys)
         {
-            keys.push_back(*value);
-        }
-        else
-        {
-            // An ignored or otherwise unreadable foreign key behaves like a
-            // null one: the loader must not query with a value the entity does
-            // not have.
-            keys.push_back(sql_value{std::monostate{}});
+            if(const auto value = entityfy::detail::read_column(entity, foreign_key))
+            {
+                keys.push_back(*value);
+            }
+            else
+            {
+                // An ignored or otherwise unreadable foreign key behaves like a
+                // null one: the loader must not query with a value the entity
+                // does not have.
+                keys.emplace_back(std::monostate{});
+            }
         }
 
         entity.[:Member:].bind(owner_->lazy_link(),
@@ -922,8 +1120,10 @@ struct set_state final : saveable
                                &load_parent<T, Member, element_type>);
     }
 
-    // Binds one collection handle: the context link, its generation, the owner
-    // key it filters on, and the loader that fills it on first access.
+    // Binds one collection handle: the context link, its generation, the
+    // owner's whole key it filters on, and the loader that fills it on first
+    // access. A composite key is bound part by part, matching the relation's
+    // foreign key columns.
     template <auto Member>
     void bind_lazy_collection(T& entity)
     {
@@ -932,8 +1132,7 @@ struct set_state final : saveable
 
         const row_key key = key_of(entity);
 
-        std::vector<sql_value> keys;
-        keys.push_back(key.part(0));
+        std::vector<sql_value> keys{key.parts().begin(), key.parts().end()};
 
         entity.[:Member:].bind(owner_->lazy_link(),
                                owner_->lazy_generation(),
@@ -2100,83 +2299,153 @@ public:
         const auto parent_model = entityfy::describe_model<T>(dialect);
         const auto child_model = entityfy::describe_model<Child>(dialect);
         const auto& relation = entityfy::detail::find_relation<Child, T>(child_model, parent_model);
+        const auto parent_key_names = entityfy::detail::primary_key_names(parent_model);
 
-        if(entityfy::primary_key_columns(parent_model).size() > 1)
+        if(!entityfy::detail::points_at_primary_key(relation, parent_key_names))
         {
-            throw std::logic_error{"entityfy: composite foreign keys are not supported yet (P1.5): relation from " +
-                                   child_model.table_name + " to " + parent_model.table_name};
+            entityfy::detail::throw_non_key_relation(child_model.table_name, parent_model.table_name);
         }
 
-        const auto parent_key_column = entityfy::primary_key_column(parent_model).name;
-        if(relation.referenced_column != parent_key_column)
+        // A composite key is compared as a whole tuple: a child that matches
+        // one column of it belongs to no parent. A single-column relation keeps
+        // the original IN list and bind order.
+        const bool                                    composite_key = parent_key_names.size() > 1;
+        std::vector<std::vector<entityfy::sql_value>> key_tuples;
+        std::unordered_set<row_key, row_key_hash>     seen_tuples;
+
+        if(composite_key)
         {
-            throw std::runtime_error{"entityfy: relation from " + child_model.table_name + " to " +
-                                     parent_model.table_name + " does not point at the primary key"};
-        }
-
-        std::vector<entityfy::sql_value> parent_keys;
-        parent_keys.reserve(parents.size());
-
-        for(const auto* parent: parents)
-        {
-            parent_keys.push_back(
-                entityfy::detail::primary_key_value(*parent, parent_model)
-            );
-        }
-
-        std::string sql = "SELECT ";
-
-        for(std::size_t index = 0; index < child_model.columns.size(); ++index)
-        {
-            if(index != 0)
+            for(const auto* parent: parents)
             {
-                sql += ", ";
+                auto tuple = entityfy::detail::read_key_tuple(*parent, relation.referenced_columns);
+
+                if(tuple)
+                {
+                    entityfy::detail::append_key_tuple(key_tuples, seen_tuples, std::move(*tuple));
+                }
             }
-
-            sql += entityfy::detail::quote_identifier(child_model.columns[index].name);
         }
-
-        sql += " FROM " + entityfy::detail::quote_identifier(child_model.table_name) + " WHERE " +
-               entityfy::detail::quote_identifier(relation.local_column) + " IN (";
-
-        for(std::size_t index = 0; index < parent_keys.size(); ++index)
+        else
         {
-            if(index != 0)
+            for(const auto* parent: parents)
             {
-                sql += ", ";
+                key_tuples.push_back({entityfy::detail::primary_key_value(*parent, parent_model)});
             }
-
-            sql += "?";
         }
-
-        sql += ")";
-
-        owner_->log(sql);
 
         std::unordered_map<row_key, std::vector<Child*>, row_key_hash> grouped;
         auto child_set = owner_->template set<Child>();
 
-        owner_->database().query_each(
-            entityfy::statement{.sql = std::move(sql), .binds = std::move(parent_keys)},
-            [&](const entityfy::detail::row& row) {
-                auto child = entityfy::detail::materialize_row<Child>(row);
+        if(!key_tuples.empty())
+        {
+            std::string sql = "SELECT ";
 
-                const auto key = entityfy::detail::read_column(child, relation.local_column);
-                if(!key)
+            for(std::size_t index = 0; index < child_model.columns.size(); ++index)
+            {
+                if(index != 0)
                 {
-                    return true;
+                    sql += ", ";
                 }
 
-                auto& stored = child_set.attach(std::move(child));
-                grouped[entityfy::detail::single_part_key(*key)].push_back(&stored);
-                return true;
+                sql += entityfy::detail::quote_identifier(child_model.columns[index].name);
             }
-        );
+
+            sql += " FROM " + entityfy::detail::quote_identifier(child_model.table_name) + " WHERE ";
+
+            std::vector<entityfy::sql_value> binds;
+
+            if(composite_key)
+            {
+                auto filter = entityfy::detail::tuple_filter(dialect, relation.local_columns, key_tuples);
+                sql += filter.sql;
+                binds = std::move(filter.binds);
+            }
+            else
+            {
+                sql += entityfy::detail::quote_identifier(relation.local_column) + " IN (";
+
+                for(std::size_t index = 0; index < key_tuples.size(); ++index)
+                {
+                    if(index != 0)
+                    {
+                        sql += ", ";
+                    }
+
+                    sql += "?";
+                }
+
+                sql += ")";
+
+                binds.reserve(key_tuples.size());
+
+                for(const auto& tuple: key_tuples)
+                {
+                    binds.push_back(tuple.front());
+                }
+            }
+
+            owner_->log(sql);
+
+            owner_->database().query_each(
+                entityfy::statement{.sql = std::move(sql), .binds = std::move(binds)},
+                [&](const entityfy::detail::row& row) {
+                    auto child = entityfy::detail::materialize_row<Child>(row);
+
+                    row_key key;
+
+                    if(composite_key)
+                    {
+                        // A child joins a parent only when its whole local
+                        // tuple matches; grouping on one part would put a
+                        // child in a bucket that is not its parent's.
+                        auto tuple = entityfy::detail::read_key_tuple(child, relation.local_columns);
+
+                        if(!tuple)
+                        {
+                            return true;
+                        }
+
+                        key = entityfy::detail::tuple_key(*tuple);
+                    }
+                    else
+                    {
+                        const auto local = entityfy::detail::read_column(child, relation.local_column);
+
+                        if(!local)
+                        {
+                            return true;
+                        }
+
+                        key = entityfy::detail::single_part_key(*local);
+                    }
+
+                    auto& stored = child_set.attach(std::move(child));
+                    grouped[key].push_back(&stored);
+                    return true;
+                }
+            );
+        }
 
         for(T* parent: parents)
         {
-            const auto key =
-                entityfy::detail::single_part_key(entityfy::detail::primary_key_value(*parent, parent_model));
+            row_key key;
+
+            if(composite_key)
+            {
+                auto tuple = entityfy::detail::read_key_tuple(*parent, relation.referenced_columns);
+
+                // A parent that does not expose its key columns cannot be
+                // referenced, so its bucket stays empty.
+                if(tuple)
+                {
+                    key = entityfy::detail::tuple_key(*tuple);
+                }
+            }
+            else
+            {
+                key = entityfy::detail::single_part_key(entityfy::detail::primary_key_value(*parent, parent_model));
+            }
+
             auto bucket = grouped[key];
 
             constexpr auto pointer_navigation = detail::find_member_of_type(^^T, ^^std::vector<Child*>);
@@ -2232,42 +2501,56 @@ public:
         const auto child_model = entityfy::describe_model<T>(dialect);
         const auto parent_model = entityfy::describe_model<Parent>(dialect);
         const auto& relation = entityfy::detail::find_relation<T, Parent>(child_model, parent_model);
+        const auto parent_key_names = entityfy::detail::primary_key_names(parent_model);
 
-        if(entityfy::primary_key_columns(parent_model).size() > 1)
+        if(!entityfy::detail::points_at_primary_key(relation, parent_key_names))
         {
-            throw std::logic_error{"entityfy: composite foreign keys are not supported yet (P1.5): relation from " +
-                                   child_model.table_name + " to " + parent_model.table_name};
-        }
-
-        const auto parent_key_column = entityfy::primary_key_column(parent_model).name;
-        if(relation.referenced_column != parent_key_column)
-        {
-            throw std::runtime_error{"entityfy: relation from " + child_model.table_name + " to " +
-                                     parent_model.table_name + " does not point at the primary key"};
+            entityfy::detail::throw_non_key_relation(child_model.table_name, parent_model.table_name);
         }
 
         constexpr auto lazy_navigation = detail::lazy_reference_member<T, Parent>();
 
-        std::vector<row_key> keys;
-        std::vector<entityfy::sql_value> binds;
+        // A composite key is compared as a whole tuple: a child that matches
+        // one column of it references no parent. A single-column relation keeps
+        // the original dedupe, IN list and bind order.
+        const bool                                    composite_key = parent_key_names.size() > 1;
+        std::vector<std::vector<entityfy::sql_value>> key_tuples;
+        std::unordered_set<row_key, row_key_hash>     seen_tuples;
 
-        for(auto* child: children)
+        if(composite_key)
         {
-            const auto key = entityfy::detail::read_column(*child, relation.local_column);
-            if(!key)
+            for(auto* child: children)
             {
-                continue;
-            }
+                auto tuple = entityfy::detail::read_key_tuple(*child, relation.local_columns);
 
-            const auto child_key = entityfy::detail::single_part_key(*key);
-            if(std::ranges::find(keys, child_key) == keys.end())
+                if(tuple)
+                {
+                    entityfy::detail::append_key_tuple(key_tuples, seen_tuples, std::move(*tuple));
+                }
+            }
+        }
+        else
+        {
+            std::vector<row_key> keys;
+
+            for(auto* child: children)
             {
-                keys.push_back(child_key);
-                binds.push_back(*key);
+                const auto key = entityfy::detail::read_column(*child, relation.local_column);
+                if(!key)
+                {
+                    continue;
+                }
+
+                const auto child_key = entityfy::detail::single_part_key(*key);
+                if(std::ranges::find(keys, child_key) == keys.end())
+                {
+                    keys.push_back(child_key);
+                    key_tuples.push_back({*key});
+                }
             }
         }
 
-        if(binds.empty())
+        if(key_tuples.empty())
         {
             for(auto* child: children)
             {
@@ -2296,20 +2579,39 @@ public:
             sql += entityfy::detail::quote_identifier(parent_model.columns[index].name);
         }
 
-        sql += " FROM " + entityfy::detail::quote_identifier(parent_model.table_name) + " WHERE " +
-               entityfy::detail::quote_identifier(parent_key_column) + " IN (";
+        sql += " FROM " + entityfy::detail::quote_identifier(parent_model.table_name) + " WHERE ";
 
-        for(std::size_t index = 0; index < binds.size(); ++index)
+        std::vector<entityfy::sql_value> binds;
+
+        if(composite_key)
         {
-            if(index != 0)
+            auto filter = entityfy::detail::tuple_filter(dialect, relation.referenced_columns, key_tuples);
+            sql += filter.sql;
+            binds = std::move(filter.binds);
+        }
+        else
+        {
+            sql += entityfy::detail::quote_identifier(relation.referenced_column) + " IN (";
+
+            for(std::size_t index = 0; index < key_tuples.size(); ++index)
             {
-                sql += ", ";
+                if(index != 0)
+                {
+                    sql += ", ";
+                }
+
+                sql += "?";
             }
 
-            sql += "?";
-        }
+            sql += ")";
 
-        sql += ")";
+            binds.reserve(key_tuples.size());
+
+            for(const auto& tuple: key_tuples)
+            {
+                binds.push_back(tuple.front());
+            }
+        }
 
         owner_->log(sql);
 
@@ -2320,22 +2622,39 @@ public:
             entityfy::statement{.sql = std::move(sql), .binds = std::move(binds)},
             [&](const entityfy::detail::row& row) {
                 auto value = entityfy::detail::materialize_row<Parent>(row);
-                const auto key = entityfy::detail::primary_key_value(value, parent_model);
+                const row_key key = composite_key
+                                        ? entityfy::detail::primary_key_of(value, parent_model)
+                                        : entityfy::detail::single_part_key(
+                                              entityfy::detail::primary_key_value(value, parent_model));
                 Parent& stored = parent_set.attach(std::move(value));
-                loaded[entityfy::detail::single_part_key(key)] = &stored;
+                loaded[key] = &stored;
                 return true;
             }
         );
 
         for(auto* child: children)
         {
-            const auto key = entityfy::detail::read_column(*child, relation.local_column);
             Parent* parent = nullptr;
 
-            if(key)
+            if(composite_key)
             {
-                const auto found = loaded.find(entityfy::detail::single_part_key(*key));
-                parent = found == loaded.end() ? nullptr : found->second;
+                auto tuple = entityfy::detail::read_key_tuple(*child, relation.local_columns);
+
+                if(tuple)
+                {
+                    const auto found = loaded.find(entityfy::detail::tuple_key(*tuple));
+                    parent = found == loaded.end() ? nullptr : found->second;
+                }
+            }
+            else
+            {
+                const auto key = entityfy::detail::read_column(*child, relation.local_column);
+
+                if(key)
+                {
+                    const auto found = loaded.find(entityfy::detail::single_part_key(*key));
+                    parent = found == loaded.end() ? nullptr : found->second;
+                }
             }
 
             if constexpr(lazy_navigation != std::meta::info{})

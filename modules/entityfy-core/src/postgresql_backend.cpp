@@ -1061,34 +1061,59 @@ public:
             output.indexes.emplace_back(std::move(index));
         }
 
+        // `constraint_column_usage` has one row per referenced column, so the
+        // information_schema join above produced the cartesian product of a
+        // composite key. The catalog keeps both key arrays in matching order;
+        // unnesting them pairwise with ordinality pairs every local column with
+        // its referenced column and keeps the key order.
         statement foreign_keys_statement;
         foreign_keys_statement.sql =
-            "SELECT kcu.column_name, ccu.table_name, ccu.column_name, rc.update_rule, rc.delete_rule "
-            "FROM information_schema.table_constraints tc "
-            "JOIN information_schema.key_column_usage kcu "
-            "ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
-            "JOIN information_schema.constraint_column_usage ccu "
-            "ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema "
+            "SELECT con.conname, local_col.attname, ref.relname, ref_col.attname, rc.update_rule, rc.delete_rule "
+            "FROM pg_constraint con "
+            "JOIN pg_class tbl ON tbl.oid = con.conrelid "
+            "JOIN pg_namespace nsp ON nsp.oid = tbl.relnamespace "
+            "JOIN pg_class ref ON ref.oid = con.confrelid "
+            "JOIN unnest(con.conkey, con.confkey) WITH ORDINALITY AS keys(local_attnum, ref_attnum, ordinality) "
+            "ON true "
+            "JOIN pg_attribute local_col ON local_col.attrelid = con.conrelid AND local_col.attnum = keys.local_attnum "
+            "JOIN pg_attribute ref_col ON ref_col.attrelid = con.confrelid AND ref_col.attnum = keys.ref_attnum "
             "JOIN information_schema.referential_constraints rc "
-            "ON rc.constraint_name = tc.constraint_name AND rc.constraint_schema = tc.table_schema "
-            "WHERE tc.constraint_type = 'FOREIGN KEY' "
-            "AND tc.table_schema = current_schema() AND tc.table_name = ?";
+            "ON rc.constraint_name = con.conname AND rc.constraint_schema = nsp.nspname "
+            "WHERE con.contype = 'f' AND nsp.nspname = current_schema() AND tbl.relname = ? "
+            "ORDER BY con.conname, keys.ordinality";
         foreign_keys_statement.binds.emplace_back(std::string{table});
 
+        std::string current_constraint;
         for(const auto& result_row: query(foreign_keys_statement))
         {
-            if(result_row.size() < 5)
+            if(result_row.size() < 6)
             {
                 continue;
             }
 
-            output.foreign_keys.emplace_back(foreign_key_info{
-                .column = value_to_string(result_row[0]),
-                .referenced_table = value_to_string(result_row[1]),
-                .referenced_column = value_to_string(result_row[2]),
-                .on_update = value_to_string(result_row[3]),
-                .on_delete = value_to_string(result_row[4]),
-            });
+            const auto constraint_name = value_to_string(result_row[0]);
+            const auto column = value_to_string(result_row[1]);
+            const auto referenced_table = value_to_string(result_row[2]);
+            const auto referenced_column = value_to_string(result_row[3]);
+
+            if(output.foreign_keys.empty() || current_constraint != constraint_name)
+            {
+                current_constraint = constraint_name;
+                output.foreign_keys.push_back(foreign_key_info{
+                    .column = column,
+                    .referenced_table = referenced_table,
+                    .referenced_column = referenced_column,
+                    .on_update = value_to_string(result_row[4]),
+                    .on_delete = value_to_string(result_row[5]),
+                    .columns = {column},
+                    .referenced_columns = {referenced_column},
+                });
+                continue;
+            }
+
+            auto& foreign_key = output.foreign_keys.back();
+            foreign_key.columns.push_back(column);
+            foreign_key.referenced_columns.push_back(referenced_column);
         }
 
         return output;
@@ -1251,8 +1276,10 @@ private:
 
     // Runs a statement, preferring the prepared plan. A prepared statement can
     // disappear underneath us (PREPARE is undone when the transaction that ran
-    // it rolls back), so a failed prepared call falls back to the plain path
-    // and forgets the plan instead of surfacing a confusing error.
+    // it rolls back), so *that* failure falls back to the plain path and
+    // forgets the plan. Any other error - a constraint violation, for example -
+    // is the statement's real outcome: retrying it inside the same transaction
+    // would only replace it with "current transaction is aborted".
     [[nodiscard]] pg_result_ptr run_statement(const std::string& sql,
                                               const std::string& prepared,
                                               const pg_parameters& bound)
@@ -1266,8 +1293,13 @@ private:
         {
             return execute_prepared(prepared, bound);
         }
-        catch(const std::exception&)
+        catch(const pg_statement_error& error)
         {
+            if(error.sqlstate() != "26000")
+            {
+                throw;
+            }
+
             forget_statement(sql);
             return execute_params(sql, bound);
         }
@@ -1631,6 +1663,14 @@ private:
 
     void deallocate_locked(const std::string& name) noexcept
     {
+        // In an aborted transaction the server rejects every command, including
+        // DEALLOCATE. Forgetting the plan locally is enough: the transaction's
+        // ROLLBACK removes the server-side prepared statement anyway.
+        if(PQtransactionStatus(connection_.get()) == PQTRANS_INERROR)
+        {
+            return;
+        }
+
         try
         {
             pg_result_ptr result{PQexec(connection_.get(), ("DEALLOCATE \"" + name + "\"").c_str())};

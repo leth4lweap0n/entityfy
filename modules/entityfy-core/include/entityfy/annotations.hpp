@@ -83,6 +83,11 @@ struct references
     annotation_text column = "id";
     annotation_text on_delete;
     annotation_text on_update;
+    // Non-zero: this column is one part of one composite foreign key together
+    // with every other column carrying the same group number. The members are
+    // emitted once as a table-level FOREIGN KEY and get no column-level
+    // REFERENCES clause.
+    int group = 0;
 };
 
 struct varchar

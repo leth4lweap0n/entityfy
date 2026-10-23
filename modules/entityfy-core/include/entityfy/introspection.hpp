@@ -28,11 +28,20 @@ struct index_info
 
 struct foreign_key_info
 {
+    // First entry of `columns`; kept for call sites that only look at one
+    // column of the key.
     std::string column{};
     std::string referenced_table{};
+    // First entry of `referenced_columns`, matching `column`.
     std::string referenced_column{};
     std::string on_update{};
     std::string on_delete{};
+    // Local and referenced columns of the whole key in key order. A
+    // single-column key has one-element lists. Providers that cannot report
+    // key positions leave both empty; consumers then fall back to `column` and
+    // `referenced_column`.
+    std::vector<std::string> columns{};
+    std::vector<std::string> referenced_columns{};
 };
 
 struct table_info

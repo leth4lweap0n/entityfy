@@ -40,6 +40,19 @@ inline void append_joined_identifiers(std::string& output, const std::vector<col
     }
 }
 
+inline void append_joined_quoted_identifiers(std::string& output, const std::vector<std::string>& identifiers)
+{
+    for(std::size_t index = 0; index < identifiers.size(); ++index)
+    {
+        if(index != 0)
+        {
+            output.append(", ");
+        }
+
+        output.append(quote_identifier(identifiers[index]));
+    }
+}
+
 inline void append_placeholders(std::string& output, std::size_t count)
 {
     for(std::size_t index = 0; index < count; ++index)
@@ -223,6 +236,39 @@ inline void append_query_tail(std::string& sql,
     }
 }
 
+// Referential action with the T-SQL spelling. T-SQL has no RESTRICT keyword;
+// NO ACTION means the same thing.
+inline const std::string& reference_action(dialect target, const std::string& value)
+{
+    static const std::string no_action{"NO ACTION"};
+    return target == dialect::sqlserver && value == "RESTRICT" ? no_action : value;
+}
+
+// One table-level FOREIGN KEY clause for a composite relation. Single-column
+// relations keep their column-level REFERENCES clause.
+inline void append_relation_reference_sql(std::string& output, const relation_descriptor& relation, dialect target)
+{
+    output.append("FOREIGN KEY (");
+    append_joined_quoted_identifiers(output, relation.local_columns);
+    output.append(") REFERENCES ");
+    output.append(quote_identifier(relation.referenced_table));
+    output.append(" (");
+    append_joined_quoted_identifiers(output, relation.referenced_columns);
+    output.push_back(')');
+
+    if(!relation.on_delete.empty())
+    {
+        output.append(" ON DELETE ");
+        output.append(reference_action(target, relation.on_delete));
+    }
+
+    if(!relation.on_update.empty())
+    {
+        output.append(" ON UPDATE ");
+        output.append(reference_action(target, relation.on_update));
+    }
+}
+
 inline std::string column_definition(const column_descriptor& column, dialect target, bool alter_table, bool column_level_primary_key)
 {
     std::string output = quote_identifier(column.name);
@@ -277,7 +323,9 @@ inline std::string column_definition(const column_descriptor& column, dialect ta
         output.push_back(')');
     }
 
-    if(column.has_reference)
+    // Group members are emitted once as a table-level FOREIGN KEY, so a column
+    // that joins a composite group carries no clause of its own.
+    if(column.has_reference && column.reference.group == 0)
     {
         output.append(" REFERENCES ");
         output.append(quote_identifier(column.reference.table));
@@ -285,22 +333,16 @@ inline std::string column_definition(const column_descriptor& column, dialect ta
         output.append(quote_identifier(column.reference.column));
         output.push_back(')');
 
-        const auto action = [&](const std::string& value) -> const std::string& {
-            static const std::string no_action{"NO ACTION"};
-            // T-SQL has no RESTRICT keyword; NO ACTION means the same thing.
-            return target == dialect::sqlserver && value == "RESTRICT" ? no_action : value;
-        };
-
         if(!column.reference.on_delete.empty())
         {
             output.append(" ON DELETE ");
-            output.append(action(column.reference.on_delete));
+            output.append(reference_action(target, column.reference.on_delete));
         }
 
         if(!column.reference.on_update.empty())
         {
             output.append(" ON UPDATE ");
-            output.append(action(column.reference.on_update));
+            output.append(reference_action(target, column.reference.on_update));
         }
     }
 
@@ -382,6 +424,19 @@ template <typename Model>
         output.sql.append(", PRIMARY KEY (");
         detail::append_joined_identifiers(output.sql, key_columns);
         output.sql.push_back(')');
+    }
+
+    // A composite foreign key is one table-level constraint; single-column
+    // relations stay in their column definition.
+    for(const auto& relation: model.relations)
+    {
+        if(relation.local_columns.size() < 2)
+        {
+            continue;
+        }
+
+        output.sql.append(", ");
+        detail::append_relation_reference_sql(output.sql, relation, model.target);
     }
 
     output.sql.push_back(')');

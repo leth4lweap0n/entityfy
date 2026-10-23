@@ -278,8 +278,9 @@ struct [[= entityfy::table{"lz_notes"}]] lz_note
     entityfy::lazy<lz_user> author;
 };
 
-// Composite owner keys cannot be expressed by a one-column foreign key yet
-// (P1.5), so binding them is an explicit error instead of a wrong key.
+// A one-column foreign key can only name part of this two-column key, so the
+// relation does not point at the primary key and is not navigable: binding it
+// is an explicit error instead of a silently wrong key.
 struct [[= entityfy::table{"lz_pair_posts"}]] lz_pair_post
 {
     [[= entityfy::primary_key, = entityfy::auto_increment]]
@@ -301,8 +302,8 @@ struct [[= entityfy::table{"lz_pair_rows"}]] lz_pair_row
     entityfy::lazy<std::vector<lz_pair_post>> children;
 };
 
-// The reference direction of the same limitation: the parent's key has two
-// columns, so a one-column foreign key cannot name it (P1.5).
+// The reference direction of the same shape: the parent's key has two columns
+// and the one-column foreign key names only `id`, so it is not navigable.
 struct [[= entityfy::table{"lz_pair_children"}]] lz_pair_child
 {
     [[= entityfy::primary_key, = entityfy::auto_increment]]
@@ -313,6 +314,45 @@ struct [[= entityfy::table{"lz_pair_children"}]] lz_pair_child
 
     [[= entityfy::ignore]]
     entityfy::lazy<lz_pair_row> pair;
+};
+
+// Composite navigation: the two columns of cn_parent's key are its identity,
+// and the child names both of them in one grouped reference. include,
+// include_parent and the lazy handles resolve the key as a single tuple, so a
+// child that matches only one column never joins the wrong parent.
+struct cn_child;
+
+struct [[= entityfy::table{"cn_parents"}]] cn_parent
+{
+    [[= entityfy::primary_key]]
+    std::int64_t tenant_id = 0;
+
+    [[= entityfy::primary_key, = entityfy::varchar{16}]]
+    std::string code;
+
+    [[= entityfy::not_null, = entityfy::varchar{120}]]
+    std::string name;
+
+    [[= entityfy::ignore]]
+    entityfy::lazy<std::vector<cn_child>> children;
+};
+
+struct [[= entityfy::table{"cn_children"}]] cn_child
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::not_null, = entityfy::references{"cn_parents", "tenant_id", "RESTRICT", "", 1}]]
+    std::int64_t tenant_id = 0;
+
+    [[= entityfy::not_null, = entityfy::varchar{16}, = entityfy::references{"cn_parents", "code", "RESTRICT", "", 1}]]
+    std::string parent_code;
+
+    [[= entityfy::not_null, = entityfy::varchar{120}]]
+    std::string label;
+
+    [[= entityfy::ignore]]
+    entityfy::lazy<cn_parent> parent;
 };
 
 // EF Core style context: the sets are declared once, the framework derives
@@ -359,6 +399,10 @@ bool postgres_required()
     const char* value = std::getenv("ENTITYFY_REQUIRE_PG");
     return value != nullptr && std::string{value} == "1";
 }
+
+// Shared by the SQLite entry point and the PostgreSQL checks, so both targets
+// run the same composite-key assertions.
+void run_composite_navigation_scenario(entityfy::db_context& ctx);
 
 status run_ef_surface_checks()
 {
@@ -2288,6 +2332,13 @@ status run_postgres_checks()
     require(!after_rollback.empty(), "pg query recovers after a rolled back PREPARE");
     require(database.statement_cache_size() == 1, "pg recovered plan is cached again");
 
+    // --- composite key navigation ---
+    ctx.execute("DROP TABLE IF EXISTS \"cn_children\" CASCADE");
+    ctx.execute("DROP TABLE IF EXISTS \"cn_parents\" CASCADE");
+    run_composite_navigation_scenario(ctx);
+    ctx.execute("DROP TABLE IF EXISTS \"cn_children\" CASCADE");
+    ctx.execute("DROP TABLE IF EXISTS \"cn_parents\" CASCADE");
+
     ctx.execute("DROP TABLE IF EXISTS \"rc_children\" CASCADE");
     ctx.execute("DROP TABLE IF EXISTS \"rc_parents\" CASCADE");
     ctx.execute("DROP TABLE IF EXISTS \"rc_tags\" CASCADE");
@@ -2504,6 +2555,148 @@ status run_sqlserver_checks()
     {
         ctx.execute(std::string{"IF OBJECT_ID(N'dbo."} + table + "', N'U') IS NOT NULL DROP TABLE dbo." + table);
     }
+
+    return status::passed;
+}
+
+// Composite-key navigation over one context. The assertions are dialect
+// neutral, so the SQLite run and the PostgreSQL run exercise the same
+// behaviour: the tuple predicate and the loaders do not special-case a target.
+void run_composite_navigation_scenario(entityfy::db_context& ctx)
+{
+    ctx.migrate<cn_parent>();
+    ctx.migrate<cn_child>();
+
+    std::vector<std::string> statements;
+    ctx.set_logger([&](std::string_view sql) { statements.emplace_back(sql); });
+
+    auto parents = ctx.set<cn_parent>();
+    auto children = ctx.set<cn_child>();
+
+    auto& one_a = parents.add(cn_parent{.tenant_id = 1, .code = "a", .name = "one-a"});
+    auto& one_b = parents.add(cn_parent{.tenant_id = 1, .code = "b", .name = "one-b"});
+    auto& two_a = parents.add(cn_parent{.tenant_id = 2, .code = "a", .name = "two-a"});
+    require(ctx.save_changes().inserted == 3, "composite parents are inserted");
+
+    auto& a1 = children.add(cn_child{.tenant_id = 1, .parent_code = "a", .label = "a1"});
+    auto& a2 = children.add(cn_child{.tenant_id = 1, .parent_code = "a", .label = "a2"});
+    auto& b1 = children.add(cn_child{.tenant_id = 1, .parent_code = "b", .label = "b1"});
+    auto& c1 = children.add(cn_child{.tenant_id = 2, .parent_code = "a", .label = "two-a"});
+    require(ctx.save_changes().inserted == 4, "composite children are inserted");
+    require(a1.id != 0 && b1.id != 0 && c1.id != 0, "composite children got generated ids");
+
+    const auto key_one_a = entityfy::row_key{entityfy::sql_value{std::int64_t{1}},
+                                             entityfy::sql_value{std::string{"a"}}};
+
+    require(parents.find(key_one_a) == &one_a, "find locates the composite parent");
+
+    // include: the whole referenced tuple selects the children, so neither the
+    // same tenant with another code nor the same code in another tenant leaks
+    // into the bucket.
+    statements.clear();
+    const auto included = parents.include<cn_child>({&one_a});
+    require(included.size() == 1 && included.front().first == &one_a, "composite include maps the parent");
+    const auto& bucket = included.front().second;
+    require(bucket.size() == 2, "composite include loads the key's children");
+    require(std::ranges::find(bucket, &a1) != bucket.end() && std::ranges::find(bucket, &a2) != bucket.end(),
+            "composite include loads exactly the key's children");
+    require(std::ranges::find(bucket, &b1) == bucket.end(), "a same-tenant child with another code is excluded");
+    require(std::ranges::find(bucket, &c1) == bucket.end(), "a same-code child from another tenant is excluded");
+    require(statements.size() == 1 && statements.front().rfind("SELECT", 0) == 0,
+            "composite include issues one select");
+    require(statements.front().find("\"tenant_id\" = ? AND \"parent_code\" = ?") != std::string::npos,
+            "a single parent key is a conjunction of every key column");
+    require(one_a.children.is_loaded() && one_a.children.get() == bucket,
+            "include caches the composite bucket on the lazy handle");
+
+    // Two distinct parent keys become one row value IN, still bound in column
+    // order.
+    statements.clear();
+    const auto multi = parents.include<cn_child>({&one_a, &two_a});
+    require(multi.size() == 2, "composite include maps every parent");
+    require(multi[0].second.size() == 2 && multi[1].second.size() == 1, "each composite owner gets its own bucket");
+    require(std::ranges::find(multi[1].second, &c1) != multi[1].second.end(), "the second tenant gets its child");
+    require(statements.size() == 1, "a multi-owner composite include issues one select");
+    require(statements.front().find("(\"tenant_id\", \"parent_code\") IN ((?, ?), (?, ?))") != std::string::npos,
+            "several parent keys are one row value IN bound in column order");
+
+    // include_parent resolves the parent of a composite child by the whole
+    // referenced tuple.
+    statements.clear();
+    const auto resolved = children.include_parent<cn_parent>({&a1, &b1, &c1});
+    require(resolved.size() == 3, "composite include_parent maps every child");
+    require(resolved[0].second == &one_a, "include_parent resolves the (1, a) parent");
+    require(resolved[1].second == &one_b, "include_parent resolves the (1, b) parent");
+    require(resolved[2].second == &two_a, "include_parent resolves the (2, a) parent");
+    require(statements.size() == 1 && statements.front().rfind("SELECT", 0) == 0,
+            "composite include_parent issues one select");
+    require(statements.front().find("(\"tenant_id\", \"code\") IN ((?, ?), (?, ?), (?, ?))") != std::string::npos,
+            "include_parent compares the whole referenced tuple");
+    require(a1.parent.get() == &one_a, "include_parent caches the resolved parent on the handle");
+
+    // Lazy collection: the handle is bound to every key part and filters on the
+    // child's whole foreign key.
+    require(one_a.children.keys().size() == 2, "the collection handle binds every owner key part");
+    require(as_integer(one_a.children.keys()[0]) == 1 && std::get<std::string>(one_a.children.keys()[1]) == "a",
+            "the collection handle binds the owner key in column order");
+
+    one_a.children.reset();
+    statements.clear();
+    const auto& loaded = one_a.children.get();
+    require(loaded.size() == 2, "the lazy collection loads the key's children");
+    require(std::ranges::find(loaded, &b1) == loaded.end(), "the lazy collection does not load another key's child");
+    require(statements.size() == 1, "the lazy collection issues one statement");
+    require(statements.front().find("\"tenant_id\" = ? AND \"parent_code\" = ?") != std::string::npos,
+            "the lazy collection filters on every foreign key column");
+
+    statements.clear();
+    require(&one_a.children.get() == &loaded, "the second collection access returns the cache");
+    require(statements.empty(), "the second collection access issues no SQL");
+
+    // Lazy reference: the handle carries every foreign key part and resolves
+    // the same tracked parent find() returns.
+    require(a1.parent.keys().size() == 2, "the reference handle binds every foreign key part");
+    require(as_integer(a1.parent.keys()[0]) == 1 && std::get<std::string>(a1.parent.keys()[1]) == "a",
+            "the reference handle binds the foreign key in column order");
+
+    a1.parent.reset();
+    statements.clear();
+    auto* resolved_parent = a1.parent.get();
+    require(resolved_parent == &one_a, "the lazy reference resolves the composite parent");
+    require(resolved_parent == parents.find(key_one_a), "the lazy reference and find() agree on the parent");
+    require(statements.empty(), "a tracked parent is served from the identity map");
+
+    statements.clear();
+    require(a1.parent.get() == resolved_parent, "the second reference access returns the cache");
+    require(statements.empty(), "the second reference access issues no SQL");
+
+    // A complete, existing tuple inserts; a child whose local tuple shares only
+    // the tenant part is rejected by the composite foreign key.
+    auto& valid = children.add(cn_child{.tenant_id = 1, .parent_code = "b", .label = "valid"});
+    require(ctx.save_changes().inserted == 1, "a complete composite reference inserts");
+    require(valid.id != 0, "the valid child got a generated id");
+
+    children.add(cn_child{.tenant_id = 1, .parent_code = "zzz", .label = "orphan"});
+    bool rejected = false;
+    try
+    {
+        ctx.save_changes();
+    }
+    catch(const entityfy::foreign_key_violation&)
+    {
+        rejected = true;
+    }
+    require(rejected, "a partial-key orphan violates the composite foreign key");
+
+    // The context may outlive the scenario (PostgreSQL drops the tables after
+    // this function), so the logger must not keep a reference to a local.
+    ctx.set_logger({});
+}
+
+status run_composite_navigation_checks()
+{
+    entityfy::db_context ctx{"sqlite://:memory:"};
+    run_composite_navigation_scenario(ctx);
 
     return status::passed;
 }
@@ -2825,33 +3018,32 @@ status run_lazy_loading_checks()
     require(no_children.empty(), "an owner without children loads an empty collection");
     require(statements.size() == 1, "the empty collection is one statement, not an error");
 
-    // Composite owner keys are rejected up front instead of binding a key the
-    // one-column relation cannot express (P1.5).
+    // A relation that names only one column of a two-column key does not point
+    // at the primary key, so binding it is an explicit error.
     auto pairs = ctx.set<lz_pair_row>();
     bool composite = false;
     try
     {
         pairs.add(lz_pair_row{.id = 1, .region = 2});
     }
-    catch(const std::logic_error& error)
+    catch(const std::runtime_error& error)
     {
-        composite = std::string{error.what()}.find("P1.5") != std::string::npos;
+        composite = std::string{error.what()}.find("does not point at the primary key") != std::string::npos;
     }
-    require(composite, "a composite owner key is an explicit logic_error");
+    require(composite, "a relation to part of a composite key is an explicit error");
 
-    // The reference direction of the same limitation: a parent with a two
-    // column key cannot be named by the one-column foreign key (P1.5).
+    // The reference direction of the same shape.
     auto pair_children = ctx.set<lz_pair_child>();
     bool composite_parent = false;
     try
     {
         pair_children.add(lz_pair_child{.pair_id = 1});
     }
-    catch(const std::logic_error& error)
+    catch(const std::runtime_error& error)
     {
-        composite_parent = std::string{error.what()}.find("P1.5") != std::string::npos;
+        composite_parent = std::string{error.what()}.find("does not point at the primary key") != std::string::npos;
     }
-    require(composite_parent, "a composite parent key is an explicit logic_error");
+    require(composite_parent, "a reference to part of a composite key is an explicit error");
 
     // Eager loading fills the lazy handle from the rows the include query
     // already returned, so a later access never issues a second query. The
@@ -2954,6 +3146,7 @@ int main()
         {"column_alias_version", run_column_alias_version_checks},
         {"no_tracking", run_no_tracking_checks},
         {"lazy_loading", run_lazy_loading_checks},
+        {"composite_navigation", run_composite_navigation_checks},
         {"manual_tracking", run_manual_tracking_checks},
         {"batch", run_batch_checks},
         {"dependency", run_dependency_checks},
@@ -2969,8 +3162,15 @@ int main()
     int skipped = 0;
     int failed = 0;
 
+    const char* only_scenario = std::getenv("ENTITYFY_ONLY_SCENARIO");
+
     for(const auto& current: entries)
     {
+        if(only_scenario != nullptr && std::string_view{only_scenario} != current.name)
+        {
+            continue;
+        }
+
         try
         {
             const auto result = current.run();

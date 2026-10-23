@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -434,13 +435,60 @@ template <typename Model>
     return found == table.indexes.end() ? nullptr : &*found;
 }
 
+// A provider that cannot report key positions fills only the singular field.
+// The list is then the same one-element key, so both representations are read
+// through one view.
+[[nodiscard]] inline std::span<const std::string> key_columns(
+    const std::vector<std::string>& columns,
+    const std::string& single_column
+) noexcept
+{
+    if(!columns.empty())
+    {
+        return std::span<const std::string>{columns};
+    }
+
+    if(single_column.empty())
+    {
+        return {};
+    }
+
+    return std::span<const std::string>{&single_column, 1};
+}
+
+[[nodiscard]] inline std::span<const std::string> foreign_key_local_columns(const foreign_key_info& foreign_key) noexcept
+{
+    return key_columns(foreign_key.columns, foreign_key.column);
+}
+
+[[nodiscard]] inline std::span<const std::string> foreign_key_referenced_columns(
+    const foreign_key_info& foreign_key
+) noexcept
+{
+    return key_columns(foreign_key.referenced_columns, foreign_key.referenced_column);
+}
+
+[[nodiscard]] inline std::span<const std::string> relation_local_columns(const relation_descriptor& relation) noexcept
+{
+    return key_columns(relation.local_columns, relation.local_column);
+}
+
+[[nodiscard]] inline std::span<const std::string> relation_referenced_columns(
+    const relation_descriptor& relation
+) noexcept
+{
+    return key_columns(relation.referenced_columns, relation.referenced_column);
+}
+
+// Locates the key by its whole local column list in key order. A single-column
+// key matches the one-element list a provider fills from its singular field.
 [[nodiscard]] inline const foreign_key_info* find_foreign_key(
     const table_info& table,
-    std::string_view column_name
+    std::span<const std::string> column_names
 )
 {
     const auto found = std::ranges::find_if(table.foreign_keys, [&](const foreign_key_info& foreign_key) {
-        return foreign_key.column == column_name;
+        return std::ranges::equal(foreign_key_local_columns(foreign_key), column_names);
     });
 
     return found == table.foreign_keys.end() ? nullptr : &*found;
@@ -481,7 +529,7 @@ template <typename Model>
     return names;
 }
 
-[[nodiscard]] inline std::string join_column_names(const std::vector<std::string>& names)
+[[nodiscard]] inline std::string join_column_names(std::span<const std::string> names)
 {
     std::string output;
     for(const auto& name: names)
@@ -495,6 +543,15 @@ template <typename Model>
     }
 
     return output;
+}
+
+// `table(column, column)` form used by the foreign-key diagnostics.
+[[nodiscard]] inline std::string foreign_key_target_text(
+    std::string_view table,
+    std::span<const std::string> columns
+)
+{
+    return std::string{table} + "(" + join_column_names(columns) + ")";
 }
 
 } // namespace detail
@@ -696,23 +753,35 @@ template <typename Model>
     {
         for(const auto& expected_relation: model.relations)
         {
-            const auto* actual_foreign_key = detail::find_foreign_key(table, expected_relation.local_column);
+            const auto expected_local_columns = detail::relation_local_columns(expected_relation);
+            const auto expected_referenced_columns = detail::relation_referenced_columns(expected_relation);
+            const auto object_name = detail::join_column_names(expected_local_columns);
+            const auto expected_target =
+                detail::foreign_key_target_text(expected_relation.referenced_table, expected_referenced_columns);
+
+            const auto* actual_foreign_key = detail::find_foreign_key(table, expected_local_columns);
             if(actual_foreign_key == nullptr)
             {
                 detail::add_schema_issue(
                     result,
                     schema_issue_kind::missing_foreign_key,
-                    expected_relation.local_column,
-                    expected_relation.referenced_table + "(" + expected_relation.referenced_column + ")",
+                    object_name,
+                    expected_target,
                     "missing",
-                    "model expects a foreign key that is missing in the database table"
+                    "model expects a foreign key on (" + object_name + ") referencing " + expected_target +
+                        " that is missing in the database table"
                 );
                 continue;
             }
 
+            const auto actual_referenced_columns =
+                detail::foreign_key_referenced_columns(*actual_foreign_key);
+            const auto actual_target =
+                detail::foreign_key_target_text(actual_foreign_key->referenced_table, actual_referenced_columns);
+
             const bool target_matches =
                 actual_foreign_key->referenced_table == expected_relation.referenced_table &&
-                actual_foreign_key->referenced_column == expected_relation.referenced_column;
+                std::ranges::equal(actual_referenced_columns, expected_referenced_columns);
             const bool action_matches =
                 detail::normalize_action(actual_foreign_key->on_delete) == detail::normalize_action(expected_relation.on_delete) &&
                 detail::normalize_action(actual_foreign_key->on_update) == detail::normalize_action(expected_relation.on_update);
@@ -722,11 +791,11 @@ template <typename Model>
                 detail::add_schema_issue(
                     result,
                     schema_issue_kind::foreign_key_mismatch,
-                    expected_relation.local_column,
-                    expected_relation.referenced_table + "(" + expected_relation.referenced_column + ") ON DELETE " +
+                    object_name,
+                    expected_target + " ON DELETE " +
                         detail::normalize_action(expected_relation.on_delete) + " ON UPDATE " +
                         detail::normalize_action(expected_relation.on_update),
-                    actual_foreign_key->referenced_table + "(" + actual_foreign_key->referenced_column + ") ON DELETE " +
+                    actual_target + " ON DELETE " +
                         detail::normalize_action(actual_foreign_key->on_delete) + " ON UPDATE " +
                         detail::normalize_action(actual_foreign_key->on_update),
                     "foreign-key target or action differs from the model"
