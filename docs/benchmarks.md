@@ -165,8 +165,12 @@ parameter limit (15 chunks):
 | Path | Throughput |
 |---|---:|
 | one round trip per chunk | 114k rows/s |
-| pipelined chunks | 119–124k rows/s |
-| Gain | 1,05–1,08x |
+| pipelined chunks | 129–142k rows/s |
+| Gain | 1,1–1,25x |
+
+The chunks use cached prepared plans only when every distinct chunk text fits in the statement
+cache; a smaller cache makes the batch send the texts unprepared instead of risking a plan that was
+evicted while the batch was being prepared.
 
 On localhost the saved round trips are a small share of the total; the gain grows with latency
 and with the number of chunks (a remote server or a smaller batch limit).

@@ -134,3 +134,36 @@ TEST_CASE("postgres serialization failure carries the typed error", "[postgresql
     second.execute(entityfy::statement{.sql = "ROLLBACK"});
     setup.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"pg_serial_race\""});
 }
+
+TEST_CASE("postgres insert_many keeps a one entry statement cache valid",
+          "[postgresql][backend][batch][cache]")
+{
+    const char* uri = std::getenv("ENTITYFY_PG_URI");
+    if(uri == nullptr || std::string{uri}.empty())
+    {
+        SKIP("ENTITYFY_PG_URI is not set");
+    }
+
+    entityfy::client db{uri};
+    db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"pg_batch_items\""});
+    db.migrate<pg_batch_item>();
+
+    // Ten rows per chunk; 401 rows make the last chunk shorter, so the batch has
+    // two distinct SQL texts while the cache only holds one plan.
+    db.set_batch_parameter_limit(20);
+    db.set_statement_cache_capacity(1);
+
+    std::vector<pg_batch_item> models;
+    models.reserve(401);
+
+    for(std::int64_t index = 0; index < 401; ++index)
+    {
+        models.push_back(pg_batch_item{.id = index + 1, .name = "item " + std::to_string(index)});
+    }
+
+    const auto inserted = db.insert_many(models);
+    REQUIRE(inserted.rows_affected == 401);
+    REQUIRE(db.count<pg_batch_item>() == 401);
+
+    db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"pg_batch_items\""});
+}

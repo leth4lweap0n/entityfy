@@ -286,8 +286,9 @@ db.clear_statement_cache();
 
 SQLite reuses compiled statements, PostgreSQL keeps a bounded cache of named server side
 `PREPARE` plans, MySQL caches `MYSQL_STMT` handles (reset before reuse), and SQL Server caches
-ODBC statements (cursor closed and parameter bindings reset before reuse). Details
-and measurements: [benchmarks.md](benchmarks.md).
+ODBC statements (cursor closed and parameter bindings reset before reuse). PostgreSQL batched
+inserts use that cache only when every distinct chunk text fits; otherwise the chunks travel
+unprepared inside the pipeline. Details and measurements: [benchmarks.md](benchmarks.md).
 
 ## Errors
 

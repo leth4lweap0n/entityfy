@@ -33,8 +33,7 @@ public:
 
     // Runs several independent statements in order. The default executes them
     // one by one; PostgreSQL overrides it with a protocol pipeline so the
-    // statements travel in one round trip (prepared statements are cached as
-    // they are for single statements).
+    // statements travel in one round trip.
     [[nodiscard]] virtual std::vector<execution_result> execute_batch(
         const std::vector<entityfy::statement>& statements)
     {

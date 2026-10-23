@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cstdint>
 #include <functional>
+#include <set>
 #include <list>
 #include <mutex>
 #include <memory>
@@ -438,16 +439,31 @@ public:
         try
         {
             std::vector<std::string> sqls;
-            std::vector<std::string> prepared_names;
             sqls.reserve(statements.size());
-            prepared_names.reserve(statements.size());
 
-            // PREPARE has to happen before the pipeline starts; a prepared
-            // statement can then be sent inside it.
             for(const auto& entry: statements)
             {
                 sqls.push_back(postgres_placeholders(entry.sql));
-                prepared_names.push_back(statement_name_for(sqls.back()));
+            }
+
+            // Prepared plans are used only when every distinct text fits in the
+            // cache: preparing more would evict an earlier chunk's plan and the
+            // pipeline would then send a name the server no longer knows.
+            std::vector<std::string> prepared_names(statements.size());
+            bool use_prepared = capacity_ != 0;
+
+            if(use_prepared)
+            {
+                std::set<std::string> distinct{sqls.begin(), sqls.end()};
+                use_prepared = distinct.size() <= capacity_;
+
+                if(use_prepared)
+                {
+                    for(std::size_t index = 0; index < statements.size(); ++index)
+                    {
+                        prepared_names[index] = statement_name_for(sqls[index]);
+                    }
+                }
             }
 
             auto pipe = connection_->pipeline();
@@ -465,7 +481,12 @@ public:
                     tao::pq::parameter<max_pg_parameters> bound;
                     bind_parameters(bound, parameters);
 
-                    pipe->send(prepared_names[index].empty() ? sqls[index] : prepared_names[index], bound);
+                    const std::string& prepared = prepared_names[index];
+                    const auto         cached = index_.find(sqls[index]);
+                    const bool         usable =
+                        !prepared.empty() && cached != index_.end() && cached->second->second == prepared;
+
+                    pipe->send(usable ? prepared : sqls[index], bound);
                 }
 
                 pipe->sync();

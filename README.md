@@ -304,7 +304,7 @@ the ratios are more stable.
 ctest --preset release
 ```
 
-54 CTest entries in the default build: 52 core Catch2 test cases (257 assertions with
+55 CTest entries in the default build: 53 core Catch2 test cases (259 assertions with
 PostgreSQL enabled) and the migrate/context test binaries - which contain 10 and 21 scenarios
 respectively. Each opt-in backend (`ENTITYFY_ENABLE_MYSQL`, `ENTITYFY_ENABLE_SQLSERVER`) adds
 three core cases (two backend tests and a statement cache test) and one scenario to the migrate
