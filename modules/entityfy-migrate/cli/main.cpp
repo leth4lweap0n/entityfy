@@ -173,17 +173,29 @@ std::string provider_from_uri(const std::string& uri)
         return "postgres";
     }
 
+    if(uri.starts_with("mysql://"))
+    {
+        return "mysql";
+    }
+
+    if(uri.starts_with("sqlserver://") || uri.starts_with("mssql://"))
+    {
+        return "sqlserver";
+    }
+
     if(uri.starts_with("sqlite://"))
     {
         return "sqlite";
     }
 
-    if(uri.empty())
+    if(uri.find("://") == std::string::npos)
     {
-        return {};
+        return "sqlite";
     }
 
-    return "sqlite";
+    // An unknown scheme keeps the explicit --provider instead of silently
+    // falling back to SQLite.
+    return {};
 }
 
 std::string normalize_database_uri(std::string uri)
