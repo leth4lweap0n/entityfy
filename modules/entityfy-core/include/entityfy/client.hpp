@@ -26,6 +26,11 @@
 namespace entityfy
 {
 
+// What the backend behind a client can do asynchronously. Callers branch on
+// this before using the async entry points: `unsupported` means those calls
+// reject instead of quietly running synchronously.
+using async_capability = detail::async_capability;
+
 class client
 {
 public:
@@ -41,6 +46,11 @@ public:
     [[nodiscard]] dialect target_dialect() const noexcept
     {
         return backend_->target_dialect();
+    }
+
+    [[nodiscard]] async_capability async_mode() const noexcept
+    {
+        return backend_->async_mode();
     }
 
     [[nodiscard]] table_info inspect_table(std::string_view table)
@@ -482,6 +492,43 @@ public:
     void query_each(const statement& input, const std::function<bool(const detail::row&)>& consumer)
     {
         backend_->query_each(input, consumer);
+    }
+
+    // Asynchronous counterparts: the same statements travel through the
+    // backend's own async path, so SQL generation and key work stay shared. A
+    // backend without async support throws the backend's logic_error instead of
+    // falling back to a synchronous call.
+    [[nodiscard]] task<detail::execution_result> execute_async(const statement& input)
+    {
+        return backend_->execute_async(input);
+    }
+
+    [[nodiscard]] task<std::vector<detail::row>> query_async(const statement& input)
+    {
+        return backend_->query_async(input);
+    }
+
+    [[nodiscard]] task<std::vector<detail::execution_result>> execute_batch_async(
+        const std::vector<statement>& input)
+    {
+        return backend_->execute_batch_async(input);
+    }
+
+    // One asynchronous query, then the consumer sees its rows in order. The
+    // batch is already fully loaded when the consumer runs, so a half-loaded row
+    // is never handed out; returning false stops before the remaining rows.
+    [[nodiscard]] task<void> query_each_async(const statement& input,
+                                              std::function<bool(const detail::row&)> consumer)
+    {
+        return query_async(input).then([consumer = std::move(consumer)](std::vector<detail::row> rows) {
+            for(const auto& current: rows)
+            {
+                if(!consumer(current))
+                {
+                    break;
+                }
+            }
+        });
     }
 
     // Prepared statement cache. The SQLite backend keeps compiled statements

@@ -153,6 +153,24 @@ public:
         return insert(model);
     }
 
+    // Async counterparts reuse the sync statement builders and only convert the
+    // driver result inside the continuation, so both paths run the same SQL.
+    [[nodiscard]] task<insert_result> insert_async(const Model& model)
+    {
+        return backend_->execute_async(insert_statement(model, model_))
+            .then([](detail::execution_result result) {
+                return insert_result{
+                    .rows_affected = result.rows_affected,
+                    .last_insert_id = result.last_insert_id,
+                };
+            });
+    }
+
+    [[nodiscard]] task<insert_result> create_async(const Model& model)
+    {
+        return insert_async(model);
+    }
+
     [[nodiscard]] std::uint64_t update(const Model& model)
     {
         return backend_->execute(update_statement(model, model_)).rows_affected;
@@ -164,6 +182,23 @@ public:
     [[nodiscard]] std::uint64_t update_partial(const Model& model, Members Model::*... members)
     {
         return backend_->execute(update_partial_statement(model, model_, members...)).rows_affected;
+    }
+
+    [[nodiscard]] task<std::uint64_t> update_async(const Model& model)
+    {
+        return backend_->execute_async(update_statement(model, model_))
+            .then([](detail::execution_result result) {
+                return result.rows_affected;
+            });
+    }
+
+    template <typename... Members>
+    [[nodiscard]] task<std::uint64_t> update_partial_async(const Model& model, Members Model::*... members)
+    {
+        return backend_->execute_async(update_partial_statement(model, model_, members...))
+            .then([](detail::execution_result result) {
+                return result.rows_affected;
+            });
     }
 
     [[nodiscard]] std::vector<Model> find_many(condition filter = {})
@@ -181,6 +216,21 @@ public:
         return find_many(query.options());
     }
 
+    [[nodiscard]] task<std::vector<Model>> find_many_async(condition filter = {})
+    {
+        return collect_async(select_statement(model_, std::move(filter)));
+    }
+
+    [[nodiscard]] task<std::vector<Model>> find_many_async(query_options<Model> options)
+    {
+        return collect_async(select_statement(model_, std::move(options)));
+    }
+
+    [[nodiscard]] task<std::vector<Model>> find_many_async(const query_builder<Model>& query)
+    {
+        return find_many_async(query.options());
+    }
+
     [[nodiscard]] std::optional<Model> find_one(condition filter = {})
     {
         return collect_one(select_one_statement(model_, std::move(filter)));
@@ -194,6 +244,21 @@ public:
     [[nodiscard]] std::optional<Model> find_one(const query_builder<Model>& query)
     {
         return find_one(query.options());
+    }
+
+    [[nodiscard]] task<std::optional<Model>> find_one_async(condition filter = {})
+    {
+        return collect_one_async(select_one_statement(model_, std::move(filter)));
+    }
+
+    [[nodiscard]] task<std::optional<Model>> find_one_async(query_options<Model> options)
+    {
+        return collect_one_async(select_one_statement(model_, std::move(options)));
+    }
+
+    [[nodiscard]] task<std::optional<Model>> find_one_async(const query_builder<Model>& query)
+    {
+        return find_one_async(query.options());
     }
 
     [[nodiscard]] std::uint64_t count(condition filter = {})
@@ -217,6 +282,29 @@ public:
         return count(query.options());
     }
 
+    [[nodiscard]] task<std::uint64_t> count_async(condition filter = {})
+    {
+        return backend_->query_async(count_statement(model_, std::move(filter)))
+            .then([](std::vector<detail::row> rows) -> std::uint64_t {
+                if(rows.empty() || rows.front().empty())
+                {
+                    return 0;
+                }
+
+                return detail::value_to_u64(rows.front().front());
+            });
+    }
+
+    [[nodiscard]] task<std::uint64_t> count_async(query_options<Model> options)
+    {
+        return count_async(std::move(options.filter));
+    }
+
+    [[nodiscard]] task<std::uint64_t> count_async(const query_builder<Model>& query)
+    {
+        return count_async(query.options());
+    }
+
     [[nodiscard]] bool exists(condition filter = {})
     {
         bool found = false;
@@ -236,6 +324,22 @@ public:
     [[nodiscard]] bool exists(const query_builder<Model>& query)
     {
         return exists(query.options());
+    }
+
+    [[nodiscard]] task<bool> exists_async(condition filter = {})
+    {
+        return backend_->query_async(exists_statement(model_, std::move(filter)))
+            .then([](std::vector<detail::row> rows) { return !rows.empty(); });
+    }
+
+    [[nodiscard]] task<bool> exists_async(query_options<Model> options)
+    {
+        return exists_async(std::move(options.filter));
+    }
+
+    [[nodiscard]] task<bool> exists_async(const query_builder<Model>& query)
+    {
+        return exists_async(query.options());
     }
 
     [[nodiscard]] insert_result insert_many(const std::vector<Model>& models)
@@ -426,11 +530,35 @@ private:
         return output;
     }
 
+    [[nodiscard]] task<std::vector<Model>> collect_async(const entityfy::statement& command)
+    {
+        return backend_->query_async(command).then([](std::vector<detail::row> rows) {
+            return materialize_many(rows);
+        });
+    }
+
+    [[nodiscard]] task<std::optional<Model>> collect_one_async(const entityfy::statement& command)
+    {
+        return backend_->query_async(command).then([](std::vector<detail::row> rows) -> std::optional<Model> {
+            if(rows.empty())
+            {
+                return std::nullopt;
+            }
+
+            return std::optional<Model>{detail::materialize_row<Model>(rows.front())};
+        });
+    }
+
 public:
     // General key API: composite and non-integral keys go through row_key.
     [[nodiscard]] std::optional<Model> find(const row_key& key)
     {
         return collect_one(select_by_key_statement(model_, key));
+    }
+
+    [[nodiscard]] task<std::optional<Model>> find_async(const row_key& key)
+    {
+        return collect_one_async(select_by_key_statement(model_, key));
     }
 
     [[nodiscard]] std::uint64_t remove_by_key(const row_key& key)
@@ -449,9 +577,23 @@ public:
 
     template <typename Id>
         requires(!std::same_as<std::remove_cvref_t<Id>, row_key>)
+    [[nodiscard]] task<std::optional<Model>> find_async(Id&& id)
+    {
+        return collect_one_async(select_by_id_statement(model_, std::forward<Id>(id)));
+    }
+
+    template <typename Id>
+        requires(!std::same_as<std::remove_cvref_t<Id>, row_key>)
     [[nodiscard]] std::optional<Model> find_unique(Id&& id)
     {
         return find(std::forward<Id>(id));
+    }
+
+    template <typename Id>
+        requires(!std::same_as<std::remove_cvref_t<Id>, row_key>)
+    [[nodiscard]] task<std::optional<Model>> find_unique_async(Id&& id)
+    {
+        return find_async(std::forward<Id>(id));
     }
 
     [[nodiscard]] std::uint64_t remove(condition filter)
@@ -462,6 +604,22 @@ public:
         }
 
         return backend_->execute(delete_statement(model_, std::move(filter))).rows_affected;
+    }
+
+    [[nodiscard]] task<std::uint64_t> remove_async(condition filter)
+    {
+        if(filter.empty())
+        {
+            throw std::invalid_argument{
+                "entityfy::table_client::remove_async requires a WHERE condition; use execute_async() for intentional "
+                "full-table deletes"
+            };
+        }
+
+        return backend_->execute_async(delete_statement(model_, std::move(filter)))
+            .then([](detail::execution_result result) {
+                return result.rows_affected;
+            });
     }
 
     template <typename Id>
