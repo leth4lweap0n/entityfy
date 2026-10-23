@@ -102,6 +102,9 @@
 - **Lazy loading (P1)**: `entityfy::lazy<T>` reference and collection handles bound to tracked
   entities, typed lifecycle errors, one-query loads through the identity map, eager-loading cache
   fill, and reset/rebind after writes and rollback
+- **Task primitives (P2.1)**: `entityfy::task<T>`/`task<void>`, cancellation hooks, `then`
+  flattening, `inline_executor` and a bounded `thread_pool_executor` (not yet wired to the
+  synchronous drivers)
 
 ## Next
 

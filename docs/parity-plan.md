@@ -171,6 +171,9 @@ navigation helpers reject composite foreign keys with a clear error.
 
 ### P2.1 `task<T>` and executors (no database)
 
+**Status:** implemented (commit 1131408): `task<T>`/`task<void>`, cancellation hook,
+`on_complete`, flattened `then`, inline and bounded pool executors, 19 tests.
+
 `entityfy::task<T>`/`task<void>` with a completion callback, cancellation hook and `sync_wait`
 for tests/CLI; a bounded thread-pool executor and a single-thread reactor abstraction. Unit tests
 for values, exceptions, move-only results, nested awaits, destruction of unused tasks and

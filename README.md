@@ -211,6 +211,10 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
 - **Partial UPDATE in core**: `db.update_partial(entity, &T::a, &T::b)` writes only the named
   columns; `update(entity)` still rewrites the row (core keeps no snapshot).
 - **SQL logger**: `client::set_logger(...)` reports every statement before it executes.
+- **Task primitives**: header-only `entityfy::task<T>` / `task<void>` (move-only results,
+  exceptions, cancellation hook, `on_complete`, `then` flattening) and `inline_executor` /
+  bounded `thread_pool_executor`. These are the groundwork for the async phase; the drivers and
+  client are still synchronous.
 
 ## entityfy-context
 
@@ -325,8 +329,8 @@ the ratios are more stable.
 ctest --preset release
 ```
 
-97 CTest entries in the default build: 95 core Catch2 test cases (1193 assertions with
-PostgreSQL enabled; SQLite-only runs execute 91 cases and 1130 assertions) and the
+116 CTest entries in the default build: 114 core Catch2 test cases (1309 assertions with
+PostgreSQL enabled; SQLite-only runs execute 110 cases and 1246 assertions) and the
 migrate/context test binaries - which contain 10 and 23 scenarios respectively (22 with SQLite
 only, 23 with PostgreSQL). Each opt-in backend (`ENTITYFY_ENABLE_MYSQL`,
 `ENTITYFY_ENABLE_SQLSERVER`) adds three core cases (two backend tests and a statement cache test)
