@@ -28,6 +28,13 @@
 - **No-tracking reads**: `query().select(...)` (tuples) and `as_no_tracking()` (full entities by
   value, EF Core `AsNoTracking`); measured 332 ns/row against 460 ns/row tracked.
   `to_list()` returns a read-only result, so mutating a row is a compile error
+- **No-tracking eager loading**: `as_no_tracking().include<Child>()` returns owning
+  `(parent, std::vector<child>)` pairs grouped by the reflection-derived foreign key; value
+  navigations are filled, pointer navigations stay empty because a pointer into the result would
+  dangle
+- **Streamed context reads**: `include`, `include_parent`, both joins and the tracked query
+  builder consume rows through `client::query_each` instead of buffering `vector<row>`; measured
+  neutral on throughput (0,91-0,96x) and constant memory in `docs/benchmarks.md`
 - FK dependency order: INSERT parent-first, DELETE child-first (`ON DELETE RESTRICT` supported)
 - Nested transactions/savepoints, retry policy, batch splitting
 - EF Core style surface: `db_context` / `db_set<T>` with `save_changes()`, `add()`, `find()`,
@@ -93,21 +100,14 @@ section is implemented and covered by the test suite.
 
 ### SQLite and PostgreSQL
 
-2. **`as_no_tracking()` with eager loading** — a no-tracking query currently rejects `include`;
-   the include path in `db_set` would have to carry read-only pairs and merge them by key.
-   Surface: `modules/entityfy-context/include/entityfy/db_set.hpp`. Acceptance: an eager-loaded
-   no-tracking read returns the same rows as the tracked variant, with a scenario.
-3. **Deduplicate the context read path** — `include`/`join` still collect `vector<row>` before
-   materializing. Surface: the same file. Acceptance: rows are built in the consumer, all suites
-   green, delta recorded in `docs/benchmarks.md`.
-4. **PostgreSQL pipeline mode / batching** — with the statement cache in place the per-call round
+2. **PostgreSQL pipeline mode / batching** — with the statement cache in place the per-call round
    trip dominates. Surface: `postgresql_backend.cpp` batch path. Acceptance: batched writes use a
    pipeline, the benchmark table records before/after, the PostgreSQL suite stays green.
-5. **Type-based transient errors and retry** — retries match message text ("deadlock detected",
+3. **Type-based transient errors and retry** — retries match message text ("deadlock detected",
    "database is locked"). Surface: `postgresql_backend.cpp`, `sqlite_backend.cpp`, `error.hpp`,
    `db_context` retry predicate. Acceptance: PostgreSQL `40001`/`40P01` and SQLite
    `SQLITE_BUSY`/`SQLITE_LOCKED` map to dedicated error types and the retry policy keys off them.
-6. **Statement cache in the migration providers** — SQLite/PostgreSQL only for now; decide by
+4. **Statement cache in the migration providers** — SQLite/PostgreSQL only for now; decide by
    measurement. Acceptance: the measurement lands in `docs/benchmarks.md` and the outcome
    (implementation or documented decision) is recorded.
 

@@ -116,6 +116,10 @@ compile error; `first()` returns a copy, and editing the copy simply never reach
 (measured tracking overhead: 1,39-1,52x per loaded row, see
 [docs/benchmarks.md](docs/benchmarks.md)).
 
+Eager loading works on both paths: `as_no_tracking().include<post>()` yields owning
+`(user, std::vector<post>)` pairs, and the tracked `include`, `include_parent` and join paths
+consume rows through `query_each` instead of buffering them.
+
 ### When not to open a context
 
 `entityfy::client` is the layer the context itself is built on: statements, the query DSL and the

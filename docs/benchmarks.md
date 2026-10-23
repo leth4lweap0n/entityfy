@@ -172,6 +172,23 @@ attach instead of hitting the identity map.
 | `save_changes` with 1 marked row (manual) | **O(changed)** | 4,8 µs @2k, 4,7 µs @8k, 5,0 µs @20k, 5,5 µs @50k - flat |
 | `save_changes` **per tracked entity** | 178 ns | the snapshot scan at 20k; auto detection only |
 
+### `include` (eager loading): streamed vs buffered
+
+`include`, `include_parent` and both joins now consume rows through `client::query_each` instead
+of collecting a `vector<row>` first. The benchmark (2.000 parents, 2 children each, in-memory
+SQLite, median of 7) compares the streamed path with a replay of the previous shape
+(`query()` -> `vector<row>` -> materialize/attach/group):
+
+| Path | Time | Ratio |
+|---|---:|---:|
+| streamed (`query_each`) | 24,6 ms | 0,91-0,96x |
+| intermediate `vector<row>` | 22,3-23,5 ms | 1,00x |
+
+The change is about **memory**, not throughput: the buffered shape held every child row
+(4.000 `vector<sql_value>` rows here, more with wide tables) alive before materialization. The
+few-percent CPU cost comes from running materialization inside the fetch loop; the buffered
+variant pays an allocation per row and column instead.
+
 Every number is a median over `repetitions`; the cold lookup and both bulk loads open a **fresh
 context per repetition**, so the ratios compare measured medians rather than single runs.
 Repeating the whole run moves the absolute values with machine load. Five `20000 5` runs gave

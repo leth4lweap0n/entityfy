@@ -28,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 using clock_type = std::chrono::steady_clock;
@@ -54,6 +55,18 @@ struct [[= entityfy::table{"bench_users_explicit"}]] bench_user_explicit
 
     [[= entityfy::not_null, = entityfy::varchar{120}]]
     std::string name;
+};
+
+struct [[= entityfy::table{"bench_posts"}]] bench_post
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::indexed, = entityfy::not_null, = entityfy::references{"bench_users", "id"}]]
+    std::int64_t user_id = 0;
+
+    [[= entityfy::not_null, = entityfy::varchar{120}]]
+    std::string title;
 };
 
 namespace
@@ -338,6 +351,124 @@ void run_context_bench(const std::vector<std::string>& emails,
     if(untracked_ns > 0.0)
     {
         std::cout << std::format("tracked / no-tracking load per row: {:.2f}x\n", load_ns / untracked_ns);
+    }
+
+    // ---- include: streamed consumer vs the previous intermediate row vector ----
+    {
+        entityfy::db_context include_ctx{"sqlite://:memory:"};
+        include_ctx.migrate<bench_user>();
+        include_ctx.migrate<bench_post>();
+
+        auto include_users = include_ctx.set<bench_user>();
+        auto include_posts = include_ctx.set<bench_post>();
+
+        const std::size_t parents = std::min<std::size_t>(rows, 2000);
+
+        for(std::size_t index = 0; index < parents; ++index)
+        {
+            include_users.add(bench_user{.email = "include" + std::to_string(index) + "@bench.test",
+                                         .name = "Include " + std::to_string(index)});
+        }
+        include_ctx.save_changes();
+
+        for(auto* user: include_users.query().to_list())
+        {
+            include_posts.add(bench_post{.user_id = user->id, .title = "first"});
+            include_posts.add(bench_post{.user_id = user->id, .title = "second"});
+        }
+        include_ctx.save_changes();
+
+        const auto tracked_parents = include_users.query().to_list();
+
+        const auto streamed = measure([&](std::size_t) {
+            const auto pairs = include_users.include<bench_post>(tracked_parents);
+            g_sink += pairs.size();
+        }, 1, repetitions);
+
+        // Previous shape: describe the relation, build the SQL, query() collects
+        // a vector<row>, then each row is materialized/attached/grouped and the
+        // pairs are assembled - exactly what include() did before it streamed.
+        const auto intermediate = measure([&](std::size_t) {
+            const auto dialect = include_ctx.database().target_dialect();
+            const auto parent_model = entityfy::describe_model<bench_user>(dialect);
+            const auto child_model = entityfy::describe_model<bench_post>(dialect);
+            const auto& relation = entityfy::detail::find_relation<bench_post, bench_user>(child_model, parent_model);
+
+            std::vector<entityfy::sql_value> parent_keys;
+            parent_keys.reserve(tracked_parents.size());
+            for(auto* parent: tracked_parents)
+            {
+                parent_keys.push_back(entityfy::detail::primary_key_value(*parent, parent_model));
+            }
+
+            std::string sql = "SELECT ";
+            for(std::size_t index = 0; index < child_model.columns.size(); ++index)
+            {
+                if(index != 0)
+                {
+                    sql += ", ";
+                }
+
+                sql += entityfy::detail::quote_identifier(child_model.columns[index].name);
+            }
+
+            sql += " FROM " + entityfy::detail::quote_identifier(child_model.table_name) + " WHERE " +
+                   entityfy::detail::quote_identifier(relation.local_column) + " IN (";
+
+            for(std::size_t index = 0; index < parent_keys.size(); ++index)
+            {
+                if(index != 0)
+                {
+                    sql += ", ";
+                }
+
+                sql += "?";
+            }
+
+            sql += ")";
+
+            const auto rows_with_children = include_ctx.database().query(
+                entityfy::statement{.sql = std::move(sql), .binds = std::move(parent_keys)}
+            );
+
+            std::unordered_map<std::string, std::vector<bench_post*>> grouped;
+
+            for(const auto& row: rows_with_children)
+            {
+                auto child = entityfy::detail::materialize_row<bench_post>(row);
+                const auto key = entityfy::detail::read_column(child, relation.local_column);
+                if(!key)
+                {
+                    continue;
+                }
+
+                auto& stored = include_posts.attach(std::move(child));
+                grouped[entityfy::detail::canonical_key(*key)].push_back(&stored);
+            }
+
+            std::vector<std::pair<bench_user*, std::vector<bench_post*>>> output;
+            output.reserve(tracked_parents.size());
+
+            for(bench_user* parent: tracked_parents)
+            {
+                const auto key = entityfy::detail::primary_key_value(*parent, parent_model);
+                auto bucket = grouped[entityfy::detail::canonical_key(key)];
+                output.emplace_back(parent, std::move(bucket));
+            }
+
+            g_sink += output.size();
+        }, 1, repetitions);
+
+        std::cout << std::format("\nContext include ({} parents, 2 children each, median of {} trials)\n",
+                                 parents,
+                                 repetitions);
+        std::cout << std::format("{:<34}{:>14.2f} us\n", "streamed (query_each)", streamed.median_ns / 1000.0);
+        std::cout << std::format("{:<34}{:>14.2f} us\n",
+                                 "intermediate vector<row>",
+                                 intermediate.median_ns / 1000.0);
+        std::cout << std::format("{:<34}{:>14.2f}x\n",
+                                 "intermediate / streamed",
+                                 intermediate.median_ns / streamed.median_ns);
     }
 
     std::cout << "\nNote: cold find and both to_list rows use a file backed database and a\n"
