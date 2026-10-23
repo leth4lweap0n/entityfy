@@ -99,6 +99,8 @@ for(const auto& model: ctx.model())
   changed columns (partial UPDATE).
 - `to_list()`, `find()`, `first()` and `include()` return pointers into the tracker: those rows
   are materialized *and* attached, so they pay for the `original` copy and the identity map entry.
+  `find`, `to_list` and `from_sql` stream the result through `client::query_each` and attach row by
+  row, so no `vector<row>` is built in between.
 - `query().select(&T::a, &T::b)` returns `std::vector<std::tuple<...>>` of values and never
   touches the tracker (the equivalent of EF Core's `Select(x => new { ... })`).
 - `as_no_tracking()` is the full-entity counterpart (EF Core's `AsNoTracking()`):

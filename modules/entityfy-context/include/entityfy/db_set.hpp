@@ -1131,13 +1131,13 @@ public:
         auto command = entityfy::select_by_id_statement(model, id);
         owner_->log(command.sql);
 
-        const auto rows = owner_->database().query(command);
-        if(rows.empty())
-        {
-            return nullptr;
-        }
+        T* found_entity = nullptr;
+        owner_->database().query_each(command, [&](const entityfy::detail::row& current) {
+            found_entity = &tracked_state->attach(entityfy::detail::materialize_row<T>(current));
+            return false;
+        });
 
-        return &tracked_state->attach(entityfy::detail::materialize_row<T>(rows.front()));
+        return found_entity;
     }
 
     // Loads every row of the table and tracks it.
@@ -1155,15 +1155,11 @@ public:
         auto command = entityfy::select_statement(model, options);
         owner_->log(command.sql);
 
-        const auto rows = owner_->database().query(command);
-
         std::vector<T*> output;
-        output.reserve(rows.size());
-
-        for(const auto& row: rows)
-        {
-            output.push_back(&tracked_state->attach(entityfy::detail::materialize_row<T>(row)));
-        }
+        owner_->database().query_each(command, [&](const entityfy::detail::row& current) {
+            output.push_back(&tracked_state->attach(entityfy::detail::materialize_row<T>(current)));
+            return true;
+        });
 
         return output;
     }
@@ -1190,15 +1186,13 @@ public:
         auto tracked_state = state();
         owner_->log(sql);
 
-        const auto rows = owner_->database().query(entityfy::statement{.sql = std::string{sql}});
-
         std::vector<T*> output;
-        output.reserve(rows.size());
-
-        for(const auto& row: rows)
-        {
-            output.push_back(&tracked_state->attach(entityfy::detail::materialize_row<T>(row)));
-        }
+        owner_->database().query_each(entityfy::statement{.sql = std::string{sql}},
+                                       [&](const entityfy::detail::row& current) {
+                                           output.push_back(
+                                               &tracked_state->attach(entityfy::detail::materialize_row<T>(current)));
+                                           return true;
+                                       });
 
         return output;
     }

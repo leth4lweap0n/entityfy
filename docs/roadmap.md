@@ -40,7 +40,8 @@
 - Snapshot, diff, apply, rollback, baseline, checksum protection
 - Runnable SQL script generation (`script --all`), generation from an empty source
 - C++ model header generation from the live schema (scaffold)
-- `entityfy_migrate` CLI
+- `entityfy_migrate` CLI (scaffold verified end to end: the generated header compiles with
+  `-fsyntax-only`)
 
 **Repository**
 
@@ -53,16 +54,37 @@
   without an intermediate row vector (measured: no significant single-row gain, small gain for
   many-row reads - see `docs/benchmarks.md`)
 
-## Planned
+## Next
 
-1. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
-   in practice covered by `entityfy::value_converter<T>` (a composite type is written to a single
-   column), but owned types **split across** columns (as in EF, e.g. `address_city`) and a TPH
-   discriminator do not exist yet.
-2. **Additional providers** — MySQL / SQL Server.
-3. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
-   **from the live schema** (the DB → model direction exists); the reverse direction (model → DB)
-   is covered by the `snapshot` + `apply` commands, with no separate generation command.
+The remaining work is large and none of it is started; each entry records the
+surface that has to change, so a session can pick one up without redoing the
+analysis. Everything above this section is implemented and covered by the test
+suite.
+
+1. **Owned types split across columns** — `describe_model` maps one member to one column today:
+   the statement builders advance a column index per persistent field and `materialize_row`
+   assigns field by field. An `[[= entityfy::owned]] address_t address` would have to flatten into
+   `address_city` / `address_street`, which touches `describe_model` (column flattening), the
+   insert/update/select builders (one member -> several columns), `materialize_row` (nested
+   assignment) and the migration snapshot/diff/scaffold. Acceptance: round trip, migration diff and
+   scaffold output for an owned model.
+2. **TPH inheritance** — needs a discriminator column, polymorphic `find_many`/`include` and a model
+   registry that can answer "which derived type is this row". Depends on the metadata work in 1.
+3. **Additional providers (MySQL, SQL Server)** — one backend each plus dialect differences
+   (identifier quoting, generated keys, upsert syntax, batch limits) and a CI service container per
+   provider. Acceptance: core, migrate and context suites run against the provider in CI.
+
+## Smaller follow-ups
+
+Measured or diagnosed, not started:
+
+- **PostgreSQL pipeline mode / batching** — with the statement cache in place the per-call round
+  trip is the dominant cost (`docs/benchmarks.md`); taocpp supports pipelines.
+- **Statement cache in the migration providers** — they prepare on every statement (known
+  limitation).
+- **`as_no_tracking()` with eager loading** — `include` would have to return read-only pairs.
+- **Deduplicate the context read path** — `include`/`join` still collect `vector<row>`; `find`,
+  `to_list`, `from_sql` and `as_no_tracking` already stream through `client::query_each`.
 
 ## Known limitations
 
