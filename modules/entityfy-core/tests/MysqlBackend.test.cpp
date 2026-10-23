@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace
@@ -96,4 +97,51 @@ TEST_CASE("mysql backend round trip", "[mysql][backend]")
     REQUIRE(db.count<mysql_user>() == 1);
 
     db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"mysql_users\""});
+}
+
+TEST_CASE("mysql statement cache reuses compiled statements", "[mysql][cache]")
+{
+    const auto uri = mysql_uri();
+    if(uri.empty())
+    {
+        SKIP("ENTITYFY_MYSQL_URI is not set");
+    }
+
+    entityfy::client db{uri};
+    db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"mysql_cache_items\""});
+    db.execute(entityfy::statement{.sql =
+                                       "CREATE TABLE \"mysql_cache_items\" (\"id\" INTEGER PRIMARY KEY, "
+                                       "\"name\" VARCHAR(40) NOT NULL)"});
+    db.clear_statement_cache();
+
+    REQUIRE(db.statement_cache_capacity() > 0);
+    REQUIRE(db.statement_cache_size() == 0);
+
+    const std::string insert_sql =
+        "INSERT INTO \"mysql_cache_items\" (\"id\", \"name\") VALUES (?, ?)";
+
+    db.execute(entityfy::statement{.sql = insert_sql, .binds = {1, std::string{"first"}}});
+    REQUIRE(db.statement_cache_size() == 1);
+
+    db.execute(entityfy::statement{.sql = insert_sql, .binds = {2, std::string{"second"}}});
+    REQUIRE(db.statement_cache_size() == 1);
+
+    const auto rows = db.query(
+        entityfy::statement{.sql = "SELECT \"id\", \"name\" FROM \"mysql_cache_items\" ORDER BY \"id\""});
+    REQUIRE(rows.size() == 2);
+    REQUIRE(std::get<std::int64_t>(rows[0][0]) == 1);
+    REQUIRE(std::get<std::string>(rows[1][1]) == "second");
+    REQUIRE(db.statement_cache_size() == 2);
+
+    db.set_statement_cache_capacity(1);
+    REQUIRE(db.statement_cache_size() == 1);
+
+    db.set_statement_cache_capacity(0);
+    REQUIRE(db.statement_cache_size() == 0);
+
+    const auto again = db.query(
+        entityfy::statement{.sql = "SELECT \"id\" FROM \"mysql_cache_items\" ORDER BY \"id\""});
+    REQUIRE(again.size() == 2);
+
+    db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"mysql_cache_items\""});
 }

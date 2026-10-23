@@ -13,11 +13,13 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -567,6 +569,11 @@ public:
 
     ~sqlserver_backend() override
     {
+        {
+            const std::lock_guard lock{mutex_};
+            clear_statement_cache_locked();
+        }
+
         if(connection_ != SQL_NULL_HDBC)
         {
             SQLDisconnect(connection_);
@@ -592,7 +599,18 @@ public:
 
             // Statements without parameters go through the text protocol;
             // transaction control in particular cannot be prepared.
-            SQLHSTMT statement_handle = input.binds.empty() ? execute_text(input) : prepare(input);
+            std::unique_ptr<statement_lease> lease;
+            SQLHSTMT                         statement_handle = SQL_NULL_HSTMT;
+
+            if(input.binds.empty())
+            {
+                statement_handle = execute_text(input);
+            }
+            else
+            {
+                lease = std::make_unique<statement_lease>(*this, input);
+                statement_handle = lease->get();
+            }
 
             execution_result output;
 
@@ -625,7 +643,11 @@ public:
                 output.rows_affected = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
             }
 
-            SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
+            if(!lease)
+            {
+                SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
+            }
+
             return output;
         }
         catch(const sql_error&)
@@ -663,12 +685,12 @@ public:
                 logger_(input.sql);
             }
 
-            SQLHSTMT statement_handle = prepare(input);
+            statement_lease lease{*this, input};
+            SQLHSTMT        statement_handle = lease.get();
 
             SQLSMALLINT column_count = 0;
             if(SQLNumResultCols(statement_handle, &column_count) != SQL_SUCCESS)
             {
-                SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
                 throw std::runtime_error{"entityfy SQL Server query returned no result set"};
             }
 
@@ -722,7 +744,6 @@ public:
                 }
             }
 
-            SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
         }
         catch(const sql_error&)
         {
@@ -737,6 +758,40 @@ public:
 
             throw_classified_sql_error("SQL Server", "query", input.sql, error.what());
         }
+    }
+
+    // Prepared statements are kept in an LRU keyed by SQL text. A cache hit
+    // closes the previous cursor and resets the parameter bindings before the
+    // statement is executed again.
+    void set_statement_cache_capacity(std::size_t capacity) override
+    {
+        const std::lock_guard lock{mutex_};
+        capacity_ = capacity;
+
+        while(cache_.size() > capacity_)
+        {
+            SQLFreeHandle(SQL_HANDLE_STMT, cache_.back().second);
+            index_.erase(cache_.back().first);
+            cache_.pop_back();
+        }
+    }
+
+    [[nodiscard]] std::size_t statement_cache_capacity() const noexcept override
+    {
+        const std::lock_guard lock{mutex_};
+        return capacity_;
+    }
+
+    [[nodiscard]] std::size_t statement_cache_size() const noexcept override
+    {
+        const std::lock_guard lock{mutex_};
+        return cache_.size();
+    }
+
+    void clear_statement_cache() override
+    {
+        const std::lock_guard lock{mutex_};
+        clear_statement_cache_locked();
     }
 
     [[nodiscard]] std::vector<std::string> table_columns(std::string_view table) override
@@ -944,34 +999,80 @@ private:
         return statement_handle;
     }
 
-    [[nodiscard]] SQLHSTMT prepare(const statement& input)
+    struct acquired_statement
+    {
+        SQLHSTMT handle = SQL_NULL_HSTMT;
+        bool     reused = false;
+    };
+
+    class statement_lease
+    {
+    public:
+        statement_lease(sqlserver_backend& owner, const statement& input)
+            : owner_{owner}, sql_{input.sql}
+        {
+            const auto acquired = owner_.acquire_statement_locked(input);
+            handle_ = acquired.handle;
+            reused_ = acquired.reused;
+        }
+
+        statement_lease(const statement_lease&) = delete;
+        statement_lease& operator=(const statement_lease&) = delete;
+
+        ~statement_lease()
+        {
+            owner_.release_statement_locked(sql_, handle_, reused_);
+        }
+
+        [[nodiscard]] SQLHSTMT get() const noexcept
+        {
+            return handle_;
+        }
+
+    private:
+        sqlserver_backend& owner_;
+        std::string        sql_;
+        SQLHSTMT           handle_ = SQL_NULL_HSTMT;
+        bool               reused_ = false;
+    };
+
+    [[nodiscard]] acquired_statement acquire_statement_locked(const statement& input)
     {
         SQLHSTMT statement_handle = SQL_NULL_HSTMT;
-        if(SQLAllocHandle(SQL_HANDLE_STMT, connection_, &statement_handle) != SQL_SUCCESS)
+        bool     reused = false;
+
+        if(capacity_ != 0)
         {
-            throw std::runtime_error{"entityfy SQL Server statement allocation failed"};
+            const auto found = index_.find(input.sql);
+
+            if(found != index_.end())
+            {
+                statement_handle = found->second->second;
+                SQLFreeStmt(statement_handle, SQL_CLOSE);
+                SQLFreeStmt(statement_handle, SQL_RESET_PARAMS);
+                cache_.splice(cache_.begin(), cache_, found->second);
+                reused = true;
+            }
         }
 
-        const auto wide = utf8_to_utf16(input.sql);
-
-        if(!succeeded(SQLPrepareW(statement_handle, const_cast<SQLWCHAR*>(wide.c_str()), SQL_NTS)))
+        if(statement_handle == SQL_NULL_HSTMT)
         {
-            SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
-            throw std::runtime_error{"entityfy SQL Server prepare failed: " + classify_sqlserver_error(SQL_HANDLE_STMT, statement_handle)};
-        }
+            if(SQLAllocHandle(SQL_HANDLE_STMT, connection_, &statement_handle) != SQL_SUCCESS)
+            {
+                throw std::runtime_error{"entityfy SQL Server statement allocation failed"};
+            }
 
-        if(input.binds.empty())
-        {
-            if(!succeeded(SQLExecute(statement_handle)))
+            const auto wide = utf8_to_utf16(input.sql);
+
+            if(!succeeded(SQLPrepareW(statement_handle, const_cast<SQLWCHAR*>(wide.c_str()), SQL_NTS)))
             {
                 const auto message = classify_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
                 SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
-                throw std::runtime_error{"entityfy SQL Server execute failed: " + message};
+                throw std::runtime_error{"entityfy SQL Server prepare failed: " + message};
             }
-
-            return statement_handle;
         }
 
+        // The bind buffers must stay alive until SQLExecute returns.
         auto parameters = make_sqlserver_parameters(input.binds);
 
         for(std::size_t index = 0; index < input.binds.size(); ++index)
@@ -990,7 +1091,7 @@ private:
                )))
             {
                 const auto message = classify_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
-                SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
+                discard_statement_locked(input.sql, statement_handle, reused);
                 throw std::runtime_error{"entityfy SQL Server bind failed: " + message};
             }
         }
@@ -998,16 +1099,65 @@ private:
         if(!succeeded(SQLExecute(statement_handle)))
         {
             const auto message = classify_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
-            SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
+            discard_statement_locked(input.sql, statement_handle, reused);
             throw std::runtime_error{"entityfy SQL Server execute failed: " + message};
         }
 
-        return statement_handle;
+        return acquired_statement{.handle = statement_handle, .reused = reused};
+    }
+
+    void release_statement_locked(std::string_view sql, SQLHSTMT handle, bool reused)
+    {
+        if(reused)
+        {
+            return;
+        }
+
+        if(capacity_ == 0)
+        {
+            SQLFreeHandle(SQL_HANDLE_STMT, handle);
+            return;
+        }
+
+        while(cache_.size() >= capacity_)
+        {
+            SQLFreeHandle(SQL_HANDLE_STMT, cache_.back().second);
+            index_.erase(cache_.back().first);
+            cache_.pop_back();
+        }
+
+        cache_.emplace_front(std::string{sql}, handle);
+        index_[std::string{sql}] = cache_.begin();
+    }
+
+    void discard_statement_locked(std::string_view sql, SQLHSTMT handle, bool reused)
+    {
+        if(reused)
+        {
+            index_.erase(std::string{sql});
+            cache_.remove_if([&](const auto& entry) { return entry.second == handle; });
+        }
+
+        SQLFreeHandle(SQL_HANDLE_STMT, handle);
+    }
+
+    void clear_statement_cache_locked() noexcept
+    {
+        for(const auto& entry: cache_)
+        {
+            SQLFreeHandle(SQL_HANDLE_STMT, entry.second);
+        }
+
+        cache_.clear();
+        index_.clear();
     }
 
     SQLHDBC                               connection_ = SQL_NULL_HDBC;
     mutable std::mutex                    mutex_;
     std::size_t                           batch_parameter_limit_ = 2000;
+    std::size_t                           capacity_ = 32;
+    std::list<std::pair<std::string, SQLHSTMT>> cache_;
+    std::unordered_map<std::string, decltype(cache_)::iterator> index_;
     std::function<void(std::string_view)> logger_;
 };
 

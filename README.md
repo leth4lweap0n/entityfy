@@ -179,10 +179,11 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
 - **query DSL**: `where`, `order_by`, `take`, `skip`, `select` (projection), `sum`, `avg`,
   `min`, `max`, `count`, grouped aggregates (`count_by`, `sum_by`, `group_count`,
   `group_count_having`).
-- **Prepared statement cache**: both backends keep statements in an LRU (default capacity 32) -
-  compiled `sqlite3_stmt` on SQLite, named server side `PREPARE` plans on PostgreSQL
-  (deallocated on eviction and after DDL); parameters are rebound on every execution, with no
-  bind leakage.
+- **Prepared statement cache**: every backend keeps statements in an LRU (default capacity 32) -
+  compiled `sqlite3_stmt` on SQLite, named server side `PREPARE` plans on PostgreSQL (deallocated
+  on eviction and after DDL), `MYSQL_STMT` handles reset between uses on MySQL, and ODBC
+  statements whose cursor and parameter bindings are reset on SQL Server; parameters are rebound
+  on every execution, with no bind leakage.
 - **Multi-row INSERT**: `insert_many` produces a single statement for models with explicit
   keys, split according to the batch parameter limit.
 - **Value converter**: with `entityfy::value_converter<T>` your own type is written to and read
@@ -296,8 +297,9 @@ ctest --preset release
 
 50 CTest entries in the default build: 48 core Catch2 test cases (233 assertions) and the
 migrate/context test binaries - which contain 11 and 20 scenarios respectively. Each opt-in
-backend (`ENTITYFY_ENABLE_MYSQL`, `ENTITYFY_ENABLE_SQLSERVER`) adds two core cases and one
-scenario to the migrate and context binaries (52 entries with MySQL, 52 with SQL Server).
+backend (`ENTITYFY_ENABLE_MYSQL`, `ENTITYFY_ENABLE_SQLSERVER`) adds three core cases (two backend
+tests and a statement cache test) and one scenario to the migrate and context binaries
+(53 entries with MySQL, 50 with SQL Server).
 
 PostgreSQL tests run when `ENTITYFY_PG_URI` is provided, MySQL tests when `ENTITYFY_MYSQL_URI` is
 provided and SQL Server tests when `ENTITYFY_SQLSERVER_URI` is provided. With
@@ -432,9 +434,8 @@ through `sl3`, and there is no second copy of SQLite.
   MySQL has no transactional DDL (a failed migration cannot be rolled back); their migrate
   providers write a SQL dump (`CREATE TABLE` + `INSERT`) instead of a native dump, which can take
   a while on large databases; `[[= entityfy::json]]` maps to `LONGTEXT` on MySQL because MariaDB
-  reports its JSON alias that way; both backends report a statement cache capacity of zero; the
-  SQL Server migrate provider rebuilds dependent indexes around `ALTER COLUMN` and refuses
-  primary-key/identity changes.
+  reports its JSON alias that way; the SQL Server migrate provider rebuilds dependent indexes
+  around `ALTER COLUMN` and refuses primary-key/identity changes.
 - Row reading is costly through `vector<vector<sql_value>>`; single-row reads need a separate
   path.
 - No `install()` / `find_package()` export yet: consume the project with `add_subdirectory` or

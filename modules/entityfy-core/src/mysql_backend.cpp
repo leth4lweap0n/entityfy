@@ -9,11 +9,13 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -403,7 +405,7 @@ public:
                 };
             }
 
-            mysql_statement statement{prepare(input)};
+            statement_lease statement{*this, input};
             auto            parameters = make_mysql_parameters(input.binds);
 
             if(mysql_stmt_bind_param(statement.get(), parameters.data()) != 0)
@@ -457,7 +459,7 @@ public:
                 logger_(input.sql);
             }
 
-            mysql_statement statement{prepare(input)};
+            statement_lease statement{*this, input};
             auto            parameters = make_mysql_parameters(input.binds);
 
             if(mysql_stmt_bind_param(statement.get(), parameters.data()) != 0)
@@ -718,9 +720,101 @@ public:
         logger_ = std::move(logger);
     }
 
-private:
-    [[nodiscard]] MYSQL_STMT* prepare(const statement& input)
+    // Compiled statements are kept in an LRU keyed by SQL text; a cache hit
+    // skips the parse/plan round trip and needs a reset for the previous
+    // result set. The lease returns the handle to the cache unless the
+    // statement was reused.
+    void set_statement_cache_capacity(std::size_t capacity) override
     {
+        const std::lock_guard lock{mutex_};
+        capacity_ = capacity;
+
+        while(cache_.size() > capacity_)
+        {
+            mysql_stmt_close(cache_.back().second);
+            index_.erase(cache_.back().first);
+            cache_.pop_back();
+        }
+    }
+
+    [[nodiscard]] std::size_t statement_cache_capacity() const noexcept override
+    {
+        const std::lock_guard lock{mutex_};
+        return capacity_;
+    }
+
+    [[nodiscard]] std::size_t statement_cache_size() const noexcept override
+    {
+        const std::lock_guard lock{mutex_};
+        return cache_.size();
+    }
+
+    void clear_statement_cache() override
+    {
+        const std::lock_guard lock{mutex_};
+        clear_statement_cache_locked();
+    }
+
+private:
+    struct acquired_statement
+    {
+        MYSQL_STMT* handle = nullptr;
+        bool        reused = false;
+    };
+
+    class statement_lease
+    {
+    public:
+        statement_lease(mysql_backend& owner, const statement& input)
+            : owner_{owner}, sql_{input.sql}
+        {
+            const auto acquired = owner_.acquire_statement_locked(input);
+            handle_ = acquired.handle;
+            reused_ = acquired.reused;
+        }
+
+        statement_lease(const statement_lease&) = delete;
+        statement_lease& operator=(const statement_lease&) = delete;
+
+        ~statement_lease()
+        {
+            owner_.release_statement_locked(sql_, handle_, reused_);
+        }
+
+        [[nodiscard]] MYSQL_STMT* get() const noexcept
+        {
+            return handle_;
+        }
+
+    private:
+        mysql_backend& owner_;
+        std::string    sql_;
+        MYSQL_STMT*    handle_ = nullptr;
+        bool           reused_ = false;
+    };
+
+    [[nodiscard]] acquired_statement acquire_statement_locked(const statement& input)
+    {
+        if(capacity_ != 0)
+        {
+            const auto found = index_.find(input.sql);
+
+            if(found != index_.end())
+            {
+                MYSQL_STMT* cached = found->second->second;
+
+                if(mysql_stmt_reset(cached) == 0)
+                {
+                    cache_.splice(cache_.begin(), cache_, found->second);
+                    return acquired_statement{.handle = cached, .reused = true};
+                }
+
+                mysql_stmt_close(cached);
+                index_.erase(found->first);
+                cache_.erase(found->second);
+            }
+        }
+
         MYSQL_STMT* created = mysql_stmt_init(handle_.get());
         if(created == nullptr)
         {
@@ -734,12 +828,50 @@ private:
             throw std::runtime_error{"entityfy MySQL prepare failed: " + classify_mysql_error(handle_.get())};
         }
 
-        return statement.release();
+        return acquired_statement{.handle = statement.release()};
+    }
+
+    void release_statement_locked(std::string_view sql, MYSQL_STMT* handle, bool reused)
+    {
+        if(reused)
+        {
+            return;
+        }
+
+        if(capacity_ == 0)
+        {
+            mysql_stmt_close(handle);
+            return;
+        }
+
+        while(cache_.size() >= capacity_)
+        {
+            mysql_stmt_close(cache_.back().second);
+            index_.erase(cache_.back().first);
+            cache_.pop_back();
+        }
+
+        cache_.emplace_front(std::string{sql}, handle);
+        index_[std::string{sql}] = cache_.begin();
+    }
+
+    void clear_statement_cache_locked() noexcept
+    {
+        for(const auto& entry: cache_)
+        {
+            mysql_stmt_close(entry.second);
+        }
+
+        cache_.clear();
+        index_.clear();
     }
 
     mysql_handle                          handle_{};
     mutable std::mutex                    mutex_;
     std::size_t                           batch_parameter_limit_ = 60000;
+    std::size_t                           capacity_ = 32;
+    std::list<std::pair<std::string, MYSQL_STMT*>> cache_;
+    std::unordered_map<std::string, decltype(cache_)::iterator> index_;
     std::function<void(std::string_view)> logger_;
 };
 

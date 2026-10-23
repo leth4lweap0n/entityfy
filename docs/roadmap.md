@@ -57,6 +57,9 @@
   migrate provider (identity columns, dependent index rebuilds, named default constraints); SQL
   Server has no `CREATE INDEX IF NOT EXISTS`, has no `RESTRICT` keyword, and `AVG` over integers is
   cast to FLOAT
+- **Statement cache for MySQL and SQL Server**: `MYSQL_STMT` handles and ODBC statements stay in
+  an LRU (default capacity 32), resetting the result set/parameter bindings between uses; measured
+  by the backend cache tests (size, capacity changes, results after disabling)
 - **MySQL/MariaDB support**: opt-in core backend (`mysql://`, `mysql` dialect, prepared statement
   path, `information_schema` introspection, error classification), context integration and a
   migrate provider with its own DDL/diff path and tests; MySQL has no transactional DDL

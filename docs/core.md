@@ -285,8 +285,8 @@ db.clear_statement_cache();
 ```
 
 SQLite reuses compiled statements, PostgreSQL keeps a bounded cache of named server side
-`PREPARE` plans, and MySQL/SQL Server report capacity 0 (their clients prepare each statement
-themselves). Details
+`PREPARE` plans, MySQL caches `MYSQL_STMT` handles (reset before reuse), and SQL Server caches
+ODBC statements (cursor closed and parameter bindings reset before reuse). Details
 and measurements: [benchmarks.md](benchmarks.md).
 
 ## Errors
