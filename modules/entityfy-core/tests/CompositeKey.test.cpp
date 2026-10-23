@@ -312,6 +312,7 @@ TEST_CASE("postgres guid primary key round trips through row_key", "[composite][
     }
 
     entityfy::client db{uri};
+    db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"ck_uuid_events\""});
     db.migrate<ck_uuid_event>();
 
     const std::string id = "6f1c2c9e-3a6d-4f4e-9f1a-2b7c8d9e0f12";
@@ -334,6 +335,9 @@ TEST_CASE("postgres guid primary key round trips through row_key", "[composite][
 
     REQUIRE(db.remove_by_key<ck_uuid_event>(entityfy::row_key{entityfy::sql_value{id}}) == 1);
     REQUIRE_FALSE(db.find<ck_uuid_event>(id).has_value());
+
+    // The migration suite inspects this database; leave no table behind.
+    db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"ck_uuid_events\""});
 }
 
 #endif // ENTITYFY_ENABLE_POSTGRESQL
