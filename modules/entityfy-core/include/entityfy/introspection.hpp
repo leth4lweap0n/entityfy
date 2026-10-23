@@ -12,6 +12,10 @@ struct column_info
     std::string sql_type{};
     bool        nullable = true;
     bool        primary_key = false;
+    // Position of the column inside a composite primary key: 0 means the column
+    // is not part of the key, 1..N is the position in the key. Backends that
+    // cannot report the position leave it 0 and only set `primary_key`.
+    int         primary_key_ordinal = 0;
     std::string default_sql{};
 };
 

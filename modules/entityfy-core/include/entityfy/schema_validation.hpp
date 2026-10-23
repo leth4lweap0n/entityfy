@@ -446,6 +446,57 @@ template <typename Model>
     return found == table.foreign_keys.end() ? nullptr : &*found;
 }
 
+// A provider that reports key positions gives every key part a positive
+// ordinal. When every ordinal is 0 the provider only exposes the boolean flag,
+// so validation falls back to the per-column comparison.
+[[nodiscard]] inline bool has_primary_key_ordinals(const table_info& table)
+{
+    return std::ranges::any_of(table.columns, [](const column_info& column) {
+        return column.primary_key_ordinal > 0;
+    });
+}
+
+[[nodiscard]] inline std::vector<std::string> ordered_primary_key_columns(const table_info& table)
+{
+    std::vector<const column_info*> key_columns;
+    for(const auto& column: table.columns)
+    {
+        if(column.primary_key_ordinal > 0)
+        {
+            key_columns.push_back(&column);
+        }
+    }
+
+    std::ranges::stable_sort(key_columns, [](const column_info* left, const column_info* right) {
+        return left->primary_key_ordinal < right->primary_key_ordinal;
+    });
+
+    std::vector<std::string> names;
+    names.reserve(key_columns.size());
+    for(const auto* column: key_columns)
+    {
+        names.emplace_back(column->name);
+    }
+
+    return names;
+}
+
+[[nodiscard]] inline std::string join_column_names(const std::vector<std::string>& names)
+{
+    std::string output;
+    for(const auto& name: names)
+    {
+        if(!output.empty())
+        {
+            output += ", ";
+        }
+
+        output += name;
+    }
+
+    return output;
+}
+
 } // namespace detail
 
 template <typename Model>
@@ -476,6 +527,10 @@ template <typename Model>
         );
         return result;
     }
+
+    // The ordered key set is only comparable when the provider reports key
+    // positions; otherwise the loop below keeps the per-column flag check.
+    const bool primary_key_order_known = detail::has_primary_key_ordinals(table);
 
     for(const auto& expected_column: model.columns)
     {
@@ -510,7 +565,8 @@ template <typename Model>
             );
         }
 
-        if(options.check_primary_key && expected_column.flags.primary_key != actual_column->primary_key)
+        if(options.check_primary_key && !primary_key_order_known &&
+           expected_column.flags.primary_key != actual_column->primary_key)
         {
             detail::add_schema_issue(
                 result,
@@ -551,6 +607,32 @@ template <typename Model>
                     "column default expression differs from the model"
                 );
             }
+        }
+    }
+
+    if(options.check_primary_key && primary_key_order_known)
+    {
+        const auto expected_key_columns = primary_key_columns(model);
+
+        std::vector<std::string> expected_key_names;
+        expected_key_names.reserve(expected_key_columns.size());
+        for(const auto& column: expected_key_columns)
+        {
+            expected_key_names.emplace_back(column.name);
+        }
+
+        const auto actual_key_names = detail::ordered_primary_key_columns(table);
+
+        if(expected_key_names != actual_key_names)
+        {
+            detail::add_schema_issue(
+                result,
+                schema_issue_kind::primary_key_mismatch,
+                model.table_name,
+                detail::join_column_names(expected_key_names),
+                detail::join_column_names(actual_key_names),
+                "primary key columns or their order differ from the model"
+            );
         }
     }
 

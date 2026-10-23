@@ -781,6 +781,40 @@ public:
             }
         }
 
+        // The ordered key set lives on the primary key index: indkey lists the
+        // key attributes in key order, so unnest with ordinality gives the
+        // position of every key column.
+        statement primary_key_order_statement;
+        primary_key_order_statement.sql =
+            "SELECT a.attname, keys.ordinality "
+            "FROM pg_class t "
+            "JOIN pg_namespace n ON n.oid = t.relnamespace "
+            "JOIN pg_index ix ON t.oid = ix.indrelid AND ix.indisprimary "
+            "JOIN unnest(ix.indkey) WITH ORDINALITY AS keys(attnum, ordinality) ON true "
+            "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = keys.attnum "
+            "WHERE n.nspname = current_schema() AND t.relname = ? "
+            "ORDER BY keys.ordinality";
+        primary_key_order_statement.binds.emplace_back(std::string{table});
+
+        for(const auto& result_row: query(primary_key_order_statement))
+        {
+            if(result_row.size() < 2)
+            {
+                continue;
+            }
+
+            const auto primary_key_name = value_to_string(result_row[0]);
+            const auto primary_key_ordinal = static_cast<int>(value_to_i64(result_row[1]));
+
+            for(auto& column: output.columns)
+            {
+                if(column.name == primary_key_name)
+                {
+                    column.primary_key_ordinal = primary_key_ordinal;
+                }
+            }
+        }
+
         statement indexes_statement;
         indexes_statement.sql =
             "SELECT i.relname, ix.indisunique, string_agg(a.attname, ',' ORDER BY keys.ordinality) "

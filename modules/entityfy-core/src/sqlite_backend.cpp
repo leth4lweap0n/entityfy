@@ -283,11 +283,16 @@ public:
                 continue;
             }
 
+            // Column 5 of the pragma is the 1-based position inside the
+            // primary key (0 for columns that are not part of the key).
+            const auto key_ordinal = value_to_i64(result_row[5]);
+
             output.columns.emplace_back(column_info{
                 .name = value_to_string(result_row[1]),
                 .sql_type = value_to_string(result_row[2]),
                 .nullable = value_to_i64(result_row[3]) == 0,
-                .primary_key = value_to_i64(result_row[5]) != 0,
+                .primary_key = key_ordinal != 0,
+                .primary_key_ordinal = static_cast<int>(key_ordinal),
                 .default_sql = value_to_string(result_row[4]),
             });
         }

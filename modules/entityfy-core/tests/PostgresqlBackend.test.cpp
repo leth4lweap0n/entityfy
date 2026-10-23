@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -83,6 +84,15 @@ struct [[= entityfy::table{"pg_ck_slugs"}]] pg_ck_slug
 [[nodiscard]] entityfy::row_key pg_slug_key(std::string slug)
 {
     return entityfy::row_key{entityfy::sql_value{std::move(slug)}};
+}
+
+[[nodiscard]] const entityfy::column_info* find_column_info(const entityfy::table_info& table, std::string_view name)
+{
+    const auto found = std::ranges::find_if(table.columns, [&](const entityfy::column_info& column) {
+        return column.name == name;
+    });
+
+    return found == table.columns.end() ? nullptr : &*found;
 }
 
 } // namespace
@@ -226,6 +236,36 @@ TEST_CASE("postgres composite and string keys", "[postgresql][backend][composite
 
     REQUIRE(db.inspect_table("pg_ck_people").exists());
     REQUIRE(db.inspect_table("pg_ck_slugs").exists());
+
+    // The primary key index reports the positions, so introspection exposes the
+    // declaration order of the composite key.
+    const auto people_table = db.inspect_table("pg_ck_people");
+
+    const auto* key_id = find_column_info(people_table, "id");
+    REQUIRE(key_id != nullptr);
+    REQUIRE(key_id->primary_key);
+    REQUIRE(key_id->primary_key_ordinal == 1);
+
+    const auto* key_region = find_column_info(people_table, "region");
+    REQUIRE(key_region != nullptr);
+    REQUIRE(key_region->primary_key);
+    REQUIRE(key_region->primary_key_ordinal == 2);
+
+    const auto* non_key_title = find_column_info(people_table, "title");
+    REQUIRE(non_key_title != nullptr);
+    REQUIRE_FALSE(non_key_title->primary_key);
+    REQUIRE(non_key_title->primary_key_ordinal == 0);
+
+    const auto slug_table = db.inspect_table("pg_ck_slugs");
+
+    const auto* key_slug = find_column_info(slug_table, "slug");
+    REQUIRE(key_slug != nullptr);
+    REQUIRE(key_slug->primary_key);
+    REQUIRE(key_slug->primary_key_ordinal == 1);
+
+    const auto* non_key_name = find_column_info(slug_table, "name");
+    REQUIRE(non_key_name != nullptr);
+    REQUIRE(non_key_name->primary_key_ordinal == 0);
 
     const auto key_columns = entityfy::primary_key_columns<pg_ck_person>(db.target_dialect());
     REQUIRE(key_columns.size() == 2);

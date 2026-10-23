@@ -5,11 +5,21 @@
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace
 {
+
+[[nodiscard]] const entityfy::column_info* find_column_info(const entityfy::table_info& table, std::string_view name)
+{
+    const auto found = std::ranges::find_if(table.columns, [&](const entityfy::column_info& column) {
+        return column.name == name;
+    });
+
+    return found == table.columns.end() ? nullptr : &*found;
+}
 
 // Two key parts, both explicit: the caller owns the whole identity and the
 // table has no auto increment column.
@@ -100,7 +110,29 @@ TEST_CASE("sqlite composite primary key writes and reads rows by row_key", "[com
     entityfy::client db{"sqlite://:memory:"};
     db.migrate<ck_person>();
 
-    REQUIRE(db.inspect_table("ck_people").exists());
+    const auto sqlite_table = db.inspect_table("ck_people");
+    REQUIRE(sqlite_table.exists());
+
+    // The pragma reports each column's 1-based position in the key, so
+    // introspection keeps the declaration order of the composite key.
+    const auto* key_id = find_column_info(sqlite_table, "id");
+    REQUIRE(key_id != nullptr);
+    REQUIRE(key_id->primary_key);
+    REQUIRE(key_id->primary_key_ordinal == 1);
+
+    const auto* key_region = find_column_info(sqlite_table, "region");
+    REQUIRE(key_region != nullptr);
+    REQUIRE(key_region->primary_key);
+    REQUIRE(key_region->primary_key_ordinal == 2);
+
+    const auto* non_key_title = find_column_info(sqlite_table, "title");
+    REQUIRE(non_key_title != nullptr);
+    REQUIRE_FALSE(non_key_title->primary_key);
+    REQUIRE(non_key_title->primary_key_ordinal == 0);
+
+    const auto* non_key_score = find_column_info(sqlite_table, "score");
+    REQUIRE(non_key_score != nullptr);
+    REQUIRE(non_key_score->primary_key_ordinal == 0);
 
     const auto key_columns = entityfy::primary_key_columns<ck_person>(db.target_dialect());
     REQUIRE(key_columns.size() == 2);
@@ -182,7 +214,17 @@ TEST_CASE("sqlite string primary key round trips through row_key", "[composite][
     entityfy::client db{"sqlite://:memory:"};
     db.migrate<ck_slug>();
 
-    REQUIRE(db.inspect_table("ck_slugs").exists());
+    const auto slug_table = db.inspect_table("ck_slugs");
+    REQUIRE(slug_table.exists());
+
+    const auto* key_slug = find_column_info(slug_table, "slug");
+    REQUIRE(key_slug != nullptr);
+    REQUIRE(key_slug->primary_key);
+    REQUIRE(key_slug->primary_key_ordinal == 1);
+
+    const auto* non_key_name = find_column_info(slug_table, "name");
+    REQUIRE(non_key_name != nullptr);
+    REQUIRE(non_key_name->primary_key_ordinal == 0);
 
     const auto key_columns = entityfy::primary_key_columns<ck_slug>(db.target_dialect());
     REQUIRE(key_columns.size() == 1);
