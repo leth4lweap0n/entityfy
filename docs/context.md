@@ -99,8 +99,8 @@ for(const auto& model: ctx.model())
   changed columns (partial UPDATE).
 - `to_list()`, `find()`, `first()` and `include()` return pointers into the tracker: those rows
   are materialized *and* attached, so they pay for the `original` copy and the identity map entry.
-  `find`, `to_list` and `from_sql` stream the result through `client::query_each` and attach row by
-  row, so no `vector<row>` is built in between.
+  `find`, `to_list`, `from_sql`, `include`, `include_parent` and the joins stream the result
+  through `client::query_each` and attach row by row, so no `vector<row>` is built in between.
 - `query().select(&T::a, &T::b)` returns `std::vector<std::tuple<...>>` of values and never
   touches the tracker (the equivalent of EF Core's `Select(x => new { ... })`).
 - `as_no_tracking()` is the full-entity counterpart (EF Core's `AsNoTracking()`):
@@ -120,6 +120,19 @@ for(const auto& model: ctx.model())
   `const T&`, so `rows[0].name = "x"` does not compile. `first()` returns a copy instead - editing
   that copy is ordinary C++ on a value and never reaches the database. That is the deliberate
   difference from EF Core's `AsNoTracking`, where the same mistake is a silent no-op.
+
+  Eager loading works on the same builder and yields owning value pairs, so nothing points into
+  the result:
+
+  ```cpp
+  const auto rows = ctx.users.as_no_tracking()
+                        .order_by(&user::name)
+                        .include<post>()          // [[= entityfy::references{"users", "id"}]]
+                        .to_list();               // std::vector<std::pair<user, std::vector<post>>>
+  ```
+
+  A `std::vector<post>` navigation member is filled as well; pointer navigations
+  (`std::vector<post*>`) stay empty because a pointer into an owning vector would dangle.
 - state is read with `users.state(entity)`: `unchanged`, `added`, `modified`, `removed`,
   `detached`.
 - `users.refresh(entity)` reloads the entity from the database.

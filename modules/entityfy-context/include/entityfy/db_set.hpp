@@ -1424,16 +1424,12 @@ public:
 
         owner_->log(sql);
 
-        const auto rows = owner_->database().query(entityfy::statement{.sql = std::move(sql)});
         auto other_set = owner_->template set<Other>();
 
         const auto split = left_model.columns.size();
 
         std::vector<std::pair<T*, Other*>> output;
-        output.reserve(rows.size());
-
-        for(const auto& row: rows)
-        {
+        owner_->database().query_each(entityfy::statement{.sql = std::move(sql)}, [&](const entityfy::detail::row& row) {
             if(row.size() < split)
             {
                 throw std::runtime_error{"entityfy: join row has fewer columns than the left model"};
@@ -1447,7 +1443,8 @@ public:
 
             output.emplace_back(&state()->attach(std::move(left_value)),
                                 &other_set.attach(std::move(right_value)));
-        }
+            return true;
+        });
 
         return output;
     }
@@ -1499,7 +1496,6 @@ public:
 
         owner_->log(sql);
 
-        const auto rows = owner_->database().query(entityfy::statement{.sql = std::move(sql)});
         auto middle_set = owner_->template set<Other>();
         auto right_set = owner_->template set<Third>();
 
@@ -1507,10 +1503,7 @@ public:
         const auto second_split = first_split + middle_model.columns.size();
 
         std::vector<std::tuple<T*, Other*, Third*>> output;
-        output.reserve(rows.size());
-
-        for(const auto& row: rows)
-        {
+        owner_->database().query_each(entityfy::statement{.sql = std::move(sql)}, [&](const entityfy::detail::row& row) {
             if(row.size() < second_split)
             {
                 throw std::runtime_error{"entityfy: three-way join row has fewer columns than expected"};
@@ -1528,7 +1521,8 @@ public:
             output.emplace_back(&state()->attach(std::move(left_value)),
                                 &middle_set.attach(std::move(middle_value)),
                                 &right_set.attach(std::move(right_value)));
-        }
+            return true;
+        });
 
         return output;
     }
@@ -1598,26 +1592,25 @@ public:
 
         owner_->log(sql);
 
-        const auto rows = owner_->database().query(
-            entityfy::statement{.sql = std::move(sql), .binds = std::move(parent_keys)}
-        );
-
         std::unordered_map<std::string, std::vector<Child*>> grouped;
+        auto child_set = owner_->template set<Child>();
 
-        for(const auto& row: rows)
-        {
-            auto child = entityfy::detail::materialize_row<Child>(row);
+        owner_->database().query_each(
+            entityfy::statement{.sql = std::move(sql), .binds = std::move(parent_keys)},
+            [&](const entityfy::detail::row& row) {
+                auto child = entityfy::detail::materialize_row<Child>(row);
 
-            const auto key = entityfy::detail::read_column(child, relation.local_column);
-            if(!key)
-            {
-                continue;
+                const auto key = entityfy::detail::read_column(child, relation.local_column);
+                if(!key)
+                {
+                    return true;
+                }
+
+                auto& stored = child_set.attach(std::move(child));
+                grouped[entityfy::detail::canonical_key(*key)].push_back(&stored);
+                return true;
             }
-
-            auto child_set = owner_->template set<Child>();
-            auto& stored = child_set.attach(std::move(child));
-            grouped[entityfy::detail::canonical_key(*key)].push_back(&stored);
-        }
+        );
 
         for(T* parent: parents)
         {
@@ -1733,20 +1726,19 @@ public:
 
         owner_->log(sql);
 
-        const auto rows = owner_->database().query(
-            entityfy::statement{.sql = std::move(sql), .binds = std::move(binds)}
-        );
-
         std::unordered_map<std::string, Parent*> loaded;
         auto parent_set = owner_->template set<Parent>();
 
-        for(const auto& row: rows)
-        {
-            auto value = entityfy::detail::materialize_row<Parent>(row);
-            const auto key = entityfy::detail::primary_key_value(value, parent_model);
-            Parent& stored = parent_set.attach(std::move(value));
-            loaded[entityfy::detail::canonical_key(key)] = &stored;
-        }
+        owner_->database().query_each(
+            entityfy::statement{.sql = std::move(sql), .binds = std::move(binds)},
+            [&](const entityfy::detail::row& row) {
+                auto value = entityfy::detail::materialize_row<Parent>(row);
+                const auto key = entityfy::detail::primary_key_value(value, parent_model);
+                Parent& stored = parent_set.attach(std::move(value));
+                loaded[entityfy::detail::canonical_key(key)] = &stored;
+                return true;
+            }
+        );
 
         for(auto* child: children)
         {
@@ -1830,6 +1822,9 @@ private:
     std::vector<T> rows_;
 };
 
+template <typename T, typename Child>
+class db_untracked_include_builder;
+
 // The value-returning counterpart of db_query_builder: same filters and paging,
 // but every row is materialized into a std::vector<T> and never attached to the
 // tracker. Reads only; there is no save path from here.
@@ -1909,10 +1904,128 @@ public:
         return owner_->database().template count<T>(options_);
     }
 
+    // Eager loading on a no-tracking read: children are returned as values, so
+    // no pointer into the result can dangle.
+    template <typename Child>
+    [[nodiscard]] std::vector<std::pair<T, std::vector<Child>>> to_list_with_children() const
+    {
+        const auto parent_rows = to_list();
+        std::vector<std::pair<T, std::vector<Child>>> output;
+        output.reserve(parent_rows.size());
+
+        const auto dialect = owner_->database().target_dialect();
+        const auto parent_model = entityfy::describe_model<T>(dialect);
+        const auto child_model = entityfy::describe_model<Child>(dialect);
+        const auto& relation = entityfy::detail::find_relation<Child, T>(child_model, parent_model);
+
+        std::vector<entityfy::sql_value> parent_keys;
+        parent_keys.reserve(parent_rows.size());
+
+        for(const auto& parent: parent_rows)
+        {
+            parent_keys.push_back(entityfy::detail::primary_key_value(parent, parent_model));
+        }
+
+        std::unordered_map<std::string, std::vector<Child>> grouped;
+
+        if(!parent_keys.empty())
+        {
+            std::string sql = "SELECT ";
+
+            for(std::size_t index = 0; index < child_model.columns.size(); ++index)
+            {
+                if(index != 0)
+                {
+                    sql += ", ";
+                }
+
+                sql += entityfy::detail::quote_identifier(child_model.columns[index].name);
+            }
+
+            sql += " FROM " + entityfy::detail::quote_identifier(child_model.table_name) + " WHERE " +
+                   entityfy::detail::quote_identifier(relation.local_column) + " IN (";
+
+            for(std::size_t index = 0; index < parent_keys.size(); ++index)
+            {
+                if(index != 0)
+                {
+                    sql += ", ";
+                }
+
+                sql += "?";
+            }
+
+            sql += ")";
+
+            owner_->log(sql);
+
+            const auto rows = owner_->database().query(
+                entityfy::statement{.sql = std::move(sql), .binds = std::move(parent_keys)}
+            );
+
+            for(const auto& row: rows)
+            {
+                auto child = entityfy::detail::materialize_row<Child>(row);
+
+                if(const auto key = entityfy::detail::read_column(child, relation.local_column))
+                {
+                    grouped[entityfy::detail::canonical_key(*key)].push_back(std::move(child));
+                }
+            }
+        }
+
+        constexpr auto value_navigation = detail::find_member_of_type(^^T, ^^std::vector<Child>);
+
+        for(const auto& parent: parent_rows)
+        {
+            const auto key = entityfy::detail::primary_key_value(parent, parent_model);
+            auto       bucket = grouped[entityfy::detail::canonical_key(key)];
+
+            output.emplace_back(parent, std::move(bucket));
+
+            if constexpr(value_navigation != std::meta::info{})
+            {
+                output.back().first.[:value_navigation:] = output.back().second;
+            }
+        }
+
+        return output;
+    }
+
+    template <typename Child>
+    [[nodiscard]] db_untracked_include_builder<T, Child> include() const;
+
 private:
     db_context*               owner_;
     entityfy::query_options<T> options_;
 };
+
+// Builder returned by db_untracked_query_builder::include(): to_list() yields
+// owning value pairs (parent, children).
+template <typename T, typename Child>
+class db_untracked_include_builder
+{
+public:
+    explicit db_untracked_include_builder(db_untracked_query_builder<T> builder)
+        : builder_{std::move(builder)}
+    {
+    }
+
+    [[nodiscard]] std::vector<std::pair<T, std::vector<Child>>> to_list() const
+    {
+        return builder_.template to_list_with_children<Child>();
+    }
+
+private:
+    db_untracked_query_builder<T> builder_;
+};
+
+template <typename T>
+template <typename Child>
+db_untracked_include_builder<T, Child> db_untracked_query_builder<T>::include() const
+{
+    return db_untracked_include_builder<T, Child>{*this};
+}
 
 template <typename T>
 class db_query_builder
@@ -1961,15 +2074,11 @@ public:
 
         owner_->log(command.sql);
 
-        const auto rows = owner_->database().query(command);
-
         std::vector<T*> output;
-        output.reserve(rows.size());
-
-        for(const auto& row: rows)
-        {
+        owner_->database().query_each(command, [&](const entityfy::detail::row& row) {
             output.push_back(&state_->attach(entityfy::detail::materialize_row<T>(row)));
-        }
+            return true;
+        });
 
         return output;
     }

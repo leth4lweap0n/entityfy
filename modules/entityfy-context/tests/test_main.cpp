@@ -1264,6 +1264,28 @@ status run_no_tracking_checks()
     }
     require(untouched, "no-tracking mutation reached the database");
 
+    // Eager loading on a no-tracking read: value pairs, no tracker entries.
+    ctx.migrate<rc_post>();
+    auto posts = ctx.set<rc_post>();
+
+    const auto owner_id = every.front().id;
+    const auto other_user = users.as_no_tracking().where(entityfy::where(&rc_user::name).eq("User 2")).first();
+    require(other_user.has_value(), "no-tracking owner lookup");
+
+    posts.add(rc_post{.user_id = owner_id, .title = "first", .score = 1});
+    posts.add(rc_post{.user_id = owner_id, .title = "second", .score = 2});
+    posts.add(rc_post{.user_id = other_user->id, .title = "third", .score = 3});
+    ctx.save_changes();
+
+    const auto with_posts = users.as_no_tracking().order_by(&rc_user::name).include<rc_post>().to_list();
+    require(with_posts.size() == 3, "no-tracking include row count");
+    require(with_posts[0].first.name == "User 1" && with_posts[0].second.size() == 2,
+            "no-tracking include buckets children by key");
+    require(with_posts[1].first.name == "User 2" && with_posts[1].second.size() == 1,
+            "no-tracking include resolves each parent");
+    require(with_posts[2].second.empty(), "no-tracking include leaves unrelated parents empty");
+    require(users.size() == tracked_before, "no-tracking include did not grow the tracker");
+
     return status::passed;
 }
 
