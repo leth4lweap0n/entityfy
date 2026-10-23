@@ -52,7 +52,7 @@ void print_help()
         "\n"
         "options:\n"
         "  --db <uri>               sqlite://file.db or postgres://conninfo\n"
-        "  --provider <name>        sqlite | postgres (for snapshot/add, defaults to sqlite)\n"
+        "  --provider <name>        sqlite | postgres | mysql (for snapshot/add, defaults to sqlite)\n"
         "  --root <dir>             migration directory (defaults to migrations/<provider>)\n"
         "  --rename <old>=<new>     column rename hint (table.column=new_name by default)\n"
         "  --allow-destructive      allows destructive operations such as drop/type changes\n"

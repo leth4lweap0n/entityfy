@@ -1501,6 +1501,114 @@ status run_postgres_checks()
     return status::passed;
 }
 
+status run_mysql_checks()
+{
+    const char* uri = std::getenv("ENTITYFY_MYSQL_URI");
+    if(uri == nullptr || std::string{uri}.empty())
+    {
+        std::cout << "mysql skipped: ENTITYFY_MYSQL_URI is not set\n";
+        return status::skipped;
+    }
+
+    entityfy::db_context ctx{uri};
+
+    for(const char* table : {"rc_children", "rc_parents", "rc_comments", "rc_posts", "rc_tags", "rc_users"})
+    {
+        ctx.execute(std::string{"DROP TABLE IF EXISTS \""} + table + "\"");
+    }
+
+    ctx.migrate<rc_user>();
+    ctx.migrate<rc_post>();
+    ctx.migrate<rc_comment>();
+    ctx.migrate<rc_tag>();
+    ctx.migrate<rc_parent>();
+    ctx.migrate<rc_child>();
+
+    auto users = ctx.set<rc_user>();
+    auto& ada = users.add(rc_user{.email = "ada@mysql.test", .name = "Ada"});
+    auto& grace = users.add(rc_user{.email = "grace@mysql.test", .name = "Grace"});
+
+    require(ctx.save_changes().inserted == 2, "mysql insert count");
+    require(users.query().sum(&rc_user::id) == std::optional<std::int64_t>{3}, "mysql aggregate sum");
+    require(users.query().avg(&rc_user::id) == std::optional<double>{1.5}, "mysql aggregate avg");
+    require(users.query().min(&rc_user::id) == std::optional<std::int64_t>{1}, "mysql aggregate min");
+    require(users.query().max(&rc_user::id) == std::optional<std::int64_t>{2}, "mysql aggregate max");
+
+    std::vector<std::string> statements;
+    ctx.set_logger([&](std::string_view sql) { statements.emplace_back(sql); });
+
+    const auto selected = users.query()
+                              .where(entityfy::where(&rc_user::email).ends_with("@mysql.test"))
+                              .order_by(&rc_user::name)
+                              .take(1)
+                              .to_list();
+    require(selected.size() == 1 && selected.front() == &ada, "mysql filter/order/take");
+    require(users.query().count() == 2, "mysql query count");
+
+    auto posts = ctx.set<rc_post>();
+    auto& first_post = posts.add(rc_post{.user_id = ada.id, .title = "first", .score = 10});
+    posts.add(rc_post{.user_id = ada.id, .title = "second", .score = 20});
+    posts.add(rc_post{.user_id = grace.id, .title = "third", .score = 5});
+    require(ctx.save_changes().inserted == 3, "mysql posts inserted");
+
+    const auto joined = users.join<rc_post>(&rc_user::id, &rc_post::user_id);
+    require(joined.size() == 3, "mysql join row count");
+
+    const auto counts = posts.query().count_by(&rc_post::user_id);
+    require(counts.size() == 2 && counts[0].first == ada.id && counts[0].second == 2 &&
+                counts[1].first == grace.id && counts[1].second == 1,
+            "mysql count_by");
+
+    const auto included = users.include<rc_post>({&ada, &grace});
+    require(included.size() == 2 && included[0].second.size() == 2 && included[1].second.size() == 1, "mysql include");
+
+    const auto projected = users.query().order_by(&rc_user::name).select(&rc_user::id, &rc_user::name);
+    require(projected.size() == 2 && std::get<0>(projected[0]) == ada.id &&
+                std::get<1>(projected[0]) == "Ada",
+            "mysql projection values");
+
+    const auto raw = users.from_sql(
+        "SELECT \"id\", \"email\", \"name\", \"version\" FROM \"rc_users\" WHERE \"email\" = 'ada@mysql.test'");
+    require(raw.size() == 1 && raw.front() == &ada, "mysql raw sql materialization");
+
+    statements.clear();
+    ada.name = "Ada Lovelace";
+    require(ctx.save_changes().updated == 1, "mysql single update tracked");
+    require(statements.size() == 1, "mysql single update statement");
+    require(statements.front().find("\"name\" = ?") != std::string::npos, "mysql changed column is in update");
+    require(statements.front().find("\"email\" = ?") == std::string::npos, "mysql unchanged column is not in update");
+
+    users.remove(ada);
+    require(ctx.save_changes().removed == 1, "mysql delete tracked");
+    require(ctx.database().table<rc_post>().count() == 1, "mysql delete cascade removed posts");
+
+    auto tags = ctx.set<rc_tag>();
+    tags.add(rc_tag{.id = 1, .name = "one"});
+    tags.add(rc_tag{.id = 2, .name = "two"});
+    tags.add(rc_tag{.id = 3, .name = "three"});
+    require(ctx.save_changes().inserted == 3, "mysql explicit-key entities inserted");
+    require(ctx.database().table<rc_tag>().count() == 3, "mysql batched rows exist");
+
+    const auto json_rows = ctx.query("SELECT \"payload\" FROM \"rc_tags\" WHERE \"id\" = 1");
+    require(json_rows.size() == 1 && std::get<std::string>(json_rows.front().front()) == "{}",
+            "mysql json column round trip");
+
+    ctx.transaction([&] {
+        users.add(rc_user{.email = "tx@mysql.test", .name = "Tx"});
+        ctx.save_changes();
+    });
+    require(ctx.database().table<rc_user>().count() == 2, "mysql transaction commit persists");
+
+    (void)first_post;
+
+    for(const char* table : {"rc_children", "rc_parents", "rc_comments", "rc_posts", "rc_tags", "rc_users"})
+    {
+        ctx.execute(std::string{"DROP TABLE IF EXISTS \""} + table + "\"");
+    }
+
+    return status::passed;
+}
+
 } // namespace
 
 int main()
@@ -1532,6 +1640,7 @@ int main()
         {"pool", run_pool_checks},
         {"async", run_async_checks},
         {"postgres", run_postgres_checks},
+        {"mysql", run_mysql_checks},
     };
 
     int passed = 0;

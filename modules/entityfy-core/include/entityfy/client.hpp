@@ -211,8 +211,31 @@ public:
         }
 
         backend_->execute(create_table(model));
+
+        std::vector<std::string> existing_indexes;
+        if(model.target == dialect::mysql)
+        {
+            // MySQL has no CREATE INDEX IF NOT EXISTS, so the existing index
+            // names are read back first.
+            for(const auto& index : backend_->inspect_table(model.table_name).indexes)
+            {
+                existing_indexes.push_back(index.name);
+            }
+        }
+
         for(const auto& index : create_index_statements(model))
         {
+            if(!existing_indexes.empty())
+            {
+                // The index name is the second token group of the generated SQL.
+                if(std::ranges::any_of(existing_indexes, [&](const std::string& name) {
+                       return index.sql.find(detail::quote_identifier(name)) != std::string::npos;
+                   }))
+                {
+                    continue;
+                }
+            }
+
             backend_->execute(index);
         }
     }

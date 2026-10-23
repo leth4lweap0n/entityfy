@@ -143,8 +143,9 @@ db.migrate_tph<animal, cat, dog>();      // one table with the union of the colu
 ## Connection and schema
 
 ```cpp
-entityfy::client db{"sqlite://app.db"};          // SQLite
+entityfy::client db{"sqlite://app.db"};                  // SQLite
 entityfy::client db{"postgres://host=... dbname=app"};  // PostgreSQL
+entityfy::client db{"mysql://user:pass@host:3306/app"}; // MySQL / MariaDB (opt-in at build time)
 
 db.migrate<user>();          // creates the table + indexes (idempotent)
 db.migrate_force<user>();    // forces past a schema validation error
@@ -233,7 +234,7 @@ this:
 | — (default) | `TEXT` column |
 | `[[= entityfy::text]]` | `TEXT` column |
 | `[[= entityfy::varchar{n}]]` | `VARCHAR(n)` column |
-| `[[= entityfy::json]]` | `JSONB` on PostgreSQL, `TEXT` on SQLite — the converter **must** produce **valid JSON** |
+| `[[= entityfy::json]]` | `JSONB` on PostgreSQL, `TEXT` on SQLite, `LONGTEXT` on MySQL/MariaDB — the converter **must** produce **valid JSON** |
 | `[[= entityfy::sql_type{"..."}]]` | Raw SQL type (e.g. `"VARCHAR(64)"`) |
 
 The `uuid`, `date`, `time`, and `timestamp` annotations are valid only on `std::string` (or a
@@ -282,7 +283,8 @@ db.statement_cache_size();             // how many statements are cached
 db.clear_statement_cache();
 ```
 
-Only the SQLite backend reuses statements; the PostgreSQL backend reports capacity 0. Details
+SQLite reuses compiled statements, PostgreSQL keeps a bounded cache of named server side
+`PREPARE` plans, and MySQL reports capacity 0 (the client prepares each statement itself). Details
 and measurements: [benchmarks.md](benchmarks.md).
 
 ## Errors

@@ -46,7 +46,19 @@ client::client(std::string_view uri)
 #endif
     }
 
-    throw std::invalid_argument{"unsupported entityfy ORM URI. Expected sqlite://, postgres://, or postgresql://"};
+    if(starts_with(uri, "mysql://"))
+    {
+#if defined(ENTITYFY_ENABLE_MYSQL)
+        backend_ = detail::make_mysql_backend(std::string{uri});
+        return;
+#else
+        throw std::invalid_argument{"MySQL backend was not enabled when entityfy was built"};
+#endif
+    }
+
+    throw std::invalid_argument{
+        "unsupported entityfy ORM URI. Expected sqlite://, postgres://, postgresql://, or mysql://"
+    };
 }
 
 client::~client() = default;

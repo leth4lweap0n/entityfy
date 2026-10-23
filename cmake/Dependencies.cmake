@@ -48,6 +48,26 @@ if(ENTITYFY_ENABLE_POSTGRESQL)
     endif()
 endif()
 
+# --- MySQL / MariaDB (Connector/C, used by the core backend) --------------
+if(ENTITYFY_ENABLE_MYSQL)
+    find_path(MYSQL_INCLUDE_DIR NAMES mysql.h HINTS ${MYSQL_ROOT} PATH_SUFFIXES include include/mariadb)
+    find_library(MYSQL_LIBRARY NAMES mariadb libmariadb mysqlclient HINTS ${MYSQL_ROOT} PATH_SUFFIXES lib lib/mariadb)
+
+    if(MYSQL_INCLUDE_DIR AND MYSQL_LIBRARY)
+        add_library(entityfy_mysql UNKNOWN IMPORTED)
+        set_target_properties(entityfy_mysql PROPERTIES
+            IMPORTED_LOCATION "${MYSQL_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${MYSQL_INCLUDE_DIR}"
+        )
+        add_library(entityfy::mysql ALIAS entityfy_mysql)
+    else()
+        message(STATUS
+            "MariaDB Connector/C not found: the MySQL backend stays disabled. "
+            "Set MYSQL_ROOT, or MYSQL_INCLUDE_DIR and MYSQL_LIBRARY, to enable it.")
+        set(ENTITYFY_ENABLE_MYSQL OFF CACHE BOOL "Build the MySQL/MariaDB backend" FORCE)
+    endif()
+endif()
+
 # --- JSON (migration snapshots and scaffold) -------------------------------
 FetchContent_Declare(
     nlohmann_json

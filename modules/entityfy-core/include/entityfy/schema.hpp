@@ -263,7 +263,7 @@ template <typename Type>
     }
     else if constexpr(std::same_as<value_type, bool>)
     {
-        return target == dialect::postgresql ? "BOOLEAN" : "INTEGER";
+        return target == dialect::sqlite ? "INTEGER" : "BOOLEAN";
     }
     else if constexpr(std::is_enum_v<value_type>)
     {
@@ -277,12 +277,17 @@ template <typename Type>
         }
         else
         {
-            return target == dialect::postgresql ? "BIGINT" : "INTEGER";
+            return target == dialect::sqlite ? "INTEGER" : "BIGINT";
         }
     }
     else if constexpr(std::floating_point<value_type>)
     {
-        return target == dialect::postgresql ? "DOUBLE PRECISION" : "REAL";
+        if(target == dialect::postgresql)
+        {
+            return "DOUBLE PRECISION";
+        }
+
+        return target == dialect::mysql ? "DOUBLE" : "REAL";
     }
     else if constexpr(std::same_as<value_type, std::string>)
     {
@@ -290,15 +295,15 @@ template <typename Type>
     }
     else if constexpr(is_sys_days_v<value_type>)
     {
-        return target == dialect::postgresql ? "DATE" : "TEXT";
+        return target == dialect::sqlite ? "TEXT" : "DATE";
     }
     else if constexpr(is_system_time_point_v<value_type>)
     {
-        return target == dialect::postgresql ? "TIMESTAMP" : "TEXT";
+        return target == dialect::sqlite ? "TEXT" : (target == dialect::mysql ? "DATETIME" : "TIMESTAMP");
     }
     else if constexpr(is_chrono_duration_v<value_type>)
     {
-        return target == dialect::postgresql ? "TIME" : "TEXT";
+        return target == dialect::sqlite ? "TEXT" : "TIME";
     }
     else if constexpr(is_byte_vector_v<value_type>)
     {
@@ -345,19 +350,31 @@ template <typename Field, auto ReflectedField>
     }
     else if constexpr(meta::has_annotation<json_t, ReflectedField>())
     {
-        return target == dialect::postgresql ? "JSONB" : "TEXT";
+        if(target == dialect::postgresql)
+        {
+            return "JSONB";
+        }
+
+        // MariaDB implements JSON as LONGTEXT plus a validity check and reports
+        // it as longtext, so the portable choice is LONGTEXT on MySQL/MariaDB.
+        return target == dialect::mysql ? "LONGTEXT" : "TEXT";
     }
     else if constexpr(meta::has_annotation<uuid_t, ReflectedField>())
     {
-        return target == dialect::postgresql ? "UUID" : "TEXT";
+        if(target == dialect::postgresql)
+        {
+            return "UUID";
+        }
+
+        return target == dialect::mysql ? "CHAR(36)" : "TEXT";
     }
     else if constexpr(meta::has_annotation<date_t, ReflectedField>())
     {
-        return target == dialect::postgresql ? "DATE" : "TEXT";
+        return target == dialect::sqlite ? "TEXT" : "DATE";
     }
     else if constexpr(meta::has_annotation<time_t, ReflectedField>())
     {
-        return target == dialect::postgresql ? "TIME" : "TEXT";
+        return target == dialect::sqlite ? "TEXT" : "TIME";
     }
     else if constexpr(
         meta::has_annotation<timestamp_t, ReflectedField>() ||
@@ -369,15 +386,20 @@ template <typename Field, auto ReflectedField>
 
         if constexpr(is_sys_days_v<storage_type>)
         {
-            return target == dialect::postgresql ? "DATE" : "TEXT";
+            return target == dialect::sqlite ? "TEXT" : "DATE";
         }
         else if constexpr(is_chrono_duration_v<storage_type>)
         {
-            return target == dialect::postgresql ? "TIME" : "TEXT";
+            return target == dialect::sqlite ? "TEXT" : "TIME";
         }
         else
         {
-            return target == dialect::postgresql ? "TIMESTAMP" : "TEXT";
+            if(target == dialect::sqlite)
+            {
+                return "TEXT";
+            }
+
+            return target == dialect::mysql ? "DATETIME" : "TIMESTAMP";
         }
     }
     else

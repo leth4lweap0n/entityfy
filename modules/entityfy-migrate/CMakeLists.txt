@@ -1,6 +1,6 @@
 # entityfy migrate: schema snapshots, diffing, apply/rollback and SQL scripts.
 
-add_library(entityfy_migrate STATIC
+set(entityfy_migrate_sources
     src/schema.cpp
     src/json.cpp
     src/util.cpp
@@ -13,6 +13,12 @@ add_library(entityfy_migrate STATIC
     src/postgres_provider.cpp
     src/pq_dynamic.cpp
 )
+
+if(ENTITYFY_ENABLE_MYSQL)
+    list(APPEND entityfy_migrate_sources src/mysql_provider.cpp)
+endif()
+
+add_library(entityfy_migrate STATIC ${entityfy_migrate_sources})
 add_library(entityfy::migrate ALIAS entityfy_migrate)
 
 target_include_directories(entityfy_migrate
@@ -29,6 +35,11 @@ target_compile_options(entityfy_migrate
 if(ENTITYFY_ENABLE_SQLITE)
     target_link_libraries(entityfy_migrate PRIVATE entityfy::sqlite)
     target_compile_definitions(entityfy_migrate PUBLIC ENTITYFY_ENABLE_SQLITE)
+endif()
+
+if(ENTITYFY_ENABLE_MYSQL)
+    target_link_libraries(entityfy_migrate PRIVATE entityfy::mysql)
+    target_compile_definitions(entityfy_migrate PUBLIC ENTITYFY_ENABLE_MYSQL)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -56,6 +67,7 @@ if(ENTITYFY_BUILD_TESTS)
         tests/test_postgres.cpp
         tests/test_table_ops.cpp
         tests/test_owned_model.cpp
+        tests/test_mysql.cpp
     )
     target_link_libraries(entityfy_migrate_tests PRIVATE entityfy::migrate)
     target_include_directories(entityfy_migrate_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples)

@@ -98,6 +98,7 @@ public:
 
 std::unique_ptr<backend> make_sqlite_backend(std::string path);
 std::unique_ptr<backend> make_postgresql_backend(std::string connection_info);
+std::unique_ptr<backend> make_mysql_backend(std::string connection_info);
 
 [[nodiscard]] std::string postgres_placeholders(std::string_view sql);
 

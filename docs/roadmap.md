@@ -52,6 +52,10 @@
 - **Owned value objects**: `[[= entityfy::owned]]` splits a struct across prefixed columns,
   through `describe_model`, DDL, INSERT/UPDATE/UPSERT, `insert_many`, the row mapper and
   migrations; nested owned values and inner annotations supported
+- **MySQL/MariaDB support**: opt-in core backend (`mysql://`, `mysql` dialect, prepared statement
+  path, `information_schema` introspection, error classification), context integration and a
+  migrate provider with its own DDL/diff path and tests; MySQL has no transactional DDL and the
+  migrate provider has no backup
 - **TPH inheritance**: `[[= entityfy::type_tag{...}]]` derived models share the base table and
   inherit its columns, `migrate_tph<Base, Types...>()` creates the union table (subtype columns
   nullable), CRUD is discriminator-scoped and `find_all_types()` loads the hierarchy as variants;
@@ -68,9 +72,10 @@ surface that has to change, so a session can pick one up without redoing the
 analysis. Everything above this section is implemented and covered by the test
 suite.
 
-1. **Additional providers (MySQL, SQL Server)** — one backend each plus dialect differences
-   (identifier quoting, generated keys, upsert syntax, batch limits) and a CI service container per
-   provider. Acceptance: core, migrate and context suites run against the provider in CI.
+1. **SQL Server provider** — needs an ODBC based client (`msodbcsql` on Windows, `unixodbc` on
+   Linux), a T-SQL dialect (`TOP`/`OFFSET FETCH`, `OUTPUT INSERTED`, bracket identifiers, no
+   `ON DUPLICATE KEY`) plus a migrate provider. Acceptance: core, migrate and context suites run
+   against a SQL Server service container in CI.
 
 ## Smaller follow-ups
 

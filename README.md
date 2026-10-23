@@ -31,7 +31,7 @@ The path from model to SQL:
 flowchart LR
     model["struct + annotation"] --> describe["describe_model&lt;Model&gt;"]
     describe --> statement["statement generation"]
-    statement --> backend["backend<br/>SQLite · PostgreSQL"]
+    statement --> backend["backend<br/>SQLite · PostgreSQL · MySQL"]
 ```
 
 ## Quick start
@@ -167,7 +167,7 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
 
 | Module | Responsibility | Documentation |
 |---|---|---|
-| `entityfy-core` | Model/annotation system, DDL generation, query DSL, SQLite + PostgreSQL backends, statement cache, value converter | [docs/core.md](docs/core.md) |
+| `entityfy-core` | Model/annotation system, DDL generation, query DSL, SQLite + PostgreSQL + MySQL/MariaDB backends, statement cache, value converter | [docs/core.md](docs/core.md) |
 | `entityfy-context` | Identity map, snapshot-based change tracking, partial UPDATE, FK dependency ordering, eager loading, context pool | [docs/context.md](docs/context.md) |
 | `entityfy-migrate` | Snapshot, diff, apply/rollback, runnable SQL script, scaffold, CLI | [docs/migration.md](docs/migration.md) |
 
@@ -294,10 +294,15 @@ the ratios are more stable.
 ctest --preset release
 ```
 
-50 CTest entries: 48 core Catch2 test cases (233 assertions) and the migrate/context test
-binaries - which contain 10 and 17 scenarios respectively.
-PostgreSQL tests run when `ENTITYFY_PG_URI` is provided; with `ENTITYFY_REQUIRE_PG=1` a skipped
-test counts as a failure. Tests write to a temporary workspace and do not pollute the source tree.
+50 CTest entries in the default build: 48 core Catch2 test cases (233 assertions) and the
+migrate/context test binaries - which contain 10 and 17 scenarios respectively. With
+`ENTITYFY_ENABLE_MYSQL=ON` the core suite adds two cases and the migrate and context binaries add
+one scenario each (52 entries).
+
+PostgreSQL tests run when `ENTITYFY_PG_URI` is provided; MySQL tests run when
+`ENTITYFY_MYSQL_URI` is provided. With `ENTITYFY_REQUIRE_PG=1` / `ENTITYFY_REQUIRE_MYSQL=1` a
+skipped backend counts as a failure. Tests write to a temporary workspace and do not pollute the
+source tree.
 
 ## Build
 
@@ -307,7 +312,7 @@ module.
 
 | Toolchain | Status |
 |---|---|
-| **GCC 16.2** (winlibs MinGW-w64, Windows x64) | the verified toolchain: Debug and Release build, all 39 CTest entries in both, every benchmark number in this README and `docs/benchmarks.md` |
+| **GCC 16.2** (winlibs MinGW-w64, Windows x64) | the verified toolchain: Debug and Release build, all CTest entries in both, every benchmark number in this README and `docs/benchmarks.md` |
 | Clang 21+ | implements P2996 behind `-freflection`, but this project has **not** been built or tested with it |
 | MSVC | no C++26 reflection yet, so it cannot build the project |
 
@@ -315,6 +320,10 @@ Requirements: CMake 3.30+ (`CMakePresets.json` targets 3.30; 4.4 was used here).
 backend requires `libpq`; pass its location with
 `-DPostgreSQL_INCLUDE_DIR=<pgsql>/include -DPostgreSQL_LIBRARY=<pgsql>/lib/libpq.dll.a` (CMake
 finds it automatically when it is on `CMAKE_PREFIX_PATH`), or use `--preset release-no-pg`.
+The MySQL backend is off by default and needs MariaDB Connector/C:
+`-DENTITYFY_ENABLE_MYSQL=ON -DMYSQL_ROOT=<connector>` (or `MYSQL_INCLUDE_DIR` and `MYSQL_LIBRARY`).
+The connector can be built from source with `-DWITH_SSL=SCHANNEL` on Windows, so it needs no
+OpenSSL; keep `libmariadb.dll` next to the executables.
 
 On MinGW the runtime (`libstdc++`, `libgcc`, `libwinpthread`) is linked statically for
 Release-like configurations, so the shipped executables need no MinGW DLLs. **Debug is excluded**:
@@ -322,8 +331,9 @@ GCC 16.2 fails to link Debug binaries against the static libstdc++ (a duplicate
 `std::runtime_error` definition that is only pulled in without optimization), so Debug binaries use
 the MinGW DLLs and need `<mingw>/bin` on `PATH` to run.
 
-There is no CI configuration yet, so "verified" above means the toolchain the maintainers build
-and test with locally.
+CI: `.github/workflows/ci.yml` (branch `ci-workflow`, pending a push with the `workflow` scope)
+runs the SQLite, PostgreSQL and MySQL suites in the official `gcc:16` container; a skipped
+PostgreSQL/MySQL run is a failure there (see the `ENTITYFY_REQUIRE_*` variables).
 
 ```bash
 cmake --preset release
@@ -338,8 +348,8 @@ cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release \
   -DPostgreSQL_INCLUDE_DIR=<pgsql>/include -DPostgreSQL_LIBRARY=<pgsql>/lib/libpq.dll.a
 ```
 
-Options: `ENTITYFY_ENABLE_SQLITE`, `ENTITYFY_ENABLE_POSTGRESQL`, `ENTITYFY_BUILD_TESTS`,
-`ENTITYFY_BUILD_EXAMPLES`, `ENTITYFY_BUILD_DEMO`.
+Options: `ENTITYFY_ENABLE_SQLITE`, `ENTITYFY_ENABLE_POSTGRESQL`, `ENTITYFY_ENABLE_MYSQL`,
+`ENTITYFY_BUILD_TESTS`, `ENTITYFY_BUILD_EXAMPLES`, `ENTITYFY_BUILD_DEMO`.
 
 ### Using it in your project
 
@@ -411,7 +421,11 @@ through `sl3`, and there is no second copy of SQLite.
   `find_all_types`), but no tracked or eager-loaded polymorphic reads, and a hierarchy has one base
   class. Composite/JSON values are stored through `value_converter`, and
   `[[= entityfy::owned]]` value objects are split into prefixed columns.
-- There are no MySQL or SQL Server providers.
+- SQL Server is not supported. MySQL/MariaDB support is opt-in (`ENTITYFY_ENABLE_MYSQL`), its DDL
+  is not transactional (a failed migration cannot be rolled back), the migrate provider has no
+  mysqldump backup (destructive steps need `--no-backup`), `[[= entityfy::json]]` maps to
+  `LONGTEXT` because MariaDB reports its JSON alias that way, and the backend reports a statement
+  cache capacity of zero.
 - Row reading is costly through `vector<vector<sql_value>>`; single-row reads need a separate
   path.
 - No `install()` / `find_package()` export yet: consume the project with `add_subdirectory` or

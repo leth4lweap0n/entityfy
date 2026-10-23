@@ -375,6 +375,13 @@ namespace detail
         return "NO ACTION";
     }
 
+    // RESTRICT and NO ACTION differ only in timing details the ORM never uses;
+    // MySQL/MariaDB reports them interchangeably.
+    if(normalized == "RESTRICT")
+    {
+        return "NO ACTION";
+    }
+
     return normalized;
 }
 

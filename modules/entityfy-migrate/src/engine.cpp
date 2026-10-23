@@ -207,12 +207,14 @@ void engine::ensure_history() const
 
     const std::string history = history_table();
 
+    const bool mysql = backend_->name() == "mysql";
+
     backend_->execute_sql(
         "CREATE TABLE IF NOT EXISTS \"" + history + "\" ("
-        "\"id\" TEXT PRIMARY KEY, "
-        "\"checksum\" TEXT NOT NULL DEFAULT '', "
+        "\"id\" " + (mysql ? "VARCHAR(191)" : "TEXT") + " PRIMARY KEY, "
+        "\"checksum\" " + (mysql ? "VARCHAR(64)" : "TEXT") + " NOT NULL DEFAULT '', "
         "\"seq\" INTEGER NOT NULL DEFAULT 0, "
-        "\"applied_at\" TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        "\"applied_at\" " + (mysql ? "DATETIME" : "TEXT") + " NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ")");
 
     bool has_sequence = true;
@@ -488,10 +490,11 @@ void engine::write_script(const std::vector<migration_file>& migrations, int seq
 
     out << "-- entityfy-migrate script (" << options_.provider_name << ")\n";
     out << "CREATE TABLE IF NOT EXISTS \"entityfy_schema_migrations\" ("
-           "\"id\" TEXT PRIMARY KEY, "
-           "\"checksum\" TEXT NOT NULL DEFAULT '', "
-           "\"seq\" INTEGER NOT NULL DEFAULT 0, "
-           "\"applied_at\" TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);\n";
+        << "\"id\" " << (options_.provider_name == "mysql" ? "VARCHAR(191)" : "TEXT") << " PRIMARY KEY, "
+        << "\"checksum\" TEXT NOT NULL DEFAULT '', "
+        << "\"seq\" INTEGER NOT NULL DEFAULT 0, "
+        << "\"applied_at\" " << (options_.provider_name == "mysql" ? "DATETIME" : "TEXT")
+        << " NOT NULL DEFAULT CURRENT_TIMESTAMP);\n";
 
     const bool sqlite = options_.provider_name == "sqlite";
     if(sqlite)
