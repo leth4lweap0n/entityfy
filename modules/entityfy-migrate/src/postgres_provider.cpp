@@ -237,6 +237,16 @@ std::vector<std::string> split_columns(std::string_view value)
     return output;
 }
 
+// Primary-key membership before and after a plan; PostgreSQL replaces the
+// constraint instead of altering the participating columns.
+struct key_change
+{
+    std::vector<std::string> before;
+    std::vector<std::string> after;
+};
+
+const std::vector<operation> empty_operations;
+
 class postgres_provider final : public provider
 {
 public:
@@ -431,9 +441,33 @@ public:
 
         plan output;
         const auto operations = diff_schemas(desired, actual, effective);
-        output.destructive = has_destructive(operations);
 
-        if(operations.empty())
+        // PostgreSQL cannot change primary-key membership with ALTER COLUMN, so
+        // the constraint is dropped and recreated. Both sides are compared
+        // directly, which also covers a change confined to table::primary_key
+        // where no column operation is produced.
+        std::map<std::string, key_change, std::less<>> key_changes;
+
+        for(const auto& desired_table: desired.tables)
+        {
+            const table* actual_table = find_table(actual, desired_table.name);
+            if(actual_table == nullptr)
+            {
+                continue;
+            }
+
+            std::vector<std::string> before = primary_key_columns(*actual_table);
+            std::vector<std::string> after = primary_key_columns(desired_table);
+
+            if(before != after)
+            {
+                key_changes.emplace(desired_table.name, key_change{std::move(before), std::move(after)});
+            }
+        }
+
+        output.destructive = has_destructive(operations) || !key_changes.empty();
+
+        if(operations.empty() && key_changes.empty())
         {
             return output;
         }
@@ -478,7 +512,9 @@ public:
         for(const auto& desired_table: desired.tables)
         {
             const auto found = by_table.find(desired_table.name);
-            if(found == by_table.end())
+            const auto changed_key = key_changes.find(desired_table.name);
+
+            if(found == by_table.end() && changed_key == key_changes.end())
             {
                 continue;
             }
@@ -489,7 +525,31 @@ public:
                 continue;
             }
 
-            for(const auto& value: found->second)
+            // The old key goes first so the column steps run without it.
+            if(changed_key != key_changes.end() && !changed_key->second.before.empty())
+            {
+                const auto rows = database_->query_params(
+                    "SELECT c.conname FROM pg_constraint c "
+                    "JOIN pg_class t ON t.oid = c.conrelid "
+                    "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                    "WHERE c.contype = 'p' AND n.nspname = current_schema() AND t.relname = $1 LIMIT 1",
+                    {desired_table.name});
+
+                if(rows.empty() || rows.front().empty())
+                {
+                    throw std::runtime_error{"entityfy/migrate:postgres: primary key constraint not found for " +
+                                             desired_table.name};
+                }
+
+                step drop;
+                drop.sql = "ALTER TABLE " + quote_ident(desired_table.name) + " DROP CONSTRAINT " +
+                           quote_ident(rows.front().front());
+                output.steps.emplace_back(std::move(drop));
+            }
+
+            const std::vector<operation>& table_operations = found == by_table.end() ? empty_operations : found->second;
+
+            for(const auto& value: table_operations)
             {
                 switch(value.kind)
                 {
@@ -525,10 +585,9 @@ public:
                         break;
                     }
 
-                    if(value.column_spec.primary_key != before->primary_key ||
-                       value.column_spec.auto_increment != before->auto_increment)
+                    if(value.column_spec.auto_increment != before->auto_increment)
                     {
-                        throw std::runtime_error{"entityfy/migrate:postgres: primary key/identity change requires a manual "
+                        throw std::runtime_error{"entityfy/migrate:postgres: identity change requires a manual "
                                                  "migration: " +
                                                  desired_table.name + "." + value.column};
                     }
@@ -635,6 +694,28 @@ public:
                 case op_kind::drop_table:
                     break;
                 }
+            }
+
+            if(changed_key != key_changes.end() && !changed_key->second.after.empty())
+            {
+                std::string sql = "ALTER TABLE " + quote_ident(desired_table.name) + " ADD PRIMARY KEY (";
+                const auto& after = changed_key->second.after;
+
+                for(std::size_t index = 0; index < after.size(); ++index)
+                {
+                    if(index != 0)
+                    {
+                        sql += ", ";
+                    }
+
+                    sql += quote_ident(after[index]);
+                }
+
+                sql += ")";
+
+                step add;
+                add.sql = std::move(sql);
+                output.steps.emplace_back(std::move(add));
             }
         }
 

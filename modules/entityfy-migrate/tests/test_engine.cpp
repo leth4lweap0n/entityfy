@@ -499,6 +499,93 @@ entityfy_test::status test_engine()
         std::filesystem::remove_all(script_root);
     }
 
+    {
+        const auto key_path = test_workspace("entityfy_key_change_test.db");
+        std::filesystem::remove(key_path);
+
+        auto backend = entityfy::migrate::open_sqlite_provider(key_path.string());
+
+        const auto apply = [&](const entityfy::migrate::plan& value) {
+            backend->start();
+            try
+            {
+                for(const auto& current: value.steps)
+                {
+                    backend->execute(current);
+                }
+
+                backend->finish();
+            }
+            catch(...)
+            {
+                backend->abort();
+                throw;
+            }
+        };
+
+        entityfy::migrate::schema single;
+
+        entityfy::migrate::table lines;
+        lines.name = "key_lines";
+        lines.primary_key = {"id"};
+        lines.columns.push_back(entityfy::migrate::column{.name = "id", .type = "INTEGER", .not_null = true,
+                                                          .primary_key = true});
+        lines.columns.push_back(entityfy::migrate::column{.name = "region", .type = "VARCHAR(16)", .not_null = true});
+        lines.columns.push_back(entityfy::migrate::column{.name = "quantity", .type = "INTEGER", .not_null = true});
+        single.tables.push_back(lines);
+
+        const auto creation = backend->make_plan(single, entityfy::migrate::schema{}, {});
+        require(creation.steps.size() == 1, "sqlite key change setup creates the table");
+        apply(creation);
+
+        backend->execute_sql("INSERT INTO \"key_lines\" (\"id\", \"region\", \"quantity\") VALUES (1, 'eu', 3)");
+        backend->execute_sql("INSERT INTO \"key_lines\" (\"id\", \"region\", \"quantity\") VALUES (2, 'us', 4)");
+
+        const auto before = backend->introspect();
+        const auto* before_lines = entityfy::migrate::find_table(before, "key_lines");
+        require(before_lines != nullptr &&
+                    entityfy::migrate::primary_key_columns(*before_lines) == std::vector<std::string>{"id"},
+                "sqlite key change starts from a single-column key");
+
+        auto promoted = single;
+        auto* promoted_lines = entityfy::migrate::find_table(promoted, "key_lines");
+        promoted_lines->primary_key = {"id", "region"};
+        entityfy::migrate::find_column(*promoted_lines, "region")->primary_key = true;
+
+        const auto change = backend->make_plan(promoted, before, {});
+        require(change.destructive, "sqlite primary key change is destructive");
+        require(!change.steps.empty() && change.steps.front().type == entityfy::migrate::step::kind::sqlite_rebuild,
+                "sqlite primary key change rebuilds the table");
+        apply(change);
+
+        const auto after = backend->introspect();
+        const auto* after_lines = entityfy::migrate::find_table(after, "key_lines");
+        require(after_lines != nullptr &&
+                    entityfy::migrate::primary_key_columns(*after_lines) == std::vector<std::string>{"id", "region"},
+                "sqlite promoted key introspected in order");
+        require(entityfy::migrate::same_schema(promoted, after), "sqlite promoted key matches the model");
+
+        const auto rows = backend->query("SELECT \"id\", \"region\", \"quantity\" FROM \"key_lines\" ORDER BY \"id\"");
+        require(rows.size() == 2 && rows.front().size() == 3 && rows.front()[1] == "eu" &&
+                    rows.back()[1] == "us" && rows.back()[2] == "4",
+                "sqlite rows survive the primary key change");
+
+        bool duplicate_rejected = false;
+        try
+        {
+            backend->execute_sql("INSERT INTO \"key_lines\" (\"id\", \"region\", \"quantity\") VALUES (1, 'eu', 9)");
+        }
+        catch(const std::exception&)
+        {
+            duplicate_rejected = true;
+        }
+
+        require(duplicate_rejected, "sqlite promoted key is enforced");
+
+        backend->close();
+        std::filesystem::remove(key_path);
+    }
+
     return entityfy_test::status::passed;
 }
 

@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <iostream>
 #include <sstream>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -19,6 +20,7 @@ void cleanup(entityfy::migrate::provider& backend)
 {
     backend.execute_sql("DROP TABLE IF EXISTS \"posts\" CASCADE");
     backend.execute_sql("DROP TABLE IF EXISTS \"users\" CASCADE");
+    backend.execute_sql("DROP TABLE IF EXISTS \"pg_migrate_pk_lines\" CASCADE");
     backend.execute_sql("DROP TABLE IF EXISTS \"entityfy_schema_migrations\" CASCADE");
 }
 
@@ -307,6 +309,176 @@ entityfy_test::status test_postgres()
         require(entityfy::migrate::find_table(after_drop, "pg_migrate_ck_lines") == nullptr &&
                     entityfy::migrate::find_table(after_drop, "pg_migrate_ck_notes") == nullptr,
                 "pg composite tables dropped");
+    }
+
+    // Changing which columns make up an existing primary key is a constraint
+    // swap: the old key is dropped, the column steps run, and the new key is
+    // added at the end.
+    {
+        backend->execute_sql("DROP TABLE IF EXISTS \"pg_migrate_pk_lines\" CASCADE");
+
+        const auto subset_of = [](const entityfy::migrate::schema& source, std::string_view name) {
+            entityfy::migrate::schema output;
+            if(const auto* found = entityfy::migrate::find_table(source, name))
+            {
+                output.tables.push_back(*found);
+            }
+            return output;
+        };
+
+        entityfy::migrate::schema single;
+
+        entityfy::migrate::table lines;
+        lines.name = "pg_migrate_pk_lines";
+        lines.primary_key = {"id"};
+        lines.columns.push_back(
+            entityfy::migrate::column{.name = "id", .type = "INTEGER", .not_null = true, .primary_key = true});
+        lines.columns.push_back(entityfy::migrate::column{.name = "region", .type = "VARCHAR(16)", .not_null = true});
+        lines.columns.push_back(entityfy::migrate::column{.name = "quantity", .type = "INTEGER", .not_null = true});
+        single.tables.push_back(lines);
+
+        const auto creation = backend->make_plan(single, entityfy::migrate::schema{}, {});
+        require(creation.steps.size() == 1, "pg key test creates the table with its key");
+        apply_plan(*backend, creation);
+
+        backend->execute_sql(
+            "INSERT INTO \"pg_migrate_pk_lines\" (\"id\", \"region\", \"quantity\") VALUES (1, 'eu', 3)");
+        backend->execute_sql(
+            "INSERT INTO \"pg_migrate_pk_lines\" (\"id\", \"region\", \"quantity\") VALUES (2, 'us', 4)");
+
+        const auto created = subset_of(backend->introspect(), "pg_migrate_pk_lines");
+        const auto* created_lines = entityfy::migrate::find_table(created, "pg_migrate_pk_lines");
+        require(created_lines != nullptr &&
+                    entityfy::migrate::primary_key_columns(*created_lines) == std::vector<std::string>{"id"},
+                "pg key test starts from a single-column key");
+
+        const auto constraint_rows = backend->query_params(
+            "SELECT c.conname FROM pg_constraint c "
+            "JOIN pg_class t ON t.oid = c.conrelid "
+            "JOIN pg_namespace n ON n.oid = t.relnamespace "
+            "WHERE c.contype = 'p' AND n.nspname = current_schema() AND t.relname = $1",
+            {"pg_migrate_pk_lines"});
+        require(constraint_rows.size() == 1 && !constraint_rows.front().empty(),
+                "pg key test reads the constraint name from the catalog");
+
+        auto promoted = single;
+        auto* promoted_lines = entityfy::migrate::find_table(promoted, "pg_migrate_pk_lines");
+        promoted_lines->primary_key = {"id", "region"};
+        entityfy::migrate::find_column(*promoted_lines, "region")->primary_key = true;
+
+        const auto promote = backend->make_plan(promoted, created, {});
+        require(promote.destructive, "pg primary key change is destructive");
+        require(promote.steps.size() == 2, "pg primary key change plans a drop and an add");
+        require(promote.steps.front().sql ==
+                    "ALTER TABLE \"pg_migrate_pk_lines\" DROP CONSTRAINT \"" + constraint_rows.front().front() + "\"",
+                "pg primary key change drops the existing constraint first");
+        require(promote.steps.back().sql == "ALTER TABLE \"pg_migrate_pk_lines\" ADD PRIMARY KEY (\"id\", \"region\")",
+                "pg primary key change adds the new key in declaration order");
+        apply_plan(*backend, promote);
+
+        const auto after_promote = subset_of(backend->introspect(), "pg_migrate_pk_lines");
+        const auto* promoted_actual = entityfy::migrate::find_table(after_promote, "pg_migrate_pk_lines");
+        require(promoted_actual != nullptr &&
+                    entityfy::migrate::primary_key_columns(*promoted_actual) ==
+                        std::vector<std::string>{"id", "region"},
+                "pg promoted primary key introspected in order");
+        require(entityfy::migrate::same_schema(promoted, after_promote),
+                "pg promoted primary key matches the model");
+
+        const auto promoted_rows = backend->query(
+            "SELECT \"id\", \"region\", \"quantity\" FROM \"pg_migrate_pk_lines\" ORDER BY \"id\"");
+        require(promoted_rows.size() == 2 && promoted_rows.front().size() == 3 &&
+                    promoted_rows.front()[1] == "eu" && promoted_rows.back()[1] == "us" &&
+                    promoted_rows.back()[2] == "4",
+                "pg rows survive the primary key change");
+
+        bool promoted_rejects_duplicate = false;
+        try
+        {
+            backend->execute_sql(
+                "INSERT INTO \"pg_migrate_pk_lines\" (\"id\", \"region\", \"quantity\") VALUES (1, 'eu', 9)");
+        }
+        catch(const std::exception&)
+        {
+            promoted_rejects_duplicate = true;
+        }
+
+        require(promoted_rejects_duplicate, "pg promoted key is enforced");
+
+        // A type change on a key column alters the column and leaves the key in place.
+        auto widened = promoted;
+        entityfy::migrate::find_column(*entityfy::migrate::find_table(widened, "pg_migrate_pk_lines"), "region")->type =
+            "VARCHAR(32)";
+
+        const auto widen = backend->make_plan(widened, after_promote, {});
+        require(widen.destructive, "pg key column type change is destructive");
+        require(widen.steps.size() == 1 &&
+                    widen.steps.front().sql.find("CONSTRAINT") == std::string::npos,
+                "pg key column type change keeps the key constraint");
+        apply_plan(*backend, widen);
+
+        const auto after_widen = subset_of(backend->introspect(), "pg_migrate_pk_lines");
+        const auto* widened_actual = entityfy::migrate::find_table(after_widen, "pg_migrate_pk_lines");
+        require(widened_actual != nullptr &&
+                    entityfy::migrate::primary_key_columns(*widened_actual) ==
+                        std::vector<std::string>{"id", "region"},
+                "pg key survives a key column type change");
+        require(entityfy::migrate::same_schema(widened, after_widen),
+                "pg widened key column matches the model");
+
+        // Going back to the single-column key swaps the constraint again.
+        auto demoted = single;
+        entityfy::migrate::find_column(*entityfy::migrate::find_table(demoted, "pg_migrate_pk_lines"), "region")->type =
+            "VARCHAR(32)";
+
+        const auto demote = backend->make_plan(demoted, after_widen, {});
+        require(demote.destructive, "pg primary key narrowing is destructive");
+        require(demote.steps.size() == 2 &&
+                    demote.steps.back().sql == "ALTER TABLE \"pg_migrate_pk_lines\" ADD PRIMARY KEY (\"id\")",
+                "pg primary key narrowing re-adds the single-column key");
+        apply_plan(*backend, demote);
+
+        const auto after_demote = subset_of(backend->introspect(), "pg_migrate_pk_lines");
+        const auto* demoted_actual = entityfy::migrate::find_table(after_demote, "pg_migrate_pk_lines");
+        require(demoted_actual != nullptr &&
+                    entityfy::migrate::primary_key_columns(*demoted_actual) == std::vector<std::string>{"id"},
+                "pg narrowed primary key introspected");
+        require(entityfy::migrate::same_schema(demoted, after_demote),
+                "pg narrowed primary key matches the model");
+
+        const auto counted = backend->query("SELECT COUNT(*) FROM \"pg_migrate_pk_lines\"");
+        require(counted.size() == 1 && counted.front().front() == "2", "pg rows survive the key narrowing");
+
+        // A change confined to the table-level key list produces no column
+        // operation, but the constraint still has to be swapped.
+        auto listed = demoted;
+        entityfy::migrate::find_table(listed, "pg_migrate_pk_lines")->primary_key = {"id", "quantity"};
+
+        const auto relist = backend->make_plan(listed, after_demote, {});
+        require(relist.destructive, "pg table-level key list change is destructive");
+        require(relist.steps.size() == 2 &&
+                    relist.steps.back().sql ==
+                        "ALTER TABLE \"pg_migrate_pk_lines\" ADD PRIMARY KEY (\"id\", \"quantity\")",
+                "pg table-level key list change still swaps the constraint");
+        apply_plan(*backend, relist);
+
+        const auto after_relist = subset_of(backend->introspect(), "pg_migrate_pk_lines");
+        const auto* relisted_actual = entityfy::migrate::find_table(after_relist, "pg_migrate_pk_lines");
+        require(relisted_actual != nullptr &&
+                    entityfy::migrate::primary_key_columns(*relisted_actual) ==
+                        std::vector<std::string>{"id", "quantity"},
+                "pg table-level key list applied");
+
+        const auto relisted_rows = backend->query("SELECT COUNT(*) FROM \"pg_migrate_pk_lines\"");
+        require(relisted_rows.size() == 1 && relisted_rows.front().front() == "2",
+                "pg rows survive the table-level key list change");
+
+        const auto relist_again = backend->make_plan(listed, after_relist, {});
+        require(relist_again.steps.empty(), "pg table-level key list apply is idempotent");
+
+        backend->execute_sql("DROP TABLE IF EXISTS \"pg_migrate_pk_lines\" CASCADE");
+        require(entityfy::migrate::find_table(backend->introspect(), "pg_migrate_pk_lines") == nullptr,
+                "pg key test table dropped");
     }
 
     cleanup(*backend);
