@@ -134,6 +134,28 @@ are green.
 4. **P3 ODBC** — decided, no code: SQLite and PostgreSQL keep their native drivers; the frozen SQL
    Server backend's gaps stay documented in the parity plan.
 
+### Slice status
+
+| Slice | Scope | Status |
+|---|---|---|
+| P0.0 | `row_key`, canonical ordering | complete |
+| P0.1 | composite/string keys in models, DDL, statements | complete |
+| P0.2 | key-based identity map and concurrency entries | complete |
+| P0.3 | migration diff for new keys, key add/drop, introspection | complete; altering an existing key (P0.3b2) open |
+| P0.4 | key tests and docs | complete |
+| P1.1 | `lazy<T>` handles, cache, typed errors | complete |
+| P1.2 | context binding, lifetimes, write/rollback invalidation | complete |
+| P1.3 | loaders and include cache fill | complete (single-column relations); P1.5 open |
+| P1.4 | lazy tests and docs | complete |
+| P1.5 | composite foreign keys in relations/navigation | open |
+| P2.1 | `task<T>`, executors | complete |
+| P2.2 | native nonblocking PostgreSQL | complete; `transaction_async` open |
+| P2.3 | async client/table surface | complete |
+| P2.4 | SQLite thread-offload facade | complete |
+| P2.5 | task-based context save, save gate | complete; native async `saveable` and `acquire_async` open |
+| P2.6 | async tests and docs | complete for the shipped slices |
+| P3 | ODBC decision | decided: no new ODBC work |
+
 The other backends stay buildable and tested but get no new features for now (see
 [Deferred](#deferred-other-providers)).
 

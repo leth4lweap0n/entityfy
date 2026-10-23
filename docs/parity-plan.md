@@ -235,7 +235,9 @@ difference and the single-owner rule.
 
 ## Phase 3 — ODBC decision (no code)
 
-Recorded for later, not started: ODBC remains the SQL Server transport only. Its known gaps are
+**Decision:** no additional ODBC requirement for this work. SQLite and PostgreSQL keep their
+native drivers (libsqlite3/sl3 and libpq); ODBC remains only the SQL Server transport, which is
+frozen. Its known gaps are
 connection-string escaping, the useless `mssql://` alias, `BEGIN`-based transactions without
 isolation/MARS attributes, native-code-only error classification (1205 deadlock and Azure
 transient codes missing), `OUTPUT`/`MERGE` key limitations, and SQL-dump-only backups. Finishing
