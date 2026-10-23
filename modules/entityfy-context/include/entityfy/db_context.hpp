@@ -154,6 +154,14 @@ public:
     // save per context at a time: a save that overlaps this one throws
     // std::logic_error instead of being queued. This is a thread offload, not
     // native I/O asynchrony.
+    //
+    // Precondition: until the returned task completes, the tracked sets must not
+    // be mutated and the context must not be used from another thread; the save
+    // worker reads the tracker and the connection. The task cannot be stopped:
+    // request_cancel() is observed but no cancel hook is installed, so the save
+    // still runs to completion and get() returns its result. A continuation runs
+    // on the save worker, so it must not release the last owner of the context
+    // (see the lifetime rule in entityfy/task.hpp).
     [[nodiscard]] entityfy::task<save_result> save_changes_async();
 
     // Drops the tracked entities and the identity map; the DB connection is kept.

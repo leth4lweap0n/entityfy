@@ -2,6 +2,8 @@
 
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -48,6 +50,11 @@ public:
 // Fixed set of worker threads over a bounded queue: submit blocks while the
 // queue is full instead of growing without limit. A max_queue of 0 means the
 // queue is unbounded.
+//
+// A worker must never be the last owner of this executor. Destroying the pool
+// from inside one of its jobs joins the calling thread, so a completion
+// callback that runs on a worker has to move the owning value out and release
+// it on the owning thread; the destructor aborts with a diagnostic instead.
 class thread_pool_executor final : public executor
 {
 public:
@@ -57,9 +64,19 @@ public:
         const std::size_t worker_count = threads == 0 ? 1 : threads;
         workers_.reserve(worker_count);
 
-        for(std::size_t index = 0; index < worker_count; ++index)
+        try
         {
-            workers_.emplace_back([this] { worker_loop(); });
+            for(std::size_t index = 0; index < worker_count; ++index)
+            {
+                workers_.emplace_back([this] { worker_loop(); });
+            }
+        }
+        catch(...)
+        {
+            // A worker that could not be created must not abandon the ones
+            // already running: stop and join them before the error escapes.
+            shutdown();
+            throw;
         }
     }
 
@@ -101,9 +118,20 @@ public:
     }
 
     // Idempotent: lets every queued and running job finish, then joins. Must not
-    // be called from one of the pool's own jobs.
+    // be called from one of the pool's own jobs; that would join the calling
+    // thread, so it is diagnosed and aborted instead.
     void shutdown()
     {
+        if(current_pool() == this)
+        {
+            std::fputs(
+                "entityfy: thread_pool_executor destroyed on its own worker thread; a completion callback "
+                "must not release the last owner. Move the value out and destroy it on the owning thread.\n",
+                stderr
+            );
+            std::abort();
+        }
+
         std::vector<std::thread> workers;
         {
             std::lock_guard lock{mutex_};
@@ -131,8 +159,38 @@ public:
     }
 
 private:
+    // Thread-local chain of the pools this thread currently works for. The
+    // destructor compares against it to diagnose a destruction on a worker;
+    // nesting keeps the inner pool visible while its job runs.
+    static thread_pool_executor const*& current_pool() noexcept
+    {
+        static thread_local thread_pool_executor const* pool = nullptr;
+        return pool;
+    }
+
+    struct worker_binding
+    {
+        explicit worker_binding(thread_pool_executor const* pool) noexcept
+            : previous_{current_pool()}
+        {
+            current_pool() = pool;
+        }
+
+        worker_binding(const worker_binding&) = delete;
+        worker_binding& operator=(const worker_binding&) = delete;
+
+        ~worker_binding()
+        {
+            current_pool() = previous_;
+        }
+
+        thread_pool_executor const* previous_;
+    };
+
     void worker_loop()
     {
+        const worker_binding binding{this};
+
         for(;;)
         {
             std::function<void()> job;

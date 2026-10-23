@@ -344,6 +344,14 @@ and `save_changes_async()` throw `std::logic_error("a save is already in progres
 queueing. The gate is released on success, failure and submit errors, so the context is usable
 again afterwards. Destroying a context with an in-flight async save drains the job before the
 tracked sets and the connection are destroyed.
+
+**Precondition:** until the returned task completes, the tracked sets must not be mutated and the
+context must not be used from another thread - the save worker reads the tracker and the
+connection. **Cancellation:** the task installs no cancel hook, so `request_cancel()` does not
+stop a save; the worker completes it and `get()` still returns the `save_result` (or rethrows the
+exception the save raised). A continuation runs on the save worker, so it must not release the
+last owner of the context (see the lifetime rule in `entityfy/task.hpp`).
+
 **Honest limit:** the context save path is a thread offload; the SQLite driver is serialized on
 one connection, and the PostgreSQL backend's native async path is exposed through the client
 (`execute_async`/`query_async`) rather than through `save_changes_async` in this phase. The

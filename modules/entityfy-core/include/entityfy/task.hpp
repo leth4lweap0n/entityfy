@@ -15,8 +15,14 @@
 
 // Single-value asynchronous result: a `task<T>` observes one value produced by
 // exactly one `task_completer<T>`. Both ends share one state; whichever end dies
-// first leaves the other intact. Continuations run on the thread that completes
-// the task, never on a hidden executor.
+// first leaves the other intact. Continuations and completion callbacks run on
+// the thread that completes the task, never on a hidden executor.
+//
+// Lifetime rule: that completing thread is the backend reactor or a pool worker.
+// Releasing the last owner of the client, context or executor from a
+// continuation or an on_complete callback would destroy it on a thread it has to
+// join; the affected destructors diagnose that mistake and abort. Move the value
+// out of the callback and release the owner on the owning thread instead.
 
 namespace entityfy
 {
@@ -304,7 +310,8 @@ public:
     // Registers the single completion callback. It runs exactly once on the
     // thread that completes the task, outside the state lock; when the task is
     // already ready it runs immediately on this thread. A second registration
-    // throws logic_error.
+    // throws logic_error. The callback must not release the last owner of the
+    // producing client, context or executor; see the lifetime rule above.
     void on_complete(std::function<void()> callback)
     {
         detail::install_completion(require_state(), std::move(callback));
@@ -313,7 +320,9 @@ public:
     // Consumes the handle and runs `continuation` with the value once it
     // arrives. The continuation returns `U` or `task<U>`; both produce a
     // `task<U>` (a nested task is flattened). Events that are not a value
-    // (exceptions, cancellation) are forwarded to the returned task.
+    // (exceptions, cancellation) are forwarded to the returned task. The
+    // continuation runs on the completing thread, so the lifetime rule above
+    // applies to it as well.
     template <typename F>
     auto then(F&& continuation)
     {

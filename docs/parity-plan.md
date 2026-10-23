@@ -189,8 +189,10 @@ dependency once the port is proven). Async flow: `PQsendQueryParams`/`PQsendQuer
 `PQflush` → `PQsocketPoll` → `PQconsumeInput`/`PQisBusy` → `PQgetResult`; pipeline batches send
 all statements, then `PQsendPipelineSync`, drain `PGRES_PIPELINE_ABORTED` on error, exit pipeline
 mode. One in-flight operation per connection; a second call is an explicit error. Cancellation
-uses libpq 17+ `PQcancelCreate/Start/Poll/Finish`; timeout marks the connection broken, is not
-retried and is not a `transient_error`. `find_package(PostgreSQL 17 REQUIRED)` (or feature-macro
+uses libpq 17+ `PQcancelCreate/Start/Poll/Finish` with a bounded 1 s delivery budget; there is no
+timeout API. A cancel request that cannot be delivered in that window is abandoned, the statement
+runs to completion, and the task reports the server's outcome. The connection is not marked broken
+after a cancel. `find_package(PostgreSQL 17 REQUIRED)` (or feature-macro
 fallbacks) is enforced.
 
 ### P2.3 Client and table surface
@@ -227,7 +229,7 @@ after timeout/cancel.
 
 `pg_sleep` interleaving proves a running coroutine does not block the caller; the same test over
 two connections proves the reactor is shared; a hundred async queries keep the thread count
-constant; single-in-flight, cancellation, timeout, retry classification, pipeline failure drain,
+constant; single-in-flight, cancellation, retry classification, pipeline failure drain,
 SQLite facade serialization and async pool behavior are covered. Docs state the capability
 difference and the single-owner rule.
 

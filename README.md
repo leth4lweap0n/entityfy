@@ -218,6 +218,19 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
   PostgreSQL uses native nonblocking libpq (one in-flight operation per connection, cancellation
   through the task hook); SQLite reports `thread_offload` and serializes async work on one worker.
 
+### Async completion threads
+
+A continuation passed to `task::then` and a callback registered with `task::on_complete` run on
+the thread that completes the task: the PostgreSQL reactor, or the SQLite/context save worker.
+That thread is joined by the executor's destructor, so a callback must not release the last owner
+of the producing `client` or `db_context`, and must not destroy a `thread_pool_executor` from
+inside one of its own jobs. Move the value out of the callback and let the owning thread release
+it; the destructors check for this and abort with a diagnostic naming the rule instead of ending
+in an unexplained `std::terminate`.
+
+`query_each_async` materializes the complete result set before the consumer sees the first row:
+returning `false` stops further consumer calls, not the network read.
+
 ## entityfy-context
 
 - EF Core style surface: `db_context` / `db_set<T>` with `save_changes()`, `add()`, `find()`,
@@ -252,8 +265,10 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
   cleared.
 - `save_changes_async()`: returns `entityfy::task<save_result>` and runs the save on a lazily
   created single-worker executor; retry delays elapse there. A save gate rejects overlapping
-  sync/async saves with `logic_error`, and destroying a context drains an in-flight save. This is
-  a thread offload, not native I/O asynchrony.
+  sync/async saves with `logic_error`, and destroying a context drains an in-flight save. The
+  tracked sets must stay untouched until the task completes; cancelling the task does not stop
+  the save, and `get()` still returns its result. This is a thread offload, not native I/O
+  asynchrony.
 
 ## entityfy-migrate
 

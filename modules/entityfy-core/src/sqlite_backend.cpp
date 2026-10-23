@@ -149,9 +149,11 @@ public:
     //
     // One SQLite connection is a serialized resource, so the async surface
     // offloads the existing synchronous entry points to one bounded worker.
-    // The worker queue keeps submission order, and the connection mutex keeps
-    // async jobs and synchronous calls ordered with each other. Cancellation
-    // is cooperative: it prevents a queued job from starting, but a statement
+    // The worker queue keeps submission order and the connection mutex
+    // serializes execution, but ordering is per statement, not per batch: the
+    // mutex is taken and released around each statement, so a synchronous call
+    // can interleave between the statements of an async batch. Cancellation is
+    // cooperative: it prevents a queued job from starting, but a statement
     // already inside SQLite cannot be interrupted.
     // ---------------------------------------------------------------------
     [[nodiscard]] async_capability async_mode() const noexcept override

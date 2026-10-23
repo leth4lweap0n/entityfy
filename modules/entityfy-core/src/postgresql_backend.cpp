@@ -10,6 +10,8 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -619,11 +621,24 @@ public:
 
     // Stops the reactor after it has drained its queue: a job that is already
     // running completes its task before the connection is closed, so no task is
-    // left pending by the destruction.
+    // left pending by the destruction. Destroying the backend from a completion
+    // callback would join the calling thread, so that case is diagnosed and
+    // aborted instead of ending in an unexplained std::terminate.
     ~postgresql_backend() override
     {
         {
             const std::lock_guard lock{queue_mutex_};
+
+            if(reactor_.joinable() && reactor_id_ == std::this_thread::get_id())
+            {
+                std::fputs(
+                    "entityfy: PostgreSQL backend destroyed on its own reactor thread; a completion callback "
+                    "must not release the last client. Move the value out and destroy it on the owning thread.\n",
+                    stderr
+                );
+                std::abort();
+            }
+
             stopping_ = true;
         }
 
@@ -1675,6 +1690,11 @@ private:
     // before the stop still runs, so its task completes instead of hanging.
     void reactor_loop()
     {
+        {
+            const std::lock_guard lock{queue_mutex_};
+            reactor_id_ = std::this_thread::get_id();
+        }
+
         for(;;)
         {
             std::function<void()> job;
@@ -2582,6 +2602,9 @@ private:
     // reactor still holds `mutex_`.
     std::atomic<bool>                 busy_{false};
     std::thread                       reactor_;
+    // Set by the reactor itself once it starts, so the destructor can tell that
+    // it runs on the thread it would have to join.
+    std::thread::id                   reactor_id_;
     std::mutex                        queue_mutex_;
     std::condition_variable           queue_cv_;
     std::deque<std::function<void()>> queue_;
