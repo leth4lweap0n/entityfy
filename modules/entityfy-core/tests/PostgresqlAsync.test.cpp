@@ -6,9 +6,11 @@
 #include <entityfy/task.hpp>
 #include <entityfy/value.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -376,6 +378,230 @@ TEST_CASE("postgres async task survives the backend destruction", "[postgresql][
     // The destructor drained the queue and joined the reactor before the
     // connection went away, so the queued job still completed its task.
     REQUIRE(pending.get().size() == 1);
+}
+
+TEST_CASE("postgres COPY is reported instead of hanging the async drain", "[postgresql][async][copy]")
+{
+    const auto uri = postgres_uri();
+    if(uri.empty())
+    {
+        SKIP("ENTITYFY_PG_URI is not set");
+    }
+
+    const auto db = entityfy::detail::make_postgresql_backend(uri);
+
+    // libpq keeps answering every result call in copy state with a fresh COPY
+    // result, so a regressed drain spins inside the reactor and never completes
+    // the task. The watchdog turns that into a failed run instead of a test
+    // that hangs, and the backend is never destroyed in that state.
+    std::atomic<bool> finished{false};
+    std::thread       watchdog{[&finished] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{20};
+
+        while(std::chrono::steady_clock::now() < deadline)
+        {
+            if(finished.load(std::memory_order_acquire))
+            {
+                return;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        }
+
+        std::fprintf(stderr, "the COPY statement never completed: the result drain is spinning\n");
+        std::_Exit(EXIT_FAILURE);
+    }};
+
+    bool async_failed = false;
+    bool sync_failed = false;
+
+    try
+    {
+        db->query_async(statement{.sql = "COPY (SELECT 1) TO STDOUT"}).get();
+    }
+    catch(const entityfy::query_error&)
+    {
+        async_failed = true;
+    }
+
+    try
+    {
+        db->execute(statement{.sql = "COPY (SELECT 1) TO STDOUT"});
+    }
+    catch(const entityfy::query_error&)
+    {
+        sync_failed = true;
+    }
+
+    // The copy stream was discarded, so both paths serve the connection again
+    // instead of failing with "connection in COPY state".
+    const auto synchronous = db->query(statement{.sql = "SELECT 1"});
+    const auto asynchronous = db->query_async(statement{.sql = "SELECT 1"}).get();
+
+    finished.store(true, std::memory_order_release);
+    watchdog.join();
+
+    REQUIRE(async_failed);
+    REQUIRE(sync_failed);
+    REQUIRE(synchronous.size() == 1);
+    REQUIRE(asynchronous.size() == 1);
+}
+
+TEST_CASE("postgres async retries plainly when the prepared plan disappeared", "[postgresql][async][cache]")
+{
+    const auto uri = postgres_uri();
+    if(uri.empty())
+    {
+        SKIP("ENTITYFY_PG_URI is not set");
+    }
+
+    const auto db = entityfy::detail::make_postgresql_backend(uri);
+
+    db->execute(statement{.sql = "DROP TABLE IF EXISTS \"pg_async_stale_plan\""});
+    db->execute(statement{.sql = "CREATE TABLE \"pg_async_stale_plan\" (\"id\" BIGINT PRIMARY KEY)"});
+
+    const std::string sql = "SELECT count(*) FROM \"pg_async_stale_plan\"";
+
+    // The synchronous path prepares and caches the plan.
+    REQUIRE(db->query(statement{.sql = sql}).size() == 1);
+
+    const auto prepared = db->query(statement{
+        .sql = "SELECT count(*) FROM pg_prepared_statements WHERE statement = 'SELECT count(*) FROM \"pg_async_stale_plan\"'"
+    });
+
+    REQUIRE(prepared.size() == 1);
+    REQUIRE(value_to_i64(prepared.front().front()) == 1);
+
+    // The server forgets every plan while the client still holds the name, so
+    // the next prepared call fails with SQLSTATE 26000.
+    db->execute(statement{.sql = "DEALLOCATE ALL"});
+
+    // The async path drops the dead name and retries unprepared instead of
+    // surfacing the stale name error.
+    const auto rows = db->query_async(statement{.sql = sql}).get();
+
+    REQUIRE(rows.size() == 1);
+    REQUIRE(value_to_i64(rows.front().front()) == 0);
+
+    // The connection is usable afterwards, through both paths.
+    REQUIRE(db->query_async(statement{.sql = sql}).get().size() == 1);
+    REQUIRE(db->query(statement{.sql = sql}).size() == 1);
+
+    db->execute(statement{.sql = "DROP TABLE IF EXISTS \"pg_async_stale_plan\""});
+}
+
+TEST_CASE("postgres async cancel requested before the send stays consistent", "[postgresql][async][cancel]")
+{
+    const auto uri = postgres_uri();
+    if(uri.empty())
+    {
+        SKIP("ENTITYFY_PG_URI is not set");
+    }
+
+    const auto db = entityfy::detail::make_postgresql_backend(uri);
+
+    db->execute(statement{.sql = "DROP TABLE IF EXISTS \"pg_async_early_cancel\""});
+    db->execute(statement{
+        .sql = "CREATE TABLE \"pg_async_early_cancel\" (\"id\" BIGINT PRIMARY KEY, \"name\" TEXT NOT NULL)"
+    });
+
+    auto pending = db->execute_async(statement{
+        .sql = insert_sql_for("pg_async_early_cancel"),
+        .binds = {std::int64_t{1}, std::string{"early"}},
+    });
+
+    // The cancel races the reactor on purpose: a cancel that wins the race must
+    // send nothing at all, one that arrives later either aborts or misses the
+    // statement. Both outcomes are valid, an inconsistent row is not.
+    pending.request_cancel();
+
+    bool cancelled = false;
+    try
+    {
+        (void)pending.get();
+    }
+    catch(const entityfy::task_cancelled&)
+    {
+        cancelled = true;
+    }
+
+    const auto counted = db->query(statement{
+        .sql = "SELECT count(*) FROM \"pg_async_early_cancel\""
+    });
+
+    REQUIRE(counted.size() == 1);
+    REQUIRE(value_to_i64(counted.front().front()) == (cancelled ? 0 : 1));
+
+    // The connection serves both paths again after the cancelled operation.
+    REQUIRE(db->query(statement{.sql = "SELECT 1"}).size() == 1);
+    REQUIRE(db->query_async(statement{.sql = "SELECT 1"}).get().size() == 1);
+
+    db->execute(statement{.sql = "DROP TABLE IF EXISTS \"pg_async_early_cancel\""});
+}
+
+TEST_CASE("postgres async pipeline does not wait per statement", "[postgresql][async][batch][latency]")
+{
+    const auto uri = postgres_uri();
+    if(uri.empty())
+    {
+        SKIP("ENTITYFY_PG_URI is not set");
+    }
+
+    const auto db = entityfy::detail::make_postgresql_backend(uri);
+
+    db->execute(statement{.sql = "DROP TABLE IF EXISTS \"pg_async_pipeline_latency\""});
+    db->execute(statement{
+        .sql = "CREATE TABLE \"pg_async_pipeline_latency\" (\"id\" BIGINT PRIMARY KEY, \"name\" TEXT NOT NULL)"
+    });
+
+    std::vector<statement> batch;
+    batch.reserve(40);
+
+    for(std::int64_t index = 0; index < 40; ++index)
+    {
+        batch.push_back(statement{
+            .sql = insert_sql_for("pg_async_pipeline_latency"),
+            .binds = {index + 1, "row " + std::to_string(index)},
+        });
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto results = db->execute_batch_async(batch).get();
+    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+
+    REQUIRE(results.size() == batch.size());
+
+    // Polling the socket after every per-query null costs one poll interval per
+    // statement, which puts forty statements over two seconds; reading the
+    // buffered results costs one round trip. The bound leaves plenty of room
+    // for a slow machine while still catching the regression.
+    REQUIRE(elapsed < 1.5);
+
+    db->execute(statement{.sql = "DROP TABLE IF EXISTS \"pg_async_pipeline_latency\""});
+}
+
+TEST_CASE("postgres async keeps a server side 57014 classified as an error", "[postgresql][async][cancel]")
+{
+    const auto uri = postgres_uri();
+    if(uri.empty())
+    {
+        SKIP("ENTITYFY_PG_URI is not set");
+    }
+
+    const auto db = entityfy::detail::make_postgresql_backend(uri);
+
+    // The server aborts on its own (statement_timeout) without any cancel
+    // request from entityfy, so SQLSTATE 57014 has to keep its query
+    // classification instead of being reported as a cancellation.
+    db->execute(statement{.sql = "SET statement_timeout = '50ms'"});
+
+    REQUIRE_THROWS_AS(db->query_async(statement{.sql = "SELECT pg_sleep(1)"}).get(), entityfy::query_error);
+
+    db->execute(statement{.sql = "SET statement_timeout = 0"});
+
+    // The aborted statement was drained, so the connection still works.
+    REQUIRE(db->query(statement{.sql = "SELECT 1"}).size() == 1);
+    REQUIRE(db->query_async(statement{.sql = "SELECT 1"}).get().size() == 1);
 }
 
 #endif // ENTITYFY_ENABLE_POSTGRESQL

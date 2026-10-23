@@ -107,6 +107,19 @@ constexpr pg_usec_time_t async_poll_interval_us = 50'000;
 // this window is abandoned and the statement simply runs to completion.
 constexpr pg_usec_time_t async_cancel_budget_us = 1'000'000;
 
+// SQLSTATE for a prepared statement name the server does not know. It is
+// raised before anything executes, so the statement can be re-sent plain.
+constexpr std::string_view sqlstate_invalid_statement_name = "26000";
+
+// The three statuses that mean the server switched the connection into the
+// COPY protocol. entityfy has no copy API, and libpq answers every PQgetResult
+// in this state with a fresh COPY result instead of the terminating null, so a
+// copy has to be recognised explicitly or a drain never finishes.
+[[nodiscard]] bool is_copy_status(ExecStatusType status) noexcept
+{
+    return status == PGRES_COPY_IN || status == PGRES_COPY_OUT || status == PGRES_COPY_BOTH;
+}
+
 // Raised by the async machinery when the server aborted the statement because
 // of our own cancel request. It never escapes the job runner, which turns it
 // into task_completer::set_cancelled().
@@ -117,6 +130,15 @@ public:
     {
         return "async PostgreSQL operation was cancelled";
     }
+};
+
+// The one cancel request an async operation may deliver. A 57014 is only
+// attributed to us when the request really reached the server; a server side
+// abort on its own (statement_timeout, ...) must keep its classification.
+struct cancel_state
+{
+    bool requested = false;
+    bool delivered = false;
 };
 
 // libpq's nonblocking mode for exactly one async operation. The synchronous
@@ -1263,6 +1285,45 @@ private:
         );
     }
 
+    // A COPY puts the connection into the copy protocol, and every later
+    // statement fails until the stream is finished. The blocking path therefore
+    // ends (COPY IN) or consumes (COPY OUT) the stream and takes the result
+    // that concludes it, so the connection can carry the next statement.
+    void discard_copy_sync(ExecStatusType status)
+    {
+        PGconn* const connection = connection_.get();
+
+        if(status == PGRES_COPY_IN || status == PGRES_COPY_BOTH)
+        {
+            // An error message marks the copy as abandoned instead of letting
+            // the server accept an empty stream as a successful copy.
+            (void)PQputCopyEnd(connection, "COPY is not supported by entityfy");
+        }
+
+        if(status == PGRES_COPY_OUT || status == PGRES_COPY_BOTH)
+        {
+            for(;;)
+            {
+                char*     buffer = nullptr;
+                const int chunk = PQgetCopyData(connection, &buffer, 0);
+
+                if(chunk > 0)
+                {
+                    PQfreemem(buffer);
+                    continue;
+                }
+
+                // -1: the server finished the copy; -2: it already failed.
+                break;
+            }
+        }
+
+        while(PGresult* trailing = PQgetResult(connection))
+        {
+            PQclear(trailing);
+        }
+    }
+
     [[nodiscard]] pg_result_ptr validate_result(PGresult* raw)
     {
         if(raw == nullptr)
@@ -1281,6 +1342,15 @@ private:
         if(status == PGRES_EMPTY_QUERY)
         {
             throw std::runtime_error{"unexpected empty query"};
+        }
+
+        if(is_copy_status(status))
+        {
+            // The statement switched the connection into the copy protocol.
+            // entityfy cannot deliver copy data, so the stream is discarded and
+            // the statement reported as unsupported.
+            discard_copy_sync(status);
+            throw pg_statement_error{"COPY is not supported by the entityfy PostgreSQL backend", "0A000"};
         }
 
         auto info = result_error_info(raw);
@@ -1323,6 +1393,24 @@ private:
         }
     }
 
+    // Leaves pipeline mode after a protocol level failure. A connection that
+    // cannot leave pipeline mode is reset: otherwise every later call fails
+    // with "not allowed in pipeline mode" instead of the real problem.
+    void abandon_pipeline_mode() noexcept
+    {
+        if(PQexitPipelineMode(connection_.get()) != 0)
+        {
+            return;
+        }
+
+        PQreset(connection_.get());
+
+        // The reset starts a fresh session, so the server side plans are gone
+        // as well and the local cache must not hand their names out again.
+        cache_.clear();
+        index_.clear();
+    }
+
     // Every statement is queued first and only then followed by the pipeline
     // sync, so the whole batch leaves in one round trip. A statement failure
     // aborts the rest of the pipeline; the remaining results are drained
@@ -1338,21 +1426,11 @@ private:
             throw std::runtime_error{"unable to enter pipeline mode: " + connection_message(connection_.get())};
         }
 
-        bool       in_pipeline = true;
-        const auto leave_pipeline = [&]() {
-            if(!in_pipeline)
-            {
-                return;
-            }
-
-            in_pipeline = false;
-            if(PQexitPipelineMode(connection_.get()) == 0)
-            {
-                throw std::runtime_error{"unable to leave pipeline mode: " + connection_message(connection_.get())};
-            }
-        };
-
-        bool sync_sent = false;
+        bool in_pipeline = true;
+        // True from the moment the sync is sent until its result and the
+        // terminator have been consumed: only then can the connection be
+        // drained and be used again.
+        bool results_pending = false;
 
         std::vector<execution_result> output;
         output.reserve(statements.size());
@@ -1405,7 +1483,7 @@ private:
                 throw std::runtime_error{"unable to sync pipeline: " + connection_message(connection_.get())};
             }
 
-            sync_sent = true;
+            results_pending = true;
             flush_pipeline();
 
             for(std::size_t index = 0; index < statements.size(); ++index)
@@ -1451,12 +1529,18 @@ private:
             // The pipeline terminates with a null result after the sync.
             pg_result_ptr trailing{PQgetResult(connection_.get())};
             (void)trailing;
+            results_pending = false;
 
-            leave_pipeline();
+            if(PQexitPipelineMode(connection_.get()) == 0)
+            {
+                throw std::runtime_error{"unable to leave pipeline mode: " + connection_message(connection_.get())};
+            }
+
+            in_pipeline = false;
         }
         catch(...)
         {
-            if(in_pipeline && sync_sent)
+            if(results_pending)
             {
                 // Consume the remaining results through the sync so the
                 // connection can leave pipeline mode and be used again.
@@ -1477,14 +1561,11 @@ private:
                 // Consume the pipeline terminator before leaving pipeline mode.
                 pg_result_ptr trailing{PQgetResult(connection_.get())};
                 (void)trailing;
+            }
 
-                try
-                {
-                    leave_pipeline();
-                }
-                catch(...)
-                {
-                }
+            if(in_pipeline)
+            {
+                abandon_pipeline_mode();
             }
 
             throw;
@@ -1513,6 +1594,22 @@ private:
         }
 
         deallocate_locked(found->second->second);
+        cache_.erase(found->second);
+        index_.erase(found);
+    }
+
+    // Drops a cached plan without asking the server. Called when the server
+    // already reported the name as unknown (SQLSTATE 26000), so a DEALLOCATE
+    // would only fail again — and on a nonblocking connection it would need a
+    // command stream of its own.
+    void forget_statement_local(const std::string& sql) noexcept
+    {
+        const auto found = index_.find(sql);
+        if(found == index_.end())
+        {
+            return;
+        }
+
         cache_.erase(found->second);
         index_.erase(found);
     }
@@ -1655,7 +1752,16 @@ private:
 
             try
             {
-                value.emplace(work(cancel));
+                // A cancel that arrived before the reactor picked the job up
+                // must not send anything at all.
+                if(cancel->load(std::memory_order_acquire))
+                {
+                    cancelled = true;
+                }
+                else
+                {
+                    value.emplace(work(cancel));
+                }
             }
             catch(const async_cancelled&)
             {
@@ -1724,10 +1830,10 @@ private:
     }
 
     // Delivers one cancel request from a separate connection, which is what lets
-    // the reactor keep draining the original one. The request is abandoned when
-    // it cannot be delivered within the cancel budget, in which case the server
-    // keeps working on the statement.
-    void request_cancel()
+    // the reactor keep draining the original one. Returns true only when the
+    // request reached the server; it is abandoned when it cannot be delivered
+    // within the cancel budget, in which case the statement keeps running.
+    [[nodiscard]] bool request_cancel()
     {
         struct cancel_deleter
         {
@@ -1744,12 +1850,12 @@ private:
 
         if(cancellation == nullptr)
         {
-            return;
+            return false;
         }
 
         if(PQcancelStart(cancellation.get()) == 0)
         {
-            return;
+            return false;
         }
 
         const pg_usec_time_t give_up = PQgetCurrentTimeUSec() + async_cancel_budget_us;
@@ -1758,26 +1864,31 @@ private:
         {
             const auto status = PQcancelPoll(cancellation.get());
 
-            if(status == PGRES_POLLING_OK || status == PGRES_POLLING_FAILED)
+            if(status == PGRES_POLLING_OK)
             {
-                return;
+                return true;
+            }
+
+            if(status == PGRES_POLLING_FAILED)
+            {
+                return false;
             }
 
             if(status != PGRES_POLLING_READING && status != PGRES_POLLING_WRITING)
             {
-                return;
+                return false;
             }
 
             const pg_usec_time_t now = PQgetCurrentTimeUSec();
             if(now >= give_up)
             {
-                return;
+                return false;
             }
 
             const int socket = PQcancelSocket(cancellation.get());
             if(socket < 0)
             {
-                return;
+                return false;
             }
 
             const int ready = PQsocketPoll(
@@ -1789,22 +1900,33 @@ private:
 
             if(ready < 0)
             {
-                return;
+                return false;
             }
         }
     }
 
+    // Observes the shared cancel flag and delivers at most one cancel request
+    // for the operation. A request that cannot be delivered is not retried: the
+    // statement simply runs to completion.
+    void observe_cancel(const std::shared_ptr<std::atomic<bool>>& cancel, cancel_state& cancellation)
+    {
+        if(cancellation.requested || !cancel->load(std::memory_order_acquire))
+        {
+            return;
+        }
+
+        cancellation.requested = true;
+        cancellation.delivered = request_cancel();
+    }
+
     // Waits for one complete result, or for the terminating null, and raises the
     // cancel request once the shared flag is observed.
-    [[nodiscard]] pg_result_ptr take_result_async(const std::shared_ptr<std::atomic<bool>>& cancel, bool& cancel_sent)
+    [[nodiscard]] pg_result_ptr take_result_async(const std::shared_ptr<std::atomic<bool>>& cancel,
+                                                  cancel_state& cancellation)
     {
         for(;;)
         {
-            if(!cancel_sent && cancel->load(std::memory_order_acquire))
-            {
-                cancel_sent = true;
-                request_cancel();
-            }
+            observe_cancel(cancel, cancellation);
 
             if(PQisBusy(connection_.get()) == 0)
             {
@@ -1822,20 +1944,46 @@ private:
         }
     }
 
-    // Reads the next result of a protocol pipeline. libpq reports a null at the
-    // end of every command's result set, so a null only means "the next result
-    // is not here yet": the caller reads exactly as many results as the
-    // pipeline produces and the terminating null is taken separately.
+    // Reads the next real result of a protocol pipeline and skips the null
+    // libpq reports at the end of every command's result set. The next
+    // command's result is normally already buffered, so libpq is asked again
+    // before the socket is polled: polling first would add a whole poll
+    // interval to every statement of the batch. The socket is only awaited
+    // while PQisBusy() reports that no complete result has been decoded yet.
     [[nodiscard]] pg_result_ptr next_pipeline_result_async(const std::shared_ptr<std::atomic<bool>>& cancel,
-                                                           bool& cancel_sent)
+                                                           cancel_state& cancellation)
     {
-        for(;;)
+        // One null may separate the previous command's results from the next
+        // result; a second null without any new input means the stream ended.
+        for(std::size_t separators = 0;;)
         {
-            if(!cancel_sent && cancel->load(std::memory_order_acquire))
+            observe_cancel(cancel, cancellation);
+
+            if(PQisBusy(connection_.get()) == 0)
             {
-                cancel_sent = true;
-                request_cancel();
+                if(PGresult* raw = PQgetResult(connection_.get()); raw != nullptr)
+                {
+                    if(is_copy_status(PQresultStatus(raw)))
+                    {
+                        // A pipeline cannot deliver copy data either, and it
+                        // cannot be drained in place: report it so the caller
+                        // abandons pipeline mode instead of looping.
+                        PQclear(raw);
+                        throw std::runtime_error{"COPY is not supported inside a PostgreSQL pipeline"};
+                    }
+
+                    return pg_result_ptr{raw};
+                }
+
+                if(++separators > 1)
+                {
+                    return {};
+                }
+
+                continue;
             }
+
+            wait_for_socket(1, 0);
 
             if(PQconsumeInput(connection_.get()) == 0)
             {
@@ -1843,37 +1991,92 @@ private:
                     "unable to read the async pipeline result: " + connection_message(connection_.get())
                 };
             }
+        }
+    }
 
-            if(PGresult* raw = PQgetResult(connection_.get()); raw != nullptr)
+    // Ends the COPY the server started and consumes the stream, so the
+    // connection leaves the copy protocol and the final result that concludes
+    // the copy becomes readable. entityfy has no copy API, so the data is
+    // discarded instead of delivered.
+    void discard_copy_async(ExecStatusType status)
+    {
+        PGconn* const connection = connection_.get();
+
+        if(status == PGRES_COPY_IN || status == PGRES_COPY_BOTH)
+        {
+            // The error message marks the copy as abandoned; otherwise the
+            // server would accept an empty stream as a successful copy. A
+            // COPY done in extended query mode is followed by a Sync, which is
+            // what lets the connection continue with normal statements.
+            (void)PQputCopyEnd(connection, "COPY is not supported by entityfy");
+            flush_async();
+        }
+
+        if(status == PGRES_COPY_OUT || status == PGRES_COPY_BOTH)
+        {
+            for(;;)
             {
-                return pg_result_ptr{raw};
-            }
+                char*     buffer = nullptr;
+                const int chunk = PQgetCopyData(connection, &buffer, 1);
 
-            wait_for_socket(1, 0);
+                if(chunk > 0)
+                {
+                    PQfreemem(buffer);
+                    continue;
+                }
+
+                if(chunk != 0)
+                {
+                    // -1: the copy ended; -2: the protocol already failed and
+                    // the drain below still has to consume what arrived.
+                    break;
+                }
+
+                // No complete chunk buffered yet: load more from the socket.
+                wait_for_socket(1, 0);
+
+                if(PQconsumeInput(connection) == 0)
+                {
+                    throw std::runtime_error{
+                        "unable to discard the async COPY stream: " + connection_message(connection)
+                    };
+                }
+            }
         }
     }
 
     // Every result up to the terminating null has to leave the input buffer,
     // otherwise the next statement on this connection would read stale results.
-    void drain_results_async(const std::shared_ptr<std::atomic<bool>>& cancel, bool& cancel_sent)
+    // A COPY result is consumed as well: libpq keeps answering every
+    // PQgetResult in copy state with a fresh COPY result instead of the
+    // terminating null, so an unguarded drain would never finish. The bound
+    // keeps a protocol surprise from spinning forever.
+    void drain_results_async(const std::shared_ptr<std::atomic<bool>>& cancel, cancel_state& cancellation)
     {
-        for(;;)
+        for(std::size_t guard = 0; guard < 4; ++guard)
         {
-            pg_result_ptr result{take_result_async(cancel, cancel_sent)};
+            pg_result_ptr result{take_result_async(cancel, cancellation)};
 
             if(result == nullptr)
             {
                 return;
             }
+
+            if(const auto status = PQresultStatus(result.get()); is_copy_status(status))
+            {
+                discard_copy_async(status);
+            }
         }
+
+        throw std::runtime_error{"the async PostgreSQL result stream did not terminate"};
     }
 
     // A server side abort caused by our own cancel request completes the task as
-    // cancelled; every other failure keeps the regular classification.
-    [[noreturn]] void deliver_async_failure(const pg_error_info& failure,
-                                            const std::shared_ptr<std::atomic<bool>>& cancel)
+    // cancelled; every other failure keeps the regular classification, because
+    // the server may have aborted on its own (statement_timeout, ...).
+    [[noreturn]] void deliver_async_failure(const pg_error_info& failure, const cancel_state& cancellation)
     {
-        if(failure.sqlstate == "57014" && cancel->load(std::memory_order_acquire))
+        if(failure.sqlstate == "57014" && cancellation.delivered)
         {
             throw async_cancelled{};
         }
@@ -1881,11 +2084,50 @@ private:
         throw pg_statement_error{failure.message, failure.sqlstate};
     }
 
+    // Sends one statement and returns its result, or throws after the result
+    // stream has been drained. A prepared plan that the server no longer knows
+    // (SQLSTATE 26000) is retried once, plain: the name is rejected before
+    // anything executes, so the retry cannot run the statement twice.
     [[nodiscard]] pg_result_ptr send_and_collect_single(const std::string& sql,
                                                         const std::string& prepared,
                                                         const pg_parameters& bound,
                                                         const std::shared_ptr<std::atomic<bool>>& cancel)
     {
+        if(prepared.empty())
+        {
+            return send_and_collect_once(sql, {}, bound, cancel);
+        }
+
+        try
+        {
+            return send_and_collect_once(sql, prepared, bound, cancel);
+        }
+        catch(const pg_statement_error& error)
+        {
+            if(error.sqlstate() != sqlstate_invalid_statement_name)
+            {
+                throw;
+            }
+
+            // The plan disappeared underneath the connection, so it is dropped
+            // locally and the statement re-sent unprepared.
+            forget_statement_local(sql);
+            return send_and_collect_once(sql, {}, bound, cancel);
+        }
+    }
+
+    [[nodiscard]] pg_result_ptr send_and_collect_once(const std::string& sql,
+                                                      const std::string& prepared,
+                                                      const pg_parameters& bound,
+                                                      const std::shared_ptr<std::atomic<bool>>& cancel)
+    {
+        // A cancel that was requested before the statement reached the socket
+        // must not send it at all.
+        if(cancel->load(std::memory_order_acquire))
+        {
+            throw async_cancelled{};
+        }
+
         const int sent = prepared.empty()
             ? PQsendQueryParams(connection_.get(),
                                 sql.c_str(),
@@ -1910,9 +2152,9 @@ private:
 
         flush_async();
 
-        bool cancel_sent = false;
+        cancel_state cancellation;
 
-        pg_result_ptr result{take_result_async(cancel, cancel_sent)};
+        pg_result_ptr result{take_result_async(cancel, cancellation)};
         if(result == nullptr)
         {
             throw std::runtime_error{
@@ -1924,17 +2166,31 @@ private:
         bool failed = false;
 
         const auto status = PQresultStatus(result.get());
+
+        if(is_copy_status(status))
+        {
+            // The server switched the connection into the copy protocol. The
+            // stream is abandoned so the connection stays usable, and the
+            // statement is reported as unsupported: entityfy cannot deliver
+            // copy data. Without this the drain would keep receiving fresh
+            // COPY results and never see its terminating null.
+            discard_copy_async(status);
+            drain_results_async(cancel, cancellation);
+
+            throw pg_statement_error{"COPY is not supported by the entityfy PostgreSQL backend", "0A000"};
+        }
+
         if(status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK)
         {
             failed = true;
             failure = result_error_info(result.get());
         }
 
-        drain_results_async(cancel, cancel_sent);
+        drain_results_async(cancel, cancellation);
 
         if(failed)
         {
-            deliver_async_failure(failure, cancel);
+            deliver_async_failure(failure, cancellation);
         }
 
         return result;
@@ -2090,28 +2346,11 @@ private:
                 sqls.push_back(postgres_placeholders(entry.sql));
             }
 
-            // Prepared plans are used only when every distinct text fits in the
-            // cache: preparing more would evict an earlier chunk's plan and the
-            // pipeline would then send a name the server no longer knows.
-            std::vector<std::string> prepared_names(statements.size());
-            bool use_prepared = capacity_ != 0;
-
-            if(use_prepared)
-            {
-                std::set<std::string> distinct{sqls.begin(), sqls.end()};
-                use_prepared = distinct.size() <= capacity_;
-
-                if(use_prepared)
-                {
-                    for(std::size_t index = 0; index < statements.size(); ++index)
-                    {
-                        prepared_names[index] = statement_name_for(sqls[index]);
-                    }
-                }
-            }
-
+            // A pipeline batch is never retried as a whole, so a stale prepared
+            // plan could not fall back to the plain path: every statement is
+            // sent plain, which costs nothing extra inside one round trip.
             const nonblocking_scope nonblocking{connection_.get()};
-            return run_pipeline_async(statements, sqls, prepared_names, cancel);
+            return run_pipeline_async(statements, sqls, cancel);
         }
         catch(const async_cancelled&)
         {
@@ -2127,57 +2366,75 @@ private:
         }
     }
 
-    void exit_pipeline_mode()
-    {
-        if(PQexitPipelineMode(connection_.get()) == 0)
-        {
-            throw std::runtime_error{"unable to leave pipeline mode: " + connection_message(connection_.get())};
-        }
-    }
-
     // Consumes results until the pipeline sync has been seen and then the
     // pipeline terminator, leaving the connection ready for
-    // PQexitPipelineMode.
-    void drain_to_pipeline_sync(const std::shared_ptr<std::atomic<bool>>& cancel, bool& cancel_sent)
+    // PQexitPipelineMode. `remaining` bounds the drain: a pipeline can only
+    // produce one result per queued statement plus the sync.
+    void drain_to_pipeline_sync(const std::shared_ptr<std::atomic<bool>>& cancel, cancel_state& cancellation,
+                                std::size_t remaining)
     {
-        for(;;)
+        for(std::size_t guard = 0; guard < remaining + 2; ++guard)
         {
-            pg_result_ptr result{next_pipeline_result_async(cancel, cancel_sent)};
+            pg_result_ptr result{next_pipeline_result_async(cancel, cancellation)};
+
+            if(result == nullptr)
+            {
+                return;
+            }
 
             if(PQresultStatus(result.get()) == PGRES_PIPELINE_SYNC)
             {
-                break;
+                // The pipeline terminates with a null result after the sync.
+                (void)take_result_async(cancel, cancellation);
+                return;
             }
         }
 
-        // The pipeline terminates with a null result after the sync.
-        (void)take_result_async(cancel, cancel_sent);
+        throw std::runtime_error{"the async PostgreSQL pipeline did not reach its sync point"};
     }
 
     [[nodiscard]] std::vector<execution_result> run_pipeline_async(
         const std::vector<entityfy::statement>& statements,
         const std::vector<std::string>& sqls,
-        const std::vector<std::string>& prepared_names,
         const std::shared_ptr<std::atomic<bool>>& cancel)
     {
+        // A cancel observed before anything was queued never reaches the server.
+        if(cancel->load(std::memory_order_acquire))
+        {
+            throw async_cancelled{};
+        }
+
         if(PQenterPipelineMode(connection_.get()) == 0)
         {
             throw std::runtime_error{"unable to enter pipeline mode: " + connection_message(connection_.get())};
         }
 
-        bool cancel_sent = false;
-        bool sync_sent = false;
+        cancel_state cancellation;
+        bool         in_pipeline = true;
+        bool         results_pending = false;
+        // Statements actually queued: a cancel stops the send loop before the
+        // next statement, so only this many results arrive.
+        std::size_t  sent = 0;
+        bool         cancelled_early = false;
 
         std::vector<execution_result> output;
         output.reserve(statements.size());
 
         pg_error_info failure;
-        bool failed = false;
+        bool          failed = false;
 
         try
         {
             for(std::size_t index = 0; index < statements.size(); ++index)
             {
+                // Cancellation is observed between statements: the batch stops
+                // queueing as soon as the flag is up.
+                if(cancel->load(std::memory_order_acquire))
+                {
+                    cancelled_early = true;
+                    break;
+                }
+
                 if(logger_)
                 {
                     logger_(statements[index].sql);
@@ -2186,34 +2443,24 @@ private:
                 auto parameters = to_pg_parameters(statements[index].binds);
                 const pg_parameters bound{parameters};
 
-                const std::string& prepared = prepared_names[index];
-                const auto cached = index_.find(sqls[index]);
-                const bool usable =
-                    !prepared.empty() && cached != index_.end() && cached->second->second == prepared;
-
-                const int sent = usable
-                    ? PQsendQueryPrepared(connection_.get(),
-                                          prepared.c_str(),
-                                          bound.count(),
-                                          bound.values(),
-                                          bound.lengths(),
-                                          bound.formats(),
-                                          0)
-                    : PQsendQueryParams(connection_.get(),
-                                        sqls[index].c_str(),
-                                        bound.count(),
-                                        nullptr,
-                                        bound.values(),
-                                        bound.lengths(),
-                                        bound.formats(),
-                                        0);
-
-                if(sent == 0)
+                // A batch is never retried as a whole, so a stale prepared plan
+                // could not fall back to the plain path: every statement is
+                // sent plain, which costs nothing extra inside one round trip.
+                if(PQsendQueryParams(connection_.get(),
+                                     sqls[index].c_str(),
+                                     bound.count(),
+                                     nullptr,
+                                     bound.values(),
+                                     bound.lengths(),
+                                     bound.formats(),
+                                     0) == 0)
                 {
                     throw std::runtime_error{
                         "unable to send the async pipeline statement: " + connection_message(connection_.get())
                     };
                 }
+
+                ++sent;
             }
 
             if(PQpipelineSync(connection_.get()) == 0)
@@ -2221,12 +2468,20 @@ private:
                 throw std::runtime_error{"unable to sync the async pipeline: " + connection_message(connection_.get())};
             }
 
-            sync_sent = true;
+            results_pending = true;
             flush_async();
 
-            for(std::size_t index = 0; index < statements.size(); ++index)
+            for(std::size_t index = 0; index < sent; ++index)
             {
-                pg_result_ptr result{next_pipeline_result_async(cancel, cancel_sent)};
+                pg_result_ptr result{next_pipeline_result_async(cancel, cancellation)};
+
+                if(result == nullptr)
+                {
+                    throw std::runtime_error{
+                        "the async pipeline stopped before returning every result: " +
+                        connection_message(connection_.get())
+                    };
+                }
 
                 if(failed)
                 {
@@ -2246,7 +2501,14 @@ private:
             }
 
             {
-                pg_result_ptr sync{next_pipeline_result_async(cancel, cancel_sent)};
+                pg_result_ptr sync{next_pipeline_result_async(cancel, cancellation)};
+
+                if(sync == nullptr)
+                {
+                    throw std::runtime_error{
+                        "the async pipeline sync result was lost: " + connection_message(connection_.get())
+                    };
+                }
 
                 if(!failed && PQresultStatus(sync.get()) != PGRES_PIPELINE_SYNC)
                 {
@@ -2256,39 +2518,51 @@ private:
             }
 
             // The pipeline terminates with a null result after the sync.
-            (void)take_result_async(cancel, cancel_sent);
+            (void)take_result_async(cancel, cancellation);
+            results_pending = false;
 
-            exit_pipeline_mode();
+            if(PQexitPipelineMode(connection_.get()) == 0)
+            {
+                throw std::runtime_error{"unable to leave pipeline mode: " + connection_message(connection_.get())};
+            }
+
+            in_pipeline = false;
         }
         catch(...)
         {
-            if(sync_sent)
+            if(results_pending)
             {
                 // Consume whatever is left through the sync so the connection
                 // can leave pipeline mode and be reused.
                 try
                 {
-                    drain_to_pipeline_sync(cancel, cancel_sent);
+                    drain_to_pipeline_sync(cancel, cancellation, sent + 1);
                 }
                 catch(const std::exception&)
                 {
                 }
             }
 
-            try
+            // A failure before the sync leaves the connection in pipeline mode;
+            // abandoning it (resetting when even that fails) keeps later calls
+            // from failing with "not allowed in pipeline mode".
+            if(in_pipeline)
             {
-                exit_pipeline_mode();
-            }
-            catch(const std::exception&)
-            {
+                abandon_pipeline_mode();
             }
 
             throw;
         }
 
+        if(cancelled_early)
+        {
+            // What was already queued has completed; the rest was never sent.
+            throw async_cancelled{};
+        }
+
         if(failed)
         {
-            deliver_async_failure(failure, cancel);
+            deliver_async_failure(failure, cancellation);
         }
 
         return output;
