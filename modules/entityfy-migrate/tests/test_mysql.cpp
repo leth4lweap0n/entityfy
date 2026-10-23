@@ -158,6 +158,8 @@ entityfy_test::status test_mysql()
         require(entityfy::migrate::same_schema(v3, backend->introspect()), "mysql database unchanged after refusal");
     }
 
+    std::filesystem::path engine_backup_path;
+
     {
         entityfy::migrate::engine runner{*backend, entityfy::migrate::engine_options{
                                         .root = root,
@@ -169,17 +171,16 @@ entityfy_test::status test_mysql()
         runner.apply(v4, output);
         require(entityfy::migrate::same_schema(v4, backend->introspect()), "mysql type change applied");
 
-        bool engine_backup = false;
         for(const auto& entry: std::filesystem::directory_iterator(root))
         {
             const auto name = entry.path().filename().string();
             if(name.starts_with("backup-") && entry.path().extension() == ".sql")
             {
-                engine_backup = true;
+                engine_backup_path = entry.path();
             }
         }
 
-        require(engine_backup, "mysql engine writes a .sql backup before destructive steps");
+        require(!engine_backup_path.empty(), "mysql engine writes a .sql backup before destructive steps");
 
         auto rows = backend->query("SELECT \"email\" FROM \"users\"");
         require(rows.size() == 1 && rows.front().front() == "ada@test.com", "mysql data preserved after type change");
@@ -224,6 +225,21 @@ entityfy_test::status test_mysql()
     require(restored.size() == 2, "mysql backup restores both rows");
     require(restored.front().size() == 2 && restored.front().front() == "1", "mysql restored integer column");
     require(restored.back().back() == "it's", "mysql restored text column");
+
+    cleanup(*backend);
+    restore_dump(*backend, read_text(engine_backup_path));
+
+    const auto backup_users = backend->query("SELECT \"full_name\" FROM \"users\"");
+    require(
+        backup_users.size() == 1 && backup_users.front().front() == "Ada",
+        "mysql engine backup restores the user row"
+    );
+
+    const auto backup_posts = backend->query("SELECT COUNT(*) FROM \"posts\"");
+    require(
+        backup_posts.size() == 1 && backup_posts.front().front() == "1",
+        "mysql engine backup restores the dependent row"
+    );
 
     cleanup(*backend);
 

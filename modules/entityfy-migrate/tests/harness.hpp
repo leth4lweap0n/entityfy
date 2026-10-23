@@ -31,8 +31,9 @@ inline std::string read_text(const std::filesystem::path& path)
     return std::string{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
 }
 
-// Replays the CREATE/INSERT statements of a provider dump (controlled test data,
-// so splitting on ';' is enough).
+// Replays a provider dump in order, including SET/transaction control so
+// identity inserts and quoted identifiers survive the round trip. Comment lines
+// are dropped; the controlled test data makes splitting on ';' enough.
 inline void restore_dump(entityfy::migrate::provider& backend, std::string_view dump)
 {
     std::size_t start = 0;
@@ -45,21 +46,40 @@ inline void restore_dump(entityfy::migrate::provider& backend, std::string_view 
             break;
         }
 
-        auto statement = dump.substr(start, end - start);
+        const auto statement = dump.substr(start, end - start);
         start = end + 1;
 
-        const auto first = statement.find_first_not_of(" \t\r\n");
-        if(first == std::string_view::npos)
+        std::string cleaned;
+        std::size_t line_start = 0;
+
+        while(line_start <= statement.size())
+        {
+            const auto line_end = statement.find('\n', line_start);
+            const auto line = statement.substr(
+                line_start, line_end == std::string_view::npos ? std::string_view::npos : line_end - line_start);
+            const auto first = line.find_first_not_of(" \t\r");
+
+            if(first != std::string_view::npos && !line.substr(first).starts_with("--"))
+            {
+                cleaned.append(line);
+                cleaned.push_back('\n');
+            }
+
+            if(line_end == std::string_view::npos)
+            {
+                break;
+            }
+
+            line_start = line_end + 1;
+        }
+
+        const auto first = cleaned.find_first_not_of(" \t\r\n");
+        if(first == std::string::npos)
         {
             continue;
         }
 
-        statement.remove_prefix(first);
-
-        if(statement.starts_with("CREATE") || statement.starts_with("INSERT"))
-        {
-            backend.execute_sql(statement);
-        }
+        backend.execute_sql(std::string_view{cleaned}.substr(first));
     }
 }
 
