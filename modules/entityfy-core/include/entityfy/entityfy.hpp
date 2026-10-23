@@ -6,6 +6,7 @@
 #include <entityfy/error.hpp>
 #include <entityfy/introspection.hpp>
 #include <entityfy/key.hpp>
+#include <entityfy/lazy.hpp>
 #include <entityfy/mapper.hpp>
 #include <entityfy/meta.hpp>
 #include <entityfy/migration.hpp>

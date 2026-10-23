@@ -2,6 +2,7 @@
 
 #include <entityfy/annotations.hpp>
 #include <entityfy/dialect.hpp>
+#include <entityfy/lazy.hpp>
 #include <entityfy/meta.hpp>
 #include <entityfy/value.hpp>
 
@@ -752,7 +753,16 @@ consteval void validate_field_annotations()
 {
     using field_type = meta::field_type_t<Model, ReflectedField>;
 
-    if constexpr(meta::has_annotation<owned_t, ReflectedField>())
+    if constexpr(is_lazy_v<field_type>)
+    {
+        // A lazy handle loads related rows on demand; it never maps to a column.
+        static_assert(
+            dependent_false<field_type>,
+            "entityfy ORM lazy<T> members must be marked [[= entityfy::ignore]]; a lazy handle loads related rows on "
+            "demand and is never persisted as a column."
+        );
+    }
+    else if constexpr(meta::has_annotation<owned_t, ReflectedField>())
     {
         static_assert(
             !is_optional_v<field_type>,
@@ -790,6 +800,16 @@ consteval void validate_owned_struct()
         persistent_field_count<owned_type>() > 0,
         "entityfy ORM owned types must contain at least one persisted field; remove entityfy::ignore from one field."
     );
+
+    // Owned values are flattened into the owning row, so they cannot hold a
+    // handle to rows of another table, ignored or not.
+    meta::for_each_field_reflection<owned_type>([]<auto meta_field>() {
+        static_assert(
+            !is_lazy_v<meta::field_type_t<owned_type, meta_field>>,
+            "entityfy ORM owned types cannot contain entityfy::lazy<T> members; declare the lazy handle on the owning "
+            "model and mark it [[= entityfy::ignore]]."
+        );
+    });
 
     meta::for_each_persistent_field_reflection<owned_type, ignore_t>([]<auto meta_field>() {
         static_assert(
