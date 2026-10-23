@@ -121,15 +121,23 @@ raw libpq `PQprepare`+`PQexecPrepared`, and raw `PQexecParams` paths are compare
 
 | Operation | entityfy | raw prepared | raw params | E/prep | E/params |
 |---|---:|---:|---:|---:|---:|
-| find (primary key) | 126,6 µs | 55,1 µs | 102,7 µs | 2,30x | 1,23x |
-| find_one (unique email) | 123,8 µs | 57,0 µs | 102,7 µs | 2,17x | 1,21x |
-| insert_many | 83k rows/s | — | — | — | — |
+| find (primary key) | 83,3 µs | 53,9 µs | 99,9 µs | 1,55x | 0,83x |
+| find_one (unique email) | 71,1 µs | 56,2 µs | 99,9 µs | 1,26x | 0,71x |
+| insert_many | 110k rows/s | — | — | — | — |
 
-**Commentary:** in PostgreSQL the absolute time is determined by network latency (~60–90 µs). The
-overhead added by the ORM layer is on the order of 30–60 µs, i.e. 1,3–2,1 times the raw driver.
-So what is "slow" here is the driver/network layer, not the ORM. Against the same server,
-`PQexecParams` (prepare on every call) remains slower than entityfy; the contribution of a
-prepared statement on the server side shows up here as well.
+**Statement cache:** the PostgreSQL backend now prepares statements too (`PREPARE` through
+taocpp::pq, LRU of 32 names by default, deallocated on eviction and after DDL). Measured in the
+same process with the cache off and on:
+
+| Operation | cache off | cache on | gain |
+|---|---:|---:|---:|
+| find (primary key) | 129,0 µs | 83,3 µs | 1,55x |
+| find_one (unique email) | 141,7 µs | 71,1 µs | 1,99x |
+
+**Commentary:** in PostgreSQL the absolute time is determined by network latency (~60–90 µs). With
+the server side cache the ORM layer adds 1,3–1,6 times the raw driver instead of 1,3–2,3 times;
+against `PQexecParams` (prepare on every call) entityfy is now faster (0,7–0,8x). What remains is
+the per-call round trip, not parsing or planning.
 
 ## Context layer (change tracking)
 

@@ -178,8 +178,10 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
 - **query DSL**: `where`, `order_by`, `take`, `skip`, `select` (projection), `sum`, `avg`,
   `min`, `max`, `count`, grouped aggregates (`count_by`, `sum_by`, `group_count`,
   `group_count_having`).
-- **Prepared statement cache**: the SQLite backend keeps compiled statements in an LRU
-  (default capacity 32); parameters are rebound on every execution, with no bind leakage.
+- **Prepared statement cache**: both backends keep statements in an LRU (default capacity 32) -
+  compiled `sqlite3_stmt` on SQLite, named server side `PREPARE` plans on PostgreSQL
+  (deallocated on eviction and after DDL); parameters are rebound on every execution, with no
+  bind leakage.
 - **Multi-row INSERT**: `insert_many` produces a single statement for models with explicit
   keys, split according to the batch parameter limit.
 - **Value converter**: with `entityfy::value_converter<T>` your own type is written to and read
@@ -270,12 +272,14 @@ PostgreSQL, local server, 5.000 rows:
 
 | Operation | entityfy | raw prepared | raw params | /prepared | /params |
 |---|---:|---:|---:|---:|---:|
-| find (primary key) | 126,6 µs | 55,1 µs | 102,7 µs | 2,30x | 1,23x |
-| find_one (unique email) | 123,8 µs | 57,0 µs | 102,7 µs | 2,17x | 1,21x |
-| insert_many | 83k rows/s | — | — | — | — |
+| find (primary key) | 83,3 µs | 53,9 µs | 99,9 µs | 1,55x | 0,83x |
+| find_one (unique email) | 71,1 µs | 56,2 µs | 99,9 µs | 1,26x | 0,71x |
+| insert_many | 110k rows/s | — | — | — | — |
 
-On PostgreSQL the absolute time is determined by network latency; the ORM layer's share is
-1,2–2,3 times the raw driver. Absolute times can vary by up to a factor of two with machine load;
+On PostgreSQL the absolute time is determined by network latency. With the server side statement
+cache the ORM layer's share is 1,3–1,6 times the raw prepared driver (cache off/on in the same
+process: 1,55x for the primary key, 1,99x for the unique email - see `docs/benchmarks.md`), and it
+is faster than `PQexecParams`. Absolute times can vary by up to a factor of two with machine load;
 the ratios are more stable.
 
 ## Tests
@@ -395,8 +399,6 @@ through `sl3`, and there is no second copy of SQLite.
 
 ## Limitations
 
-- The PostgreSQL backend does not use a prepared statement cache; `taocpp::pq` does not expose
-  `PQexecPrepared`. An adapter moving to raw libpq is required.
 - `save_changes_async()` is a thread offload, not I/O asynchrony.
 - The core does not perform dirty-column updates; partial UPDATE lives in the context layer.
 - Column-split owned types and TPH inheritance are not supported. Composite/JSON values are

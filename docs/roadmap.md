@@ -7,7 +7,9 @@
 - Model/annotation system, DDL generation, schema validation, and drift report
 - query DSL: filters, ordering, paging, projection, aggregates, grouped aggregates
 - SQLite and PostgreSQL backends
-- **Prepared statement cache** (LRU, default capacity 32, bind-leak tested)
+- **Prepared statement cache** on both backends (LRU, default capacity 32, bind-leak tested,
+  SQLite `sqlite3_stmt` + PostgreSQL named `PREPARE` plans; measured 1,55x / 1,99x against the
+  cache being off)
 - **Multi-row INSERT** (`insert_many`): a single statement for models with explicit keys, split
   according to the batch limit; measured 4,1x gain
 - **SQL logger** (`client::set_logger`) and batch parameter limit
@@ -46,33 +48,29 @@
 
 ## Planned
 
-1. **PostgreSQL statement cache** — `taocpp::pq` does not expose `PQexecPrepared` (only
-   `PQexecParams`); a small adapter moving to raw libpq (`PQprepare`/`PQexecPrepared`) is needed
-   for prepared statements. The SQLite side was meanwhile solved with an LRU cache.
-2. **Row materialization allocations** — single-row reads should produce the row object directly
+1. **Row materialization allocations** — single-row reads should produce the row object directly
    instead of `vector<vector<sql_value>>`.
-3. **Dirty-column update** — because core keeps no snapshot, `table_client::update` writes all
+2. **Dirty-column update** — because core keeps no snapshot, `table_client::update` writes all
    columns; partial UPDATE exists only in the context layer.
-4. **Write tracking in the context** — `save_changes()` compares every tracked entity against its
+3. **Write tracking in the context** — `save_changes()` compares every tracked entity against its
    snapshot, so a one-row update is O(tracked entities) even though the undo log already records
    only what a save touches (see `docs/benchmarks.md`). Removing the remaining scan needs write
    hooks: an explicit `mark_modified(entity)` API or proxy-style setters.
-5. **Compile-time no-tracking view** — `as_no_tracking()` returns `std::vector<T>` by value, so
+4. **Compile-time no-tracking view** — `as_no_tracking()` returns `std::vector<T>` by value, so
    mutating a returned entity compiles and is silently ignored (the EF Core `AsNoTracking`
    footgun). A const-only wrapper would make that a compile error; it needs a view type that
    keeps the value movable, so it is a design decision, not a rename.
-6. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
+5. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
    in practice covered by `entityfy::value_converter<T>` (a composite type is written to a single
    column), but owned types **split across** columns (as in EF, e.g. `address_city`) and a TPH
    discriminator do not exist yet.
-7. **Additional providers** — MySQL / SQL Server.
-8. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
+6. **Additional providers** — MySQL / SQL Server.
+7. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
    **from the live schema** (the DB → model direction exists); the reverse direction (model → DB)
    is covered by the `snapshot` + `apply` commands, with no separate generation command.
 
 ## Known limitations
 
-- The statement cache is enabled only in the SQLite backend.
 - The context module uses `entityfy::db_query_builder`; it is named this way to avoid a name
   collision with core's `entityfy::query_builder`.
 - The migration module uses its own providers; there is no statement cache there.

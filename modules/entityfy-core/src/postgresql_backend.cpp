@@ -7,13 +7,16 @@
 #include <tao/pq/oid.hpp>
 #include <tao/pq/result_traits.hpp>
 
+#include <cctype>
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <mutex>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -384,7 +387,17 @@ public:
             auto parameters = to_pg_parameters(input.binds);
             tao::pq::parameter<max_pg_parameters> bound;
             bind_parameters(bound, parameters);
-            auto result = connection_->execute(sql, bound);
+
+            const bool ddl = is_ddl(sql);
+            const std::string prepared = statement_name_for(sql);
+            auto result = run_statement(sql, prepared, bound);
+
+            // A prepared plan captures the schema at prepare time; after DDL the
+            // cached plans may refer to a dropped or altered relation.
+            if(ddl)
+            {
+                clear_statement_cache_locked();
+            }
 
             return execution_result{
                 .rows_affected = result.has_rows_affected() ? result.rows_affected() : 0,
@@ -411,7 +424,9 @@ public:
             auto parameters = to_pg_parameters(input.binds);
             tao::pq::parameter<max_pg_parameters> bound;
             bind_parameters(bound, parameters);
-            auto result = connection_->execute(sql, bound);
+
+            const std::string prepared = statement_name_for(sql);
+            auto result = run_statement(sql, prepared, bound);
 
             std::vector<row> rows;
             rows.reserve(result.size());
@@ -602,26 +617,44 @@ public:
         return output;
     }
 
-    // The PostgreSQL backend talks to libpq through taocpp::pq, which does not
-    // expose reusable prepared statements. The cache API stays available so
-    // that code stays portable, but the capacity stays zero.
+    // Named server side prepared statements, kept in an LRU like the SQLite
+    // backend. taocpp::pq sends PQsendQueryPrepared once a name is prepared,
+    // so a cache hit skips parsing and planning on the server.
     void set_statement_cache_capacity(std::size_t capacity) override
     {
-        (void)capacity;
+        const std::lock_guard lock{mutex_};
+        capacity_ = capacity;
+
+        if(capacity_ == 0)
+        {
+            clear_statement_cache_locked();
+            return;
+        }
+
+        while(cache_.size() > capacity_)
+        {
+            deallocate_locked(cache_.back().second);
+            index_.erase(cache_.back().first);
+            cache_.pop_back();
+        }
     }
 
     [[nodiscard]] std::size_t statement_cache_capacity() const noexcept override
     {
-        return 0;
+        const std::lock_guard lock{mutex_};
+        return capacity_;
     }
 
     [[nodiscard]] std::size_t statement_cache_size() const noexcept override
     {
-        return 0;
+        const std::lock_guard lock{mutex_};
+        return cache_.size();
     }
 
     void clear_statement_cache() override
     {
+        const std::lock_guard lock{mutex_};
+        clear_statement_cache_locked();
     }
 
     void set_batch_parameter_limit(std::size_t limit) override
@@ -643,9 +676,173 @@ public:
     }
 
 private:
+    // PREPARE accepts SELECT, INSERT, UPDATE, DELETE, VALUES and WITH; other
+    // statements (DDL, SET, COPY, ...) go through the plain execution path.
+    // Multi statement input is never prepared either.
+    [[nodiscard]] static bool is_preparable(std::string_view sql)
+    {
+        const auto begin = sql.find_first_not_of(" \t\r\n");
+        if(begin == std::string_view::npos)
+        {
+            return false;
+        }
+
+        if(const auto semicolon = sql.find(';'); semicolon != std::string_view::npos)
+        {
+            if(sql.substr(semicolon + 1).find_first_not_of(" \t\r\n;") != std::string_view::npos)
+            {
+                return false;
+            }
+        }
+
+        std::string keyword;
+        for(std::size_t index = begin; index < sql.size(); ++index)
+        {
+            const auto character = static_cast<unsigned char>(sql[index]);
+            if(!std::isalpha(character))
+            {
+                break;
+            }
+
+            keyword.push_back(static_cast<char>(std::toupper(character)));
+        }
+
+        return keyword == "SELECT" || keyword == "INSERT" || keyword == "UPDATE" || keyword == "DELETE" ||
+               keyword == "VALUES" || keyword == "WITH";
+    }
+
+    [[nodiscard]] static bool is_ddl(std::string_view sql)
+    {
+        const auto begin = sql.find_first_not_of(" \t\r\n");
+        if(begin == std::string_view::npos)
+        {
+            return false;
+        }
+
+        std::string keyword;
+        for(std::size_t index = begin; index < sql.size(); ++index)
+        {
+            const auto character = static_cast<unsigned char>(sql[index]);
+            if(!std::isalpha(character))
+            {
+                break;
+            }
+
+            keyword.push_back(static_cast<char>(std::toupper(character)));
+        }
+
+        return keyword == "CREATE" || keyword == "ALTER" || keyword == "DROP" || keyword == "TRUNCATE" ||
+               keyword == "RENAME";
+    }
+
+    // Returns the prepared statement name for the SQL, or nullptr when the
+    // statement should run unprepared. Caller holds the mutex.
+    // Empty string when the statement runs unprepared.
+    [[nodiscard]] std::string statement_name_for(const std::string& sql)
+    {
+        if(capacity_ == 0 || !is_preparable(sql))
+        {
+            return {};
+        }
+
+        if(const auto found = index_.find(sql); found != index_.end())
+        {
+            cache_.splice(cache_.begin(), cache_, found->second);
+            return cache_.front().second;
+        }
+
+        const auto name = "entityfy_stmt_" + std::to_string(next_statement_id_++);
+
+        try
+        {
+            connection_->prepare(name, sql);
+        }
+        catch(const std::exception&)
+        {
+            // Not preparable in this server: keep using the plain path instead
+            // of failing the statement.
+            return {};
+        }
+
+        cache_.emplace_front(sql, name);
+        index_[sql] = cache_.begin();
+
+        while(cache_.size() > capacity_)
+        {
+            deallocate_locked(cache_.back().second);
+            index_.erase(cache_.back().first);
+            cache_.pop_back();
+        }
+
+        return cache_.front().second;
+    }
+
+    // Runs a statement, preferring the prepared plan. A prepared statement can
+    // disappear underneath us (PREPARE is undone when the transaction that ran
+    // it rolls back), so a failed prepared call falls back to the plain path
+    // and forgets the plan instead of surfacing a confusing error.
+    [[nodiscard]] tao::pq::result run_statement(const std::string& sql,
+                                                const std::string& prepared,
+                                                tao::pq::parameter<max_pg_parameters>& bound)
+    {
+        if(prepared.empty())
+        {
+            return connection_->execute(sql, bound);
+        }
+
+        try
+        {
+            return connection_->execute(prepared, bound);
+        }
+        catch(const std::exception&)
+        {
+            forget_statement(sql);
+            return connection_->execute(sql, bound);
+        }
+    }
+
+    void forget_statement(const std::string& sql)
+    {
+        const auto found = index_.find(sql);
+        if(found == index_.end())
+        {
+            return;
+        }
+
+        deallocate_locked(found->second->second);
+        cache_.erase(found->second);
+        index_.erase(found);
+    }
+
+    void deallocate_locked(const std::string& name) noexcept
+    {
+        try
+        {
+            connection_->deallocate(name);
+        }
+        catch(const std::exception&)
+        {
+        }
+    }
+
+    void clear_statement_cache_locked() noexcept
+    {
+        for(const auto& entry: cache_)
+        {
+            deallocate_locked(entry.second);
+        }
+
+        cache_.clear();
+        index_.clear();
+    }
+
     std::shared_ptr<tao::pq::connection> connection_;
     mutable std::recursive_mutex           mutex_;
     std::size_t                            batch_parameter_limit_ = max_pg_parameters;
+    std::size_t                            capacity_ = 32;
+    std::uint64_t                          next_statement_id_ = 1;
+    std::list<std::pair<std::string, std::string>> cache_;
+    std::unordered_map<std::string, decltype(cache_.begin())> index_;
     std::function<void(std::string_view)>  logger_;
 };
 

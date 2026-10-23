@@ -86,7 +86,5 @@ Measured effect: [docs/benchmarks.md](benchmarks.md).
 
 ## Deliberate limitations
 
-- The PostgreSQL backend does not use a statement cache (libpq prepared statement reuse is not
-  exposed through taocpp). The API exists to keep it portable; capacity reports 0.
 - The migration module uses its own providers; there is no statement cache there.
 - There is no async/coroutine API; `db_context_pool` provides connection and context reuse.

@@ -1366,6 +1366,55 @@ status run_postgres_checks()
     require(ctx.database().table<rc_parent>().count() == 0, "pg parent row removed");
     require(ctx.database().table<rc_child>().count() == 0, "pg child row removed");
 
+    // --- statement cache: named prepared statements on the server ---
+    auto& database = ctx.database();
+    database.set_statement_cache_capacity(32);
+    database.clear_statement_cache();
+    require(database.statement_cache_capacity() == 32, "pg cache capacity is configurable");
+
+    (void)users.query().select(&rc_user::email);
+    const auto cached_after_first = database.statement_cache_size();
+    (void)users.query().select(&rc_user::email);
+    require(cached_after_first == 1 && database.statement_cache_size() == 1,
+            "pg cache prepares a statement once and reuses it");
+
+    const auto cached_rows = users.query().order_by(&rc_user::id).select(&rc_user::id);
+    database.set_statement_cache_capacity(0);
+    require(database.statement_cache_size() == 0, "pg disabling the cache deallocates the plans");
+    const auto uncached_rows = users.query().order_by(&rc_user::id).select(&rc_user::id);
+    require(cached_rows == uncached_rows, "pg cache does not change results");
+
+    database.set_statement_cache_capacity(32);
+    (void)users.query().select(&rc_user::email);
+    require(database.statement_cache_size() > 0, "pg cache is populated before DDL");
+    ctx.execute("CREATE TEMPORARY TABLE \"rc_cache_probe\" (\"id\" INTEGER)");
+    require(database.statement_cache_size() == 0, "pg DDL drops stale prepared plans");
+    ctx.execute("DROP TABLE IF EXISTS \"rc_cache_probe\"");
+
+    // PREPARE is transactional: a rolled back transaction removes the plan the
+    // cache believes in, so the next call has to recover through the plain path.
+    database.set_statement_cache_capacity(32);
+    database.clear_statement_cache();
+
+    bool cache_rollback = false;
+    try
+    {
+        ctx.transaction([&] {
+            (void)users.query().select(&rc_user::email);
+            throw std::runtime_error{"force rollback"};
+        });
+    }
+    catch(const std::exception&)
+    {
+        cache_rollback = true;
+    }
+
+    require(cache_rollback, "pg cache rollback probe ran");
+    require(database.statement_cache_size() == 1, "pg cache holds the plan prepared inside the transaction");
+    const auto after_rollback = users.query().select(&rc_user::email);
+    require(!after_rollback.empty(), "pg query recovers after a rolled back PREPARE");
+    require(database.statement_cache_size() == 1, "pg recovered plan is cached again");
+
     ctx.execute("DROP TABLE IF EXISTS \"rc_children\" CASCADE");
     ctx.execute("DROP TABLE IF EXISTS \"rc_parents\" CASCADE");
     ctx.execute("DROP TABLE IF EXISTS \"rc_tags\" CASCADE");

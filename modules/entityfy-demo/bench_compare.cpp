@@ -740,6 +740,21 @@ void run_postgres_bench(const std::string& uri, std::size_t rows, std::size_t re
     pg_check(connection, PQprepare(connection, "bench_pk", pk_sql.c_str(), 0, nullptr), "prepare pk");
     pg_check(connection, PQprepare(connection, "bench_email", email_sql.c_str(), 0, nullptr), "prepare email");
 
+    // Statement cache on/off for the same entityfy calls, same process.
+    database.set_statement_cache_capacity(0);
+    database.clear_statement_cache();
+
+    const auto entityfy_pk_uncached = measure(
+        [&](std::size_t index) {
+            const auto found = users.find(static_cast<std::int64_t>(index + 1));
+            g_sink += found ? static_cast<std::uint64_t>(found->id) : 0;
+        },
+        std::min<std::size_t>(rows, 200),
+        repetitions);
+
+    database.set_statement_cache_capacity(32);
+    database.clear_statement_cache();
+
     const auto entityfy_pk = measure(
         [&](std::size_t index) {
             const auto found = users.find(static_cast<std::int64_t>(index + 1));
@@ -784,6 +799,20 @@ void run_postgres_bench(const std::string& uri, std::size_t rows, std::size_t re
         },
         std::min<std::size_t>(rows, 200),
         repetitions);
+
+    database.set_statement_cache_capacity(0);
+    database.clear_statement_cache();
+
+    const auto entityfy_email_uncached = measure(
+        [&](std::size_t index) {
+            const auto found = users.find_one(entityfy::where(&bench_user_explicit::email).eq(emails[index]));
+            g_sink += found ? static_cast<std::uint64_t>(found->id) : 0;
+        },
+        std::min<std::size_t>(rows, 200),
+        repetitions);
+
+    database.set_statement_cache_capacity(32);
+    database.clear_statement_cache();
 
     const auto entityfy_email = measure(
         [&](std::size_t index) {
@@ -839,6 +868,22 @@ void run_postgres_bench(const std::string& uri, std::size_t rows, std::size_t re
 
     row("find (primary key)", entityfy_pk, raw_prepared_pk, raw_params_pk);
     row("find_one (unique email)", entityfy_email, raw_prepared_email, raw_params_pk);
+
+    std::cout << "\nstatement cache (entityfy, same process)\n";
+    std::cout << std::format("{:<26}{:>14}{:>14}{:>11}\n", "operation", "cache off us", "cache on us", "speedup");
+    std::cout << std::string(65, '-') << "\n";
+
+    const auto cache_row = [&](std::string_view name, const timing& off, const timing& on) {
+        const double speedup = on.median_ns > 0.0 ? off.median_ns / on.median_ns : 0.0;
+        std::cout << std::format("{:<26}{:>14.1f}{:>14.1f}{:>10.2f}x\n",
+                                 name,
+                                 off.median_ns / 1000.0,
+                                 on.median_ns / 1000.0,
+                                 speedup);
+    };
+
+    cache_row("find (primary key)", entityfy_pk_uncached, entityfy_pk);
+    cache_row("find_one (unique email)", entityfy_email_uncached, entityfy_email);
 
     // Leave the database as it was found: a leftover bench table makes the
     // migration test report a schema that no longer matches its snapshot.
