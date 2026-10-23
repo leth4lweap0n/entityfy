@@ -397,9 +397,10 @@ GCC 16.2 fails to link Debug binaries against the static libstdc++ (a duplicate
 `std::runtime_error` definition that is only pulled in without optimization), so Debug binaries use
 the MinGW DLLs and need `<mingw>/bin` on `PATH` to run.
 
-CI: `.github/workflows/ci.yml` (branch `ci-workflow`, pending a push with the `workflow` scope)
-runs the SQLite, PostgreSQL and MySQL suites in the official `gcc:16` container; a skipped
-PostgreSQL/MySQL run is a failure there (see the `ENTITYFY_REQUIRE_*` variables).
+CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs four parallel jobs in the
+official `gcc:16` container - SQLite, PostgreSQL 18, MariaDB 11.4 and SQL Server 2022 - and each
+job asserts that its backend was enabled before building. A skipped PostgreSQL, MySQL or SQL
+Server run is a failure there (see the `ENTITYFY_REQUIRE_*` variables).
 
 ```bash
 cmake --preset release

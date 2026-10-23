@@ -95,7 +95,7 @@ if(ENTITYFY_BUILD_EXAMPLES)
     FetchContent_Declare(
         spdlog
         GIT_REPOSITORY https://github.com/gabime/spdlog.git
-        GIT_TAG v1.x
+        GIT_TAG v1.17.0
         GIT_SHALLOW TRUE
         EXCLUDE_FROM_ALL
     )

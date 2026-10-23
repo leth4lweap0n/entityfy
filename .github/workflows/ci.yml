@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -11,7 +13,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   linux-sqlite:
@@ -20,7 +22,9 @@ jobs:
     container: gcc:16
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install tools
         run: |
@@ -31,14 +35,19 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DENTITYFY_BUILD_TESTS=ON \
+            -DBUILD_TESTING=ON \
             -DENTITYFY_ENABLE_SQLITE=ON \
             -DENTITYFY_ENABLE_POSTGRESQL=OFF
+
+      - name: Verify the SQLite backend is enabled
+        run: grep -q '^ENTITYFY_ENABLE_SQLITE:BOOL=ON$' build/CMakeCache.txt
 
       - name: Build
         run: cmake --build build --parallel "$(nproc)"
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --no-tests=error
 
   linux-postgresql:
     name: linux / gcc 16 / postgresql
@@ -56,8 +65,11 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+          --health-start-period=30s
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install tools
         run: |
@@ -68,8 +80,15 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DENTITYFY_BUILD_TESTS=ON \
+            -DBUILD_TESTING=ON \
             -DENTITYFY_ENABLE_SQLITE=ON \
             -DENTITYFY_ENABLE_POSTGRESQL=ON
+
+      - name: Verify the backends are enabled
+        run: |
+          grep -q '^ENTITYFY_ENABLE_SQLITE:BOOL=ON$' build/CMakeCache.txt
+          grep -q '^ENTITYFY_ENABLE_POSTGRESQL:BOOL=ON$' build/CMakeCache.txt
 
       - name: Build
         run: cmake --build build --parallel "$(nproc)"
@@ -78,7 +97,7 @@ jobs:
         env:
           ENTITYFY_PG_URI: postgresql://postgres:postgres@postgres:5432/entityfy_test
           ENTITYFY_REQUIRE_PG: "1"
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --no-tests=error
 
   linux-mysql:
     name: linux / gcc 16 / mysql
@@ -96,8 +115,11 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 30
+          --health-start-period=30s
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install tools
         run: |
@@ -108,9 +130,16 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DENTITYFY_BUILD_TESTS=ON \
+            -DBUILD_TESTING=ON \
             -DENTITYFY_ENABLE_SQLITE=ON \
             -DENTITYFY_ENABLE_POSTGRESQL=OFF \
             -DENTITYFY_ENABLE_MYSQL=ON
+
+      - name: Verify the MySQL backend is enabled
+        run: |
+          grep -q '^ENTITYFY_ENABLE_SQLITE:BOOL=ON$' build/CMakeCache.txt
+          grep -q '^ENTITYFY_ENABLE_MYSQL:BOOL=ON$' build/CMakeCache.txt
 
       - name: Build
         run: cmake --build build --parallel "$(nproc)"
@@ -119,7 +148,7 @@ jobs:
         env:
           ENTITYFY_MYSQL_URI: mysql://root:secret@mariadb:3306/entityfy_test
           ENTITYFY_REQUIRE_MYSQL: "1"
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --no-tests=error
 
   linux-sqlserver:
     name: linux / gcc 16 / sqlserver
@@ -137,33 +166,47 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 30
+          --health-start-period=30s
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install tools and the ODBC driver
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
           apt-get install -y --no-install-recommends curl gnupg ca-certificates cmake ninja-build git unixodbc-dev
-          # The Microsoft keyring is not trusted by sqv on Debian 13; the CI
-          # container pins the official repository, so trust it explicitly.
-          echo "deb [trusted=yes] https://packages.microsoft.com/debian/13/prod trixie main" \
+          # microsoft.asc is the legacy SHA1 key; Debian 13's sqv rejects it.
+          # microsoft-2025.asc carries the SHA1-free key that signs this repo.
+          curl -sSL https://packages.microsoft.com/keys/microsoft-2025.asc |
+            gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/13/prod trixie main" \
             > /etc/apt/sources.list.d/mssql-release.list
           apt-get update
           ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 mssql-tools18
 
       - name: Create the test database
+        env:
+          SQLCMDPASSWORD: "Str0ng!Passw0rd"
         run: |
-          /opt/mssql-tools18/bin/sqlcmd -S mssql -U sa -P 'Str0ng!Passw0rd' -C -b \
+          /opt/mssql-tools18/bin/sqlcmd -S mssql -U sa -C -b \
             -Q "IF DB_ID('entityfy_test') IS NULL CREATE DATABASE entityfy_test"
 
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DENTITYFY_BUILD_TESTS=ON \
+            -DBUILD_TESTING=ON \
             -DENTITYFY_ENABLE_SQLITE=ON \
             -DENTITYFY_ENABLE_POSTGRESQL=OFF \
             -DENTITYFY_ENABLE_SQLSERVER=ON
+
+      - name: Verify the SQL Server backend is enabled
+        run: |
+          grep -q '^ENTITYFY_ENABLE_SQLITE:BOOL=ON$' build/CMakeCache.txt
+          grep -q '^ENTITYFY_ENABLE_SQLSERVER:BOOL=ON$' build/CMakeCache.txt
 
       - name: Build
         run: cmake --build build --parallel "$(nproc)"
@@ -172,4 +215,4 @@ jobs:
         env:
           ENTITYFY_SQLSERVER_URI: sqlserver://sa:Str0ng!Passw0rd@mssql:1433/entityfy_test
           ENTITYFY_REQUIRE_SQLSERVER: "1"
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --no-tests=error
