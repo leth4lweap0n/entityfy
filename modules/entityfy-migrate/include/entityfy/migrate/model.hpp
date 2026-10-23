@@ -19,6 +19,12 @@ template <typename Model>
     table output;
     output.name = descriptor.table_name;
 
+    // Declaration order, straight from the descriptor's key indices.
+    for(const auto& source: entityfy::primary_key_columns(descriptor))
+    {
+        output.primary_key.push_back(source.name);
+    }
+
     for(const auto& source: descriptor.columns)
     {
         column destination;

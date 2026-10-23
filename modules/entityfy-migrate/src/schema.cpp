@@ -52,6 +52,25 @@ const index* find_index(const table& value, std::string_view name)
     return found == value.indexes.end() ? nullptr : &*found;
 }
 
+std::vector<std::string> primary_key_columns(const table& value)
+{
+    if(!value.primary_key.empty())
+    {
+        return value.primary_key;
+    }
+
+    std::vector<std::string> output;
+    for(const auto& current: value.columns)
+    {
+        if(current.primary_key)
+        {
+            output.push_back(current.name);
+        }
+    }
+
+    return output;
+}
+
 std::string normalize_sql(std::string_view input)
 {
     std::string output;
@@ -181,6 +200,11 @@ bool same_schema(const schema& left, const schema& right)
         }
 
         if(left_table.columns.size() != right_table->columns.size())
+        {
+            return false;
+        }
+
+        if(primary_key_columns(left_table) != primary_key_columns(*right_table))
         {
             return false;
         }

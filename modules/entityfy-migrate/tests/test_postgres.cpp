@@ -1,6 +1,7 @@
 #include "harness.hpp"
 
 #include <entityfy/migrate/engine.hpp>
+#include <entityfy/migrate/json.hpp>
 #include <entityfy/migrate/provider.hpp>
 
 #include "models.hpp"
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <iostream>
 #include <sstream>
+#include <vector>
 
 namespace
 {
@@ -18,6 +20,31 @@ void cleanup(entityfy::migrate::provider& backend)
     backend.execute_sql("DROP TABLE IF EXISTS \"posts\" CASCADE");
     backend.execute_sql("DROP TABLE IF EXISTS \"users\" CASCADE");
     backend.execute_sql("DROP TABLE IF EXISTS \"entityfy_schema_migrations\" CASCADE");
+}
+
+void drop_composite_tables(entityfy::migrate::provider& backend)
+{
+    backend.execute_sql("DROP TABLE IF EXISTS \"pg_migrate_ck_lines\" CASCADE");
+    backend.execute_sql("DROP TABLE IF EXISTS \"pg_migrate_ck_notes\" CASCADE");
+}
+
+void apply_plan(entityfy::migrate::provider& backend, const entityfy::migrate::plan& value)
+{
+    backend.start();
+    try
+    {
+        for(const auto& current: value.steps)
+        {
+            backend.execute(current);
+        }
+
+        backend.finish();
+    }
+    catch(...)
+    {
+        backend.abort();
+        throw;
+    }
 }
 
 std::string history_count(entityfy::migrate::provider& backend)
@@ -189,6 +216,98 @@ entityfy_test::status test_postgres()
     backend->execute_sql("DELETE FROM \"users\" WHERE \"id\" = 1");
     const auto remaining = backend->query("SELECT COUNT(*) FROM \"posts\"");
     require(remaining.size() == 1 && remaining.front().front() == "0", "pg foreign key cascade works");
+
+    // Composite keys use a table-level PRIMARY KEY and must round-trip; a
+    // single-column key keeps its column-level form.
+    {
+        drop_composite_tables(*backend);
+
+        entityfy::migrate::schema composite;
+
+        entityfy::migrate::table lines;
+        lines.name = "pg_migrate_ck_lines";
+        lines.primary_key = {"id", "region"};
+        lines.columns.push_back(
+            entityfy::migrate::column{.name = "id", .type = "INTEGER", .not_null = true, .primary_key = true});
+        lines.columns.push_back(
+            entityfy::migrate::column{.name = "region", .type = "VARCHAR(16)", .not_null = true, .primary_key = true});
+        lines.columns.push_back(entityfy::migrate::column{.name = "quantity", .type = "INTEGER", .not_null = true});
+        composite.tables.push_back(lines);
+
+        entityfy::migrate::table notes;
+        notes.name = "pg_migrate_ck_notes";
+        notes.primary_key = {"id"};
+        notes.columns.push_back(entityfy::migrate::column{.name = "id", .type = "INTEGER", .not_null = true,
+                                            .primary_key = true, .auto_increment = true});
+        notes.columns.push_back(entityfy::migrate::column{.name = "body", .type = "TEXT", .not_null = true});
+        composite.tables.push_back(notes);
+
+        const auto creation = backend->make_plan(composite, entityfy::migrate::schema{}, {});
+        require(creation.steps.size() == 2, "pg composite creation creates both tables");
+        require(!creation.destructive, "pg composite creation is not destructive");
+        apply_plan(*backend, creation);
+
+        const auto actual = backend->introspect();
+
+        entityfy::migrate::schema subset;
+        for(const auto* name: {"pg_migrate_ck_lines", "pg_migrate_ck_notes"})
+        {
+            if(const auto* found = entityfy::migrate::find_table(actual, name))
+            {
+                subset.tables.push_back(*found);
+            }
+        }
+
+        require(subset.tables.size() == 2, "pg composite tables introspected");
+        if(!entityfy::migrate::same_schema(composite, subset))
+        {
+            std::cout << "desired:\n" << entityfy::migrate::schema_to_json(composite) << "\nactual:\n"
+                      << entityfy::migrate::schema_to_json(subset) << "\n";
+        }
+        require(entityfy::migrate::same_schema(composite, subset), "pg composite create table roundtrip");
+
+        const auto* actual_lines = entityfy::migrate::find_table(subset, "pg_migrate_ck_lines");
+        require(actual_lines != nullptr &&
+                    actual_lines->primary_key == std::vector<std::string>{"id", "region"},
+                "pg composite key order introspected");
+
+        const auto* actual_notes = entityfy::migrate::find_table(subset, "pg_migrate_ck_notes");
+        require(actual_notes != nullptr &&
+                    entityfy::migrate::primary_key_columns(*actual_notes) == std::vector<std::string>{"id"},
+                "pg single key column introspected");
+
+        const auto idempotent = backend->make_plan(composite, subset, {});
+        require(idempotent.steps.empty(), "pg second composite apply has no steps");
+        require(!idempotent.destructive, "pg idempotent composite plan is not destructive");
+
+        backend->execute_sql(
+            "INSERT INTO \"pg_migrate_ck_lines\" (\"id\", \"region\", \"quantity\") VALUES (1, 'eu', 3)");
+
+        bool duplicate_rejected = false;
+        try
+        {
+            backend->execute_sql(
+                "INSERT INTO \"pg_migrate_ck_lines\" (\"id\", \"region\", \"quantity\") VALUES (1, 'eu', 9)");
+        }
+        catch(const std::exception&)
+        {
+            duplicate_rejected = true;
+        }
+
+        require(duplicate_rejected, "pg composite key rejects duplicate rows");
+
+        backend->execute_sql(
+            "INSERT INTO \"pg_migrate_ck_lines\" (\"id\", \"region\", \"quantity\") VALUES (1, 'us', 4)");
+        const auto counted = backend->query("SELECT COUNT(*) FROM \"pg_migrate_ck_lines\"");
+        require(counted.size() == 1 && counted.front().front() == "2", "pg different regions are distinct keys");
+
+        drop_composite_tables(*backend);
+
+        const auto after_drop = backend->introspect();
+        require(entityfy::migrate::find_table(after_drop, "pg_migrate_ck_lines") == nullptr &&
+                    entityfy::migrate::find_table(after_drop, "pg_migrate_ck_notes") == nullptr,
+                "pg composite tables dropped");
+    }
 
     cleanup(*backend);
 

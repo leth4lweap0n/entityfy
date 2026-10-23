@@ -57,6 +57,11 @@ struct table
     std::vector<column>     columns;
     std::vector<index>      indexes;
     std::vector<foreign_key> foreign_keys;
+
+    // Ordered primary-key column names. An empty list means "read the
+    // per-column flags in column order", which keeps snapshots written before
+    // this field existed readable.
+    std::vector<std::string> primary_key;
 };
 
 struct schema
@@ -69,6 +74,10 @@ struct schema
 [[nodiscard]] const column* find_column(const table& value, std::string_view name);
 [[nodiscard]] column*       find_column(table& value, std::string_view name);
 [[nodiscard]] const index*  find_index(const table& value, std::string_view name);
+
+// Ordered key columns: `table::primary_key` when present, otherwise the
+// columns flagged `primary_key` in declaration order.
+[[nodiscard]] std::vector<std::string> primary_key_columns(const table& value);
 
 // For comparing SQL text: uppercased and whitespace removed.
 [[nodiscard]] std::string normalize_sql(std::string_view input);

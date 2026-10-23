@@ -619,7 +619,7 @@ std::string normalize_sqlserver_default(std::string value)
     return value;
 }
 
-std::string column_definition(const column& value, bool alter)
+std::string column_definition(const column& value, bool alter, bool composite_key)
 {
     std::string output = quote_ident(value.name) + " ";
     output += value.type.empty() ? "NVARCHAR(MAX)" : value.type;
@@ -639,7 +639,7 @@ std::string column_definition(const column& value, bool alter)
         output += " DEFAULT " + value.default_sql;
     }
 
-    if(value.primary_key && !alter)
+    if(value.primary_key && !alter && !composite_key)
     {
         output += " PRIMARY KEY";
     }
@@ -669,6 +669,9 @@ std::string column_definition(const column& value, bool alter)
 
 std::string create_table_sql(const table& value, bool if_not_exists)
 {
+    const std::vector<std::string> key_columns = primary_key_columns(value);
+    const bool composite_key = key_columns.size() >= 2;
+
     std::string output;
     if(if_not_exists)
     {
@@ -686,7 +689,23 @@ std::string create_table_sql(const table& value, bool if_not_exists)
             output += ", ";
         }
 
-        output += column_definition(value.columns[index], false);
+        output += column_definition(value.columns[index], false, composite_key);
+    }
+
+    if(composite_key)
+    {
+        output += ", PRIMARY KEY (";
+        for(std::size_t index = 0; index < key_columns.size(); ++index)
+        {
+            if(index != 0)
+            {
+                output += ", ";
+            }
+
+            output += quote_ident(key_columns[index]);
+        }
+
+        output += ")";
     }
 
     output += ")";
@@ -875,7 +894,8 @@ public:
             const auto primary_keys = connection_.query_params(
                 "SELECT k.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS t "
                 "JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k ON k.CONSTRAINT_NAME = t.CONSTRAINT_NAME "
-                "WHERE t.CONSTRAINT_TYPE = 'PRIMARY KEY' AND k.TABLE_NAME = ? AND k.TABLE_SCHEMA = SCHEMA_NAME()",
+                "WHERE t.CONSTRAINT_TYPE = 'PRIMARY KEY' AND k.TABLE_NAME = ? AND k.TABLE_SCHEMA = SCHEMA_NAME() "
+                "ORDER BY k.ORDINAL_POSITION",
                 {current.name});
 
             for(const auto& key_row: primary_keys)
@@ -884,6 +904,8 @@ public:
                 {
                     continue;
                 }
+
+                current.primary_key.push_back(key_row.front());
 
                 if(column* target = find_column(current, key_row.front()))
                 {
@@ -1056,7 +1078,7 @@ public:
                 {
                     step add;
                     add.sql = "ALTER TABLE " + quote_ident(desired_table.name) + " ADD " +
-                              column_definition(value.column_spec, true);
+                              column_definition(value.column_spec, true, false);
                     output.steps.emplace_back(std::move(add));
                     break;
                 }

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -156,6 +157,80 @@ entityfy_test::status test_sqlite()
     backend->execute_sql("DELETE FROM \"users\" WHERE \"id\" = 1");
     rows = backend->query("SELECT COUNT(*) FROM \"posts\"");
     require(rows.size() == 1 && rows.front()[0] == "0", "foreign key cascade still works");
+
+    // Composite keys use a table-level PRIMARY KEY and must round-trip; a
+    // single-column key keeps its column-level form.
+    {
+        const auto composite_path = test_workspace("entityfy_sqlite_composite_test.db");
+        std::filesystem::remove(composite_path);
+
+        auto composite_backend = entityfy::migrate::open_sqlite_provider(composite_path.string());
+
+        entityfy::migrate::schema composite;
+
+        entityfy::migrate::table lines;
+        lines.name = "key_lines";
+        lines.primary_key = {"id", "region"};
+        lines.columns.push_back(
+            entityfy::migrate::column{.name = "id", .type = "INTEGER", .not_null = true, .primary_key = true});
+        lines.columns.push_back(
+            entityfy::migrate::column{.name = "region", .type = "TEXT", .not_null = true, .primary_key = true});
+        lines.columns.push_back(entityfy::migrate::column{.name = "quantity", .type = "INTEGER", .not_null = true});
+        composite.tables.push_back(lines);
+
+        entityfy::migrate::table notes;
+        notes.name = "key_notes";
+        notes.primary_key = {"id"};
+        notes.columns.push_back(entityfy::migrate::column{.name = "id", .type = "INTEGER", .not_null = true,
+                                            .primary_key = true, .auto_increment = true});
+        notes.columns.push_back(entityfy::migrate::column{.name = "body", .type = "TEXT", .not_null = true});
+        composite.tables.push_back(notes);
+
+        const auto creation = composite_backend->make_plan(composite, entityfy::migrate::schema{}, {});
+        require(creation.steps.size() == 2, "composite creation creates both tables");
+        require(!creation.destructive, "composite creation is not destructive");
+        apply_plan(*composite_backend, creation);
+
+        auto actual = composite_backend->introspect();
+        if(!entityfy::migrate::same_schema(composite, actual))
+        {
+            std::cout << "desired:\n" << entityfy::migrate::schema_to_json(composite) << "\nactual:\n"
+                      << entityfy::migrate::schema_to_json(actual) << "\n";
+        }
+        require(entityfy::migrate::same_schema(composite, actual), "composite create table roundtrip");
+
+        const auto* actual_lines = entityfy::migrate::find_table(actual, "key_lines");
+        require(actual_lines != nullptr, "composite table introspected");
+        require(actual_lines->primary_key == std::vector<std::string>{"id", "region"},
+                "composite key order introspected");
+
+        const auto* actual_notes = entityfy::migrate::find_table(actual, "key_notes");
+        require(actual_notes != nullptr, "single key table introspected");
+        require(entityfy::migrate::primary_key_columns(*actual_notes) == std::vector<std::string>{"id"},
+                "single key column introspected");
+
+        const auto idempotent = composite_backend->make_plan(composite, actual, {});
+        require(idempotent.steps.empty(), "second composite apply has no steps");
+
+        composite_backend->execute_sql("INSERT INTO \"key_lines\" (\"id\", \"region\", \"quantity\") VALUES (1, 'eu', 3)");
+
+        bool duplicate_rejected = false;
+        try
+        {
+            composite_backend->execute_sql(
+                "INSERT INTO \"key_lines\" (\"id\", \"region\", \"quantity\") VALUES (1, 'eu', 9)");
+        }
+        catch(const std::exception&)
+        {
+            duplicate_rejected = true;
+        }
+
+        require(duplicate_rejected, "composite key rejects duplicate rows");
+
+        composite_backend->execute_sql("INSERT INTO \"key_lines\" (\"id\", \"region\", \"quantity\") VALUES (1, 'us', 4)");
+        rows = composite_backend->query("SELECT COUNT(*) FROM \"key_lines\"");
+        require(rows.size() == 1 && rows.front()[0] == "2", "different regions are distinct keys");
+    }
 
     return entityfy_test::status::passed;
 }

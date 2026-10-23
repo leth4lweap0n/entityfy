@@ -1,5 +1,6 @@
 #include "harness.hpp"
 
+#include <entityfy/migrate/json.hpp>
 #include <entityfy/migrate/scaffold.hpp>
 
 #include <cstdlib>
@@ -40,6 +41,16 @@ entityfy_test::status test_scaffold()
     numeric.columns.push_back(entityfy::migrate::column{.name = "id", .type = "INTEGER", .primary_key = true,
                                           .auto_increment = true});
     value.tables.push_back(numeric);
+
+    entityfy::migrate::table regions;
+    regions.name = "key_regions";
+    regions.primary_key = {"id", "region"};
+    regions.columns.push_back(
+        entityfy::migrate::column{.name = "id", .type = "INTEGER", .not_null = true, .primary_key = true});
+    regions.columns.push_back(
+        entityfy::migrate::column{.name = "region", .type = "TEXT", .not_null = true, .primary_key = true});
+    regions.columns.push_back(entityfy::migrate::column{.name = "title", .type = "TEXT"});
+    value.tables.push_back(regions);
 
     const auto text = entityfy::migrate::generate_models(value, "shop");
 
@@ -89,6 +100,44 @@ entityfy_test::status test_scaffold()
     require(pg_text.find("entityfy::json") != std::string::npos, "pg scaffold json");
     require(pg_text.find("std::vector<std::byte>") != std::string::npos, "pg scaffold bytea");
     require(pg_text.find("entityfy::blob") != std::string::npos, "pg scaffold blob annotation");
+
+    // A composite key must annotate every key column, in the same style as a
+    // single-column key, and the generated text must be deterministic.
+    require(text.find("struct [[= entityfy::table{\"key_regions\"}]] KeyRegion") != std::string::npos,
+            "scaffold composite struct");
+
+    entityfy::migrate::schema composite;
+    composite.tables.push_back(regions);
+    const auto composite_text = entityfy::migrate::generate_models(composite, "composite_models");
+
+    const auto count_key_annotations = [](const std::string& generated) {
+        std::size_t count = 0;
+        const std::string needle = "= entityfy::primary_key";
+        for(auto position = generated.find(needle); position != std::string::npos;
+            position = generated.find(needle, position + needle.size()))
+        {
+            ++count;
+        }
+        return count;
+    };
+
+    require(composite_text.find("struct [[= entityfy::table{\"key_regions\"}]] KeyRegion") != std::string::npos,
+            "scaffold composite struct isolated");
+    require(count_key_annotations(composite_text) == 2, "scaffold emits one key annotation per composite column");
+    require(composite_text.find("[[= entityfy::primary_key]]\n    std::int64_t id = 0;") != std::string::npos,
+            "scaffold annotates the first key column");
+    require(composite_text.find("[[= entityfy::primary_key, = entityfy::text]]\n    std::string region{};") !=
+                std::string::npos,
+            "scaffold annotates the second key column");
+    require(composite_text.find("entityfy::not_null") == std::string::npos,
+            "scaffold does not duplicate not_null on key columns");
+    require(composite_text == entityfy::migrate::generate_models(composite, "composite_models"),
+            "scaffold composite output is stable");
+    require(composite_text ==
+                entityfy::migrate::generate_models(
+                    entityfy::migrate::schema_from_json(entityfy::migrate::schema_to_json(composite)),
+                    "composite_models"),
+            "scaffold composite output survives a json roundtrip");
 
 #ifdef ENTITYFY_CORE_INCLUDE
     {

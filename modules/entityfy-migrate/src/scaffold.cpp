@@ -237,8 +237,10 @@ generated_type type_for(const column& value)
 std::string column_annotations(const table& owner, const column& value)
 {
     std::vector<std::string> annotations;
+    const std::vector<std::string> key_columns = primary_key_columns(owner);
+    const bool primary = std::ranges::find(key_columns, value.name) != key_columns.end();
 
-    if(value.primary_key)
+    if(primary)
     {
         annotations.emplace_back("= entityfy::primary_key");
     }
@@ -266,7 +268,7 @@ std::string column_annotations(const table& owner, const column& value)
         annotations.emplace_back("= entityfy::indexed");
     }
 
-    if(value.not_null && !value.primary_key)
+    if(value.not_null && !primary)
     {
         annotations.emplace_back("= entityfy::not_null");
     }

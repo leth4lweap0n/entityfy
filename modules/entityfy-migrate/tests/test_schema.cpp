@@ -3,6 +3,8 @@
 #include <entityfy/migrate/schema.hpp>
 #include <entityfy/migrate/sha256.hpp>
 
+#include <vector>
+
 entityfy_test::status test_schema()
 {
     require(entityfy::migrate::normalize_sql(" varchar(320) ") == "VARCHAR(320)", "normalize type");
@@ -37,6 +39,37 @@ entityfy_test::status test_schema()
     right = left;
     right.tables.front().columns.push_back(entityfy::migrate::column{.name = "extra", .type = "TEXT"});
     require(!entityfy::migrate::same_schema(left, right), "column drift detected");
+
+    entityfy::migrate::schema composite;
+    entityfy::migrate::table regions;
+    regions.name = "key_regions";
+    regions.primary_key = {"id", "region"};
+    regions.columns.push_back(
+        entityfy::migrate::column{.name = "id", .type = "INTEGER", .not_null = true, .primary_key = true});
+    regions.columns.push_back(
+        entityfy::migrate::column{.name = "region", .type = "TEXT", .not_null = true, .primary_key = true});
+    composite.tables.push_back(regions);
+
+    auto composite_copy = composite;
+    require(entityfy::migrate::same_schema(composite, composite_copy), "same composite schema");
+
+    composite_copy.tables.front().primary_key = {"region", "id"};
+    require(!entityfy::migrate::same_schema(composite, composite_copy), "reversed key order detected");
+
+    composite_copy = composite;
+    composite_copy.tables.front().columns.push_back(
+        entityfy::migrate::column{.name = "tenant", .type = "TEXT", .not_null = true, .primary_key = true});
+    composite_copy.tables.front().primary_key = {"id", "region", "tenant"};
+    require(!entityfy::migrate::same_schema(composite, composite_copy), "extra key column detected");
+
+    // Old snapshots carry only the per-column flags; the derived list must
+    // compare equal to the explicit one.
+    auto flagged_only = composite;
+    flagged_only.tables.front().primary_key.clear();
+    require(entityfy::migrate::primary_key_columns(flagged_only.tables.front()) ==
+                entityfy::migrate::primary_key_columns(composite.tables.front()),
+            "flag fallback matches the explicit key list");
+    require(entityfy::migrate::same_schema(composite, flagged_only), "explicit and derived key lists compare equal");
 
     return entityfy_test::status::passed;
 }

@@ -469,7 +469,7 @@ private:
     mysql_handle handle_;
 };
 
-std::string column_definition(const column& value, bool alter)
+std::string column_definition(const column& value, bool alter, bool composite_key)
 {
     std::string output = quote_ident(value.name) + " ";
     output += value.type.empty() ? "TEXT" : value.type;
@@ -479,7 +479,7 @@ std::string column_definition(const column& value, bool alter)
         output += " AUTO_INCREMENT";
     }
 
-    if(value.not_null && !value.primary_key)
+    if((value.not_null && !value.primary_key) || (composite_key && value.primary_key))
     {
         output += " NOT NULL";
     }
@@ -489,7 +489,7 @@ std::string column_definition(const column& value, bool alter)
         output += " DEFAULT " + value.default_sql;
     }
 
-    if(value.primary_key && !alter)
+    if(value.primary_key && !alter && !composite_key)
     {
         output += " PRIMARY KEY";
     }
@@ -515,6 +515,9 @@ std::string column_definition(const column& value, bool alter)
 
 std::string create_table_sql(const table& value, bool if_not_exists)
 {
+    const std::vector<std::string> key_columns = primary_key_columns(value);
+    const bool composite_key = key_columns.size() >= 2;
+
     std::string output = "CREATE TABLE ";
     if(if_not_exists)
     {
@@ -530,7 +533,23 @@ std::string create_table_sql(const table& value, bool if_not_exists)
             output += ", ";
         }
 
-        output += column_definition(value.columns[index], false);
+        output += column_definition(value.columns[index], false, composite_key);
+    }
+
+    if(composite_key)
+    {
+        output += ", PRIMARY KEY (";
+        for(std::size_t index = 0; index < key_columns.size(); ++index)
+        {
+            if(index != 0)
+            {
+                output += ", ";
+            }
+
+            output += quote_ident(key_columns[index]);
+        }
+
+        output += ")";
     }
 
     output += ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
@@ -700,6 +719,20 @@ public:
                 current.columns.emplace_back(std::move(entry));
             }
 
+            const auto primary_keys = connection_.query_params(
+                "SELECT column_name FROM information_schema.statistics "
+                "WHERE table_schema = DATABASE() AND table_name = ? AND index_name = 'PRIMARY' "
+                "ORDER BY seq_in_index",
+                {current.name});
+
+            for(const auto& key_row: primary_keys)
+            {
+                if(!key_row.empty())
+                {
+                    current.primary_key.push_back(key_row.front());
+                }
+            }
+
             const auto indexes = connection_.query_params(
                 "SELECT index_name, non_unique, GROUP_CONCAT(column_name ORDER BY seq_in_index) "
                 "FROM information_schema.statistics "
@@ -858,7 +891,7 @@ public:
                 {
                     step add;
                     add.sql = "ALTER TABLE " + quote_ident(desired_table.name) + " ADD COLUMN " +
-                              column_definition(value.column_spec, true);
+                              column_definition(value.column_spec, true, false);
                     output.steps.emplace_back(std::move(add));
                     break;
                 }
@@ -893,7 +926,7 @@ public:
                     {
                         step alter;
                         alter.sql = "ALTER TABLE " + quote_ident(desired_table.name) + " MODIFY COLUMN " +
-                                    column_definition(value.column_spec, true);
+                                    column_definition(value.column_spec, true, false);
                         output.steps.emplace_back(std::move(alter));
                     }
 

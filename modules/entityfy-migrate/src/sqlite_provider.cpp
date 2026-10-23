@@ -8,6 +8,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace entityfy::migrate
@@ -100,11 +101,11 @@ void run_sql(sqlite3* database, std::string_view sql)
     }
 }
 
-std::string column_definition(const column& value)
+std::string column_definition(const column& value, bool composite_key)
 {
     std::string output = quote_ident(value.name) + " ";
 
-    if(value.primary_key && value.auto_increment)
+    if(value.primary_key && value.auto_increment && !composite_key)
     {
         output += "INTEGER PRIMARY KEY AUTOINCREMENT";
         return output;
@@ -112,12 +113,14 @@ std::string column_definition(const column& value)
 
     output += value.type.empty() ? "TEXT" : value.type;
 
-    if(value.primary_key)
+    if(value.primary_key && !composite_key)
     {
         output += " PRIMARY KEY";
     }
-    else if(value.not_null)
+    else if(value.not_null || (composite_key && value.primary_key))
     {
+        // SQLite does not imply NOT NULL for key columns, so a composite key
+        // needs the constraint spelled out on every part.
         output += " NOT NULL";
     }
 
@@ -152,6 +155,9 @@ std::string column_definition(const column& value)
 
 std::string create_table_sql(const table& value, std::string_view table_name, bool if_not_exists)
 {
+    const std::vector<std::string> key_columns = primary_key_columns(value);
+    const bool composite_key = key_columns.size() >= 2;
+
     std::string output = "CREATE TABLE ";
     if(if_not_exists)
     {
@@ -168,7 +174,23 @@ std::string create_table_sql(const table& value, std::string_view table_name, bo
             output += ", ";
         }
 
-        output += column_definition(value.columns[index]);
+        output += column_definition(value.columns[index], composite_key);
+    }
+
+    if(composite_key)
+    {
+        output += ", PRIMARY KEY (";
+        for(std::size_t index = 0; index < key_columns.size(); ++index)
+        {
+            if(index != 0)
+            {
+                output += ", ";
+            }
+
+            output += quote_ident(key_columns[index]);
+        }
+
+        output += ")";
     }
 
     output += ")";
@@ -248,6 +270,8 @@ public:
             const bool table_has_autoincrement = table_sql.find("AUTOINCREMENT") != std::string::npos;
 
             const auto columns = run_query(database_, "PRAGMA table_xinfo(" + quote_ident(current.name) + ")");
+            std::vector<std::pair<int, std::string>> key_columns;
+
             for(const auto& column_row: columns)
             {
                 if(column_row.size() < 7 || column_row[6] != "0")
@@ -263,7 +287,23 @@ public:
                 entry.primary_key = column_row[5] != "0" && !column_row[5].empty();
                 entry.not_null = entry.not_null || entry.primary_key;
                 entry.auto_increment = entry.primary_key && table_has_autoincrement;
+
+                if(entry.primary_key)
+                {
+                    key_columns.emplace_back(std::stoi(column_row[5]), entry.name);
+                }
+
                 current.columns.emplace_back(std::move(entry));
+            }
+
+            std::ranges::sort(key_columns, [](const std::pair<int, std::string>& left,
+                                              const std::pair<int, std::string>& right) {
+                return left.first < right.first;
+            });
+
+            for(auto& [ordinal, name]: key_columns)
+            {
+                current.primary_key.push_back(std::move(name));
             }
 
             const auto indexes = run_query(database_, "PRAGMA index_list(" + quote_ident(current.name) + ")");
@@ -454,7 +494,7 @@ public:
                 {
                     step add;
                     add.sql = "ALTER TABLE " + quote_ident(desired_table.name) + " ADD COLUMN " +
-                              column_definition(value.column_spec);
+                              column_definition(value.column_spec, false);
                     add.label = value.detail;
                     output.steps.emplace_back(std::move(add));
                 }

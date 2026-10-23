@@ -76,6 +76,11 @@ json table_to_json(const table& value)
     json output;
     output["name"] = value.name;
 
+    if(!value.primary_key.empty())
+    {
+        output["primary_key"] = value.primary_key;
+    }
+
     auto columns = json::array();
     for(const auto& current: value.columns)
     {
@@ -114,6 +119,17 @@ table table_from_json(const json& value)
 {
     table output;
     output.name = value.value("name", "");
+
+    if(value.contains("primary_key") && value["primary_key"].is_array())
+    {
+        for(const auto& current: value["primary_key"])
+        {
+            if(current.is_string())
+            {
+                output.primary_key.push_back(current.get<std::string>());
+            }
+        }
+    }
 
     if(value.contains("columns"))
     {
