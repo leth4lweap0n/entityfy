@@ -19,6 +19,29 @@ struct field
     std::string_view name;
 };
 
+// Base-class members come first, then the type's own members, so a derived
+// model and its statement builders agree on the column order.
+consteval std::vector<std::meta::info> members_including_bases(std::meta::info type)
+{
+    constexpr auto context = std::meta::access_context::current();
+
+    std::vector<std::meta::info> members;
+
+    for(auto base : std::meta::bases_of(type, context))
+    {
+        const auto base_type = std::meta::type_of(base);
+        auto       inherited = members_including_bases(base_type);
+        members.insert(members.end(), inherited.begin(), inherited.end());
+    }
+
+    for(auto member : std::meta::nonstatic_data_members_of(type, context))
+    {
+        members.push_back(member);
+    }
+
+    return members;
+}
+
 template <typename Type>
 class type
 {
@@ -35,9 +58,7 @@ public:
 
     consteval static auto fields()
     {
-        constexpr auto context = std::meta::access_context::current();
-        auto           fields = std::meta::nonstatic_data_members_of(info(), context);
-        return std::define_static_array(fields);
+        return std::define_static_array(members_including_bases(info()));
     }
 
     template <typename Object, typename Function>

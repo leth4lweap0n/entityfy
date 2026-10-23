@@ -171,6 +171,31 @@ inline std::string column_definition(const column_descriptor& column, dialect ta
     return output;
 }
 
+// TPH: scopes a condition to the concrete type. Empty tag means the model is a
+// base (or not part of a hierarchy), so the condition is returned unchanged.
+template <typename Model>
+[[nodiscard]] condition scoped_condition(const model_descriptor<Model>& model, condition filter)
+{
+    if(model.type_tag.empty() || model.discriminator_column.empty())
+    {
+        return filter;
+    }
+
+    condition scoped;
+    if(filter.empty())
+    {
+        scoped.sql = quote_identifier(model.discriminator_column) + " = ?";
+    }
+    else
+    {
+        scoped.sql = "(" + filter.sql + ") AND " + quote_identifier(model.discriminator_column) + " = ?";
+    }
+
+    scoped.binds = std::move(filter.binds);
+    scoped.binds.emplace_back(model.type_tag);
+    return scoped;
+}
+
 } // namespace detail
 
 template <typename Model>
@@ -302,7 +327,14 @@ template <typename Model>
         const auto& descriptor = model.columns[descriptor_index];
         if(!descriptor.generated_on_insert)
         {
-            output.binds.emplace_back(detail::to_sql_value(value));
+            if(descriptor.flags.discriminator && !model.type_tag.empty())
+            {
+                output.binds.emplace_back(model.type_tag);
+            }
+            else
+            {
+                output.binds.emplace_back(detail::to_sql_value(value));
+            }
         }
 
         ++descriptor_index;
@@ -389,7 +421,14 @@ template <typename Model>
             const auto& descriptor = model.columns[descriptor_index];
             if(!descriptor.generated_on_insert)
             {
-                output.binds.emplace_back(detail::to_sql_value(value));
+                if(descriptor.flags.discriminator && !model.type_tag.empty())
+                {
+                    output.binds.emplace_back(model.type_tag);
+                }
+                else
+                {
+                    output.binds.emplace_back(detail::to_sql_value(value));
+                }
             }
 
             ++descriptor_index;
@@ -479,7 +518,14 @@ template <typename Model>
         const auto& descriptor = model.columns[descriptor_index];
         if(!descriptor.generated_on_insert || descriptor.flags.primary_key)
         {
-            output.binds.emplace_back(detail::to_sql_value(value));
+            if(descriptor.flags.discriminator && !model.type_tag.empty())
+            {
+                output.binds.emplace_back(model.type_tag);
+            }
+            else
+            {
+                output.binds.emplace_back(detail::to_sql_value(value));
+            }
         }
 
         ++descriptor_index;
@@ -514,6 +560,12 @@ template <typename Model>
         if(descriptor.flags.primary_key)
         {
             key_bind = detail::to_sql_value(value);
+            ++descriptor_index;
+            return;
+        }
+
+        if(descriptor.flags.discriminator)
+        {
             ++descriptor_index;
             return;
         }
@@ -565,6 +617,15 @@ template <typename Model>
     output.sql.append(detail::quote_identifier(primary_key.name));
     output.sql.append(" = ?");
     output.binds.emplace_back(std::move(*key_bind));
+
+    if(!model.type_tag.empty())
+    {
+        output.sql.append(" AND ");
+        output.sql.append(detail::quote_identifier(model.discriminator_column));
+        output.sql.append(" = ?");
+        output.binds.emplace_back(model.type_tag);
+    }
+
     return output;
 }
 
@@ -643,7 +704,8 @@ template <typename Model>
     detail::for_each_leaf_field(patch, [&](std::string_view, std::string_view, const auto& value) {
         const auto& descriptor = model.columns[descriptor_index];
 
-        if(descriptor.flags.primary_key || (descriptor.generated_on_insert && !descriptor.flags.updated_at))
+        if(descriptor.flags.primary_key || descriptor.flags.discriminator ||
+           (descriptor.generated_on_insert && !descriptor.flags.updated_at))
         {
             ++descriptor_index;
             return;
@@ -676,6 +738,8 @@ template <typename Model>
         throw std::logic_error{"entityfy ORM update_many requires at least one mutable column"};
     }
 
+    filter = detail::scoped_condition(model, std::move(filter));
+
     if(!filter.empty())
     {
         output.sql.append(" WHERE ");
@@ -707,6 +771,8 @@ template <typename Model>
     output.sql.append(" FROM ");
     output.sql.append(detail::quote_identifier(model.table_name));
 
+    filter = detail::scoped_condition(model, std::move(filter));
+
     if(!filter.empty())
     {
         output.sql.append(" WHERE ");
@@ -725,6 +791,7 @@ template <typename Model>
     detail::append_joined_identifiers(output.sql, model.columns);
     output.sql.append(" FROM ");
     output.sql.append(detail::quote_identifier(model.table_name));
+    options.filter = detail::scoped_condition(model, std::move(options.filter));
     detail::append_query_tail(output.sql, output.binds, std::move(options));
     return output;
 }
@@ -792,6 +859,8 @@ template <typename Model>
     output.sql = "DELETE FROM ";
     output.sql.append(detail::quote_identifier(model.table_name));
 
+    filter = detail::scoped_condition(model, std::move(filter));
+
     if(!filter.empty())
     {
         output.sql.append(" WHERE ");
@@ -808,6 +877,7 @@ template <typename Model>
     statement output;
     output.sql = "DELETE FROM ";
     output.sql.append(detail::quote_identifier(model.table_name));
+    options.filter = detail::scoped_condition(model, std::move(options.filter));
     detail::append_query_tail(output.sql, output.binds, std::move(options), false);
     return output;
 }
@@ -842,6 +912,8 @@ template <typename Model>
     output.sql = "SELECT COUNT(*) FROM ";
     output.sql.append(detail::quote_identifier(model.table_name));
 
+    filter = detail::scoped_condition(model, std::move(filter));
+
     if(!filter.empty())
     {
         output.sql.append(" WHERE ");
@@ -864,6 +936,8 @@ template <typename Model>
     statement output;
     output.sql = "SELECT 1 FROM ";
     output.sql.append(detail::quote_identifier(model.table_name));
+
+    filter = detail::scoped_condition(model, std::move(filter));
 
     if(!filter.empty())
     {

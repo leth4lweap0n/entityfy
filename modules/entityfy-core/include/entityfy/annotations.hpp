@@ -172,6 +172,18 @@ struct owned_t
 {
 };
 
+// TPH: tags the string column that stores the concrete type of a row.
+struct discriminator_t
+{
+};
+
+// TPH: declares the discriminator value written by a derived model, e.g.
+// `struct [[= entityfy::type_tag{"cat"}]] cat : animal { ... };`
+struct type_tag
+{
+    annotation_text value;
+};
+
 using map = column;
 using db_type = sql_type;
 using default_sql = default_value;
@@ -197,5 +209,6 @@ inline constexpr json_t           json{};
 inline constexpr text_t           text{};
 inline constexpr blob_t           blob{};
 inline constexpr owned_t          owned{};
+inline constexpr discriminator_t  discriminator{};
 
 } // namespace entityfy

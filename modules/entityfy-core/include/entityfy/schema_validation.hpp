@@ -450,6 +450,13 @@ template <typename Model>
 {
     schema_validation_result result;
 
+    // A derived TPH model only owns part of the shared table: the sibling
+    // columns belong to the other types in the hierarchy.
+    if(!model.type_tag.empty())
+    {
+        options.allow_extra_columns = true;
+    }
+
     if(!table.exists())
     {
         detail::add_schema_issue(

@@ -30,6 +30,7 @@ struct column_flags
     bool ignored = false;
     bool created_at = false;
     bool updated_at = false;
+    bool discriminator = false;
 };
 
 struct reference_descriptor
@@ -65,16 +66,38 @@ struct relation_descriptor
 namespace detail
 {
 
+consteval annotation_text inherited_table_name(std::meta::info type)
+{
+    constexpr auto context = std::meta::access_context::current();
+
+    const auto direct = meta::annotation_or<table>(type, table{});
+    if(!direct.name.empty())
+    {
+        return direct.name;
+    }
+
+    for(auto base : std::meta::bases_of(type, context))
+    {
+        const auto inherited = inherited_table_name(std::meta::type_of(base));
+        if(!inherited.empty())
+        {
+            return inherited;
+        }
+    }
+
+    return {};
+}
+
 template <typename Type>
 consteval annotation_text annotated_table_name()
 {
-    const auto annotation = meta::type_annotation_or<table, Type>(table{});
-    if(annotation.name.empty())
+    const auto inherited = inherited_table_name(meta::type_info<Type>());
+    if(!inherited.empty())
     {
-        return annotation_text{meta::type_name<Type>()};
+        return inherited;
     }
 
-    return annotation.name;
+    return annotation_text{meta::type_name<Type>()};
 }
 
 template <auto ReflectedField>
@@ -172,6 +195,7 @@ consteval column_flags annotated_column_flags()
     flags.ignored = meta::has_annotation<ignore_t, ReflectedField>();
     flags.created_at = meta::has_annotation<created_at_t, ReflectedField>();
     flags.updated_at = meta::has_annotation<updated_at_t, ReflectedField>();
+    flags.discriminator = meta::has_annotation<discriminator_t, ReflectedField>();
 
     if(flags.auto_increment)
     {
@@ -440,6 +464,21 @@ consteval std::size_t explicit_primary_key_count()
 }
 
 template <typename Type>
+consteval std::size_t discriminator_field_count()
+{
+    std::size_t count = 0;
+
+    meta::for_each_persistent_field_reflection<std::remove_cvref_t<Type>, ignore_t>([&]<auto meta_field>() {
+        if constexpr(meta::has_annotation<discriminator_t, meta_field>())
+        {
+            ++count;
+        }
+    });
+
+    return count;
+}
+
+template <typename Type>
 consteval bool has_implicit_id_key()
 {
     bool found = false;
@@ -585,6 +624,14 @@ consteval void validate_scalar_field_annotations()
         constexpr auto annotation = meta::annotation_or<check, ReflectedField>();
         static_assert(!annotation.sql.empty(), "entityfy ORM [[= entityfy::check{...}]] requires a SQL expression.");
     }
+
+    if constexpr(meta::has_annotation<discriminator_t, ReflectedField>())
+    {
+        static_assert(
+            is_string_storage_v<field_type> && !is_optional_v<field_type>,
+            "entityfy ORM [[= entityfy::discriminator]] requires a non-optional std::string column."
+        );
+    }
 }
 
 template <typename Model, auto ReflectedField>
@@ -668,6 +715,35 @@ consteval void validate_model()
 
     constexpr auto explicit_primary_keys = explicit_primary_key_count<model_type>();
     static_assert(explicit_primary_keys <= 1, "entityfy ORM models must contain at most one primary key annotation.");
+
+    constexpr auto base_count =
+        std::meta::bases_of(meta::type_info<model_type>(), std::meta::access_context::current()).size();
+    constexpr auto tag = meta::type_annotation_or<type_tag, model_type>(type_tag{});
+
+    if constexpr(base_count > 0)
+    {
+        static_assert(base_count == 1, "entityfy ORM TPH models support a single base class.");
+        static_assert(
+            !tag.value.empty(),
+            "entityfy ORM derived models must declare [[= entityfy::type_tag{\"...\"}]] so rows can be told apart."
+        );
+        static_assert(
+            meta::type_annotation_or<table, model_type>(table{}).name.empty(),
+            "entityfy ORM derived models inherit the table from their base; do not repeat [[= entityfy::table{...}]]."
+        );
+        static_assert(
+            discriminator_field_count<model_type>() == 1,
+            "entityfy ORM TPH hierarchies need exactly one [[= entityfy::discriminator]] column."
+        );
+    }
+    else
+    {
+        static_assert(tag.value.empty(), "entityfy ORM [[= entityfy::type_tag{...}]] belongs on derived models.");
+        static_assert(
+            discriminator_field_count<model_type>() <= 1,
+            "entityfy ORM models can declare at most one [[= entityfy::discriminator]] column."
+        );
+    }
 
     if constexpr(explicit_primary_keys == 0)
     {
@@ -779,10 +855,12 @@ template <typename Type>
 template <typename Type>
 struct model_descriptor
 {
-    dialect                        target{};
-    std::string                    table_name{};
-    std::vector<column_descriptor> columns{};
+    dialect                          target{};
+    std::string                      table_name{};
+    std::vector<column_descriptor>   columns{};
     std::vector<relation_descriptor> relations{};
+    std::string                      type_tag{};
+    std::string                      discriminator_column{};
 };
 
 template <typename Type>
@@ -807,11 +885,23 @@ template <typename Type>
         }
     }
 
+    std::string discriminator_column;
+    for(const auto& column : columns)
+    {
+        if(column.flags.discriminator)
+        {
+            discriminator_column = column.name;
+            break;
+        }
+    }
+
     return model_descriptor<model_type>{
         .target = target,
         .table_name = table_name<model_type>(),
         .columns = std::move(columns),
         .relations = std::move(relations),
+        .type_tag = std::string{meta::type_annotation_or<type_tag, model_type>(type_tag{}).value.view()},
+        .discriminator_column = std::move(discriminator_column),
     };
 }
 

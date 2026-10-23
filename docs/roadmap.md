@@ -52,6 +52,10 @@
 - **Owned value objects**: `[[= entityfy::owned]]` splits a struct across prefixed columns,
   through `describe_model`, DDL, INSERT/UPDATE/UPSERT, `insert_many`, the row mapper and
   migrations; nested owned values and inner annotations supported
+- **TPH inheritance**: `[[= entityfy::type_tag{...}]]` derived models share the base table and
+  inherit its columns, `migrate_tph<Base, Types...>()` creates the union table (subtype columns
+  nullable), CRUD is discriminator-scoped and `find_all_types()` loads the hierarchy as variants;
+  single base class, no tracked/eager-loaded polymorphic reads
 - **Partial UPDATE in core**: `update_partial(entity, &T::a, ...)` writes only the named columns
 - **Streaming row materialization**: `find`/`find_one`/`find_many`/`exists` materialize in place
   without an intermediate row vector (measured: no significant single-row gain, small gain for
@@ -64,10 +68,7 @@ surface that has to change, so a session can pick one up without redoing the
 analysis. Everything above this section is implemented and covered by the test
 suite.
 
-1. **TPH inheritance** — needs a discriminator column, polymorphic `find_many`/`include` and a
-   model registry that can answer "which derived type is this row". The column-flattening walkers
-   from owned types are the metadata foundation for it.
-2. **Additional providers (MySQL, SQL Server)** — one backend each plus dialect differences
+1. **Additional providers (MySQL, SQL Server)** — one backend each plus dialect differences
    (identifier quoting, generated keys, upsert syntax, batch limits) and a CI service container per
    provider. Acceptance: core, migrate and context suites run against the provider in CI.
 

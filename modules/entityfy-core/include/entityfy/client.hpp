@@ -8,6 +8,7 @@
 #include <entityfy/statement.hpp>
 #include <entityfy/table.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstddef>
 #include <functional>
@@ -16,7 +17,9 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <stdexcept>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace entityfy
@@ -152,6 +155,66 @@ public:
     void reset_schema()
     {
         this->template table<Model>().reset_schema();
+    }
+
+    // TPH: creates the shared table from the base and every derived model, so
+    // the table carries the union of their columns. Derived models cannot be
+    // migrated on their own (their table belongs to the hierarchy).
+    template <typename Base, typename... Types>
+    void migrate_tph()
+    {
+        auto model = describe_model<Base>(backend_->target_dialect());
+
+        const auto base_columns = model.columns;
+        const auto in_base = [&](std::string_view name) {
+            return std::ranges::any_of(base_columns, [&](const column_descriptor& column) {
+                return column.name == name;
+            });
+        };
+
+        const auto merge = [&](const auto& other) {
+            if(other.table_name != model.table_name)
+            {
+                throw std::logic_error{"entityfy::migrate_tph requires every type to share the base table"};
+            }
+
+            for(const auto& column : other.columns)
+            {
+                const auto existing = std::ranges::find_if(model.columns, [&](const column_descriptor& candidate) {
+                    return candidate.name == column.name;
+                });
+
+                if(existing == model.columns.end())
+                {
+                    model.columns.push_back(column);
+                }
+                else if(existing->sql_type != column.sql_type)
+                {
+                    throw std::logic_error{
+                        "entityfy::migrate_tph found conflicting column definitions for `" + column.name + "`"
+                    };
+                }
+            }
+        };
+
+        (merge(describe_model<Types>(backend_->target_dialect())), ...);
+
+        // A row only carries the columns of its own type, so the columns that
+        // belong to a single subtype have to be nullable in the shared table.
+        for(auto& column : model.columns)
+        {
+            if(!in_base(column.name) && !column.flags.primary_key)
+            {
+                column.flags.not_null = false;
+                column.flags.nullable = true;
+            }
+        }
+
+        backend_->execute(create_table(model));
+        for(const auto& index : create_index_statements(model))
+        {
+            backend_->execute(index);
+        }
     }
 
     template <typename Model>
@@ -460,5 +523,42 @@ private:
     std::unique_ptr<detail::backend> backend_;
     std::size_t                      transaction_depth_ = 0;
 };
+
+namespace detail
+{
+
+template <typename Base, typename Type, typename... Types>
+void append_type_rows(client& db, std::vector<std::variant<Types...>>& rows)
+{
+    static_assert(std::is_base_of_v<Base, Type>, "entityfy ORM TPH reads require types derived from the base");
+
+    if(entityfy::table_name<Type>() != entityfy::table_name<Base>())
+    {
+        throw std::logic_error{
+            "entityfy ORM TPH reads require every type to share the base table; check [[= entityfy::table{...}]]"
+        };
+    }
+
+    for(auto& row : db.template find_many<Type>())
+    {
+        rows.emplace_back(std::move(row));
+    }
+}
+
+} // namespace detail
+
+// TPH: reads every concrete type of a hierarchy and returns the instances as
+// variants. Each type is one query scoped by its discriminator, in the order the
+// types are listed. The rows are plain values, not tracked entities, and eager
+// loading is not part of this path.
+template <typename Base, typename... Types>
+[[nodiscard]] std::vector<std::variant<Types...>> find_all_types(client& db)
+{
+    static_assert(sizeof...(Types) > 0, "entityfy::find_all_types needs at least one concrete type");
+
+    std::vector<std::variant<Types...>> rows;
+    (detail::append_type_rows<Base, Types>(db, rows), ...);
+    return rows;
+}
 
 } // namespace entityfy

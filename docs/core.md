@@ -95,6 +95,51 @@ struct [[= entityfy::table{"people"}]] person
 - A member pointer such as `&person::home` does not name a single column, so `where()` /
   `order_by()` reject it; use the flattened SQL column name as a string instead.
 
+### Table-per-hierarchy inheritance (TPH)
+
+Table-per-hierarchy inheritance (TPH) keeps a whole C++ class hierarchy in one table:
+
+```cpp
+struct [[= entityfy::table{"animals"}]] animal
+{
+    [[= entityfy::id, = entityfy::auto_increment]] std::int64_t id = 0;
+    [[= entityfy::not_null, = entityfy::varchar{16}, = entityfy::discriminator]]
+    std::string kind;
+    [[= entityfy::varchar{60}]] std::string name;
+};
+
+struct [[= entityfy::type_tag{"cat"}]] cat : animal
+{
+    int lives = 9;
+};
+
+struct [[= entityfy::type_tag{"dog"}]] dog : animal
+{
+    bool good_boy = true;
+};
+
+db.migrate_tph<animal, cat, dog>();      // one table with the union of the columns
+```
+
+- Base members come first in the column order, then the derived members; the base's
+  `entityfy::table{...}` annotation names the table for the whole hierarchy.
+- Exactly one base class and exactly one `[[= entityfy::discriminator]]` string column per
+  hierarchy. A derived struct must declare `[[= entityfy::type_tag{"..."}]]` and must not repeat
+  `[[= entityfy::table{...}]]`.
+- `migrate_tph<Base, Types...>()` creates the table with the union of the columns. Columns that only
+  belong to a subtype are created nullable, because a row only carries its own type's columns.
+  `migrate<Derived>()` on its own is not part of this path.
+- `insert`, `insert_many` and `upsert` on a derived model write the type tag, not the member value;
+  `update` never rewrites the discriminator. Base inserts keep the member value, which lets a base
+  type store additional tags.
+- `select`, `count`, `exists`, `delete_many`, `update` and `update_many` on a derived model are
+  scoped with `discriminator = '<tag>'`, so a derived call never sees or changes sibling rows.
+- `find_all_types<Base, Types...>(db)` loads the whole hierarchy as
+  `std::vector<std::variant<Types...>>`. It runs one query per type, returns plain values (not
+  tracked entities) and does not eager-load relations.
+- Reading a base model returns the base columns only; use the concrete type to read its own
+  columns.
+
 ## Connection and schema
 
 ```cpp
