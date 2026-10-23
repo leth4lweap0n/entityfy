@@ -246,7 +246,8 @@ template <typename T>
 
 // Reads the value of a persisted column from an in memory entity. The column
 // is resolved by name through reflection, so the caller never has to pass a
-// member pointer.
+// member pointer. A nullable column that is null reads as a present NULL
+// value, which is distinct from a column that does not exist on the model.
 template <typename Model>
 [[nodiscard]] std::optional<sql_value> read_column(const Model& entity, std::string_view column)
 {
@@ -255,7 +256,8 @@ template <typename Model>
     meta::for_each_persistent_field_reflection<Model, ignore_t>([&]<auto meta_field>() {
         using field_type = meta::field_type_t<Model, meta_field>;
 
-        if constexpr(std::integral<field_type> || std::same_as<field_type, std::string>)
+        if constexpr(std::integral<field_type> || std::same_as<field_type, std::string> ||
+                     detail::is_optional_v<field_type>)
         {
             if(result.has_value())
             {
@@ -342,6 +344,24 @@ template <typename T>
 consteval std::size_t lazy_member_count()
 {
     return lazy_members<T>().size();
+}
+
+// Position of a lazy member in lazy_members<T>(), so the relation a member was
+// validated with can be cached and addressed without a second reflection pass.
+template <typename T, auto Member>
+consteval std::size_t lazy_member_index()
+{
+    constexpr auto members = lazy_members<T>();
+
+    for(std::size_t index = 0; index < members.size(); ++index)
+    {
+        if(members[index] == Member)
+        {
+            return index;
+        }
+    }
+
+    return 0;
 }
 
 // Name used in diagnostics: a broken lazy member must name itself, because the
@@ -435,6 +455,43 @@ template <typename Owner, auto Member, typename Element>
     return output;
 }
 
+// Loader bound into a reference handle: resolves the parent by the owner's
+// foreign key through the context's identity map, so the reference is the same
+// tracked entity find() would return and repeated access never duplicates rows.
+template <typename Owner, auto Member, typename Element>
+[[nodiscard]] Element* load_parent(db_context* owner, std::span<const sql_value> keys)
+{
+    if(owner == nullptr)
+    {
+        throw std::logic_error{"entityfy: lazy member `" + std::string{lazy_member_name<Member>()} +
+                               "` cannot load without a context"};
+    }
+
+    if(keys.size() != 1)
+    {
+        throw std::logic_error{"entityfy: lazy member `" + std::string{lazy_member_name<Member>()} +
+                               "` expects exactly one foreign key part"};
+    }
+
+    // A missing or null foreign key has no parent; querying for NULL would
+    // always match nothing, so the round trip is skipped entirely.
+    if(std::holds_alternative<std::monostate>(keys.front()))
+    {
+        return nullptr;
+    }
+
+    const auto parent_model = entityfy::describe_model<Element>(owner->database().target_dialect());
+
+    if(entityfy::primary_key_columns(parent_model).size() != 1)
+    {
+        throw std::logic_error{"entityfy: composite foreign keys are not supported yet (P1.5): lazy member `" +
+                               std::string{lazy_member_name<Member>()} + "` on " + parent_model.table_name};
+    }
+
+    auto parent_set = owner->template set<Element>();
+    return parent_set.find(row_key{std::vector<sql_value>{keys.front()}});
+}
+
 template <typename T>
 struct set_state final : saveable
 {
@@ -487,6 +544,10 @@ struct set_state final : saveable
     // Set once the relations of the lazy members have been resolved: the lookup
     // only depends on reflection, so it is not repeated per bound entity.
     bool                                       lazy_relations_validated_ = false;
+    // Foreign key column of every reference-shaped lazy member, in
+    // lazy_members<T>() order. Filled by validate_lazy_relations(); collection
+    // entries stay empty because their loader filters on the owner key.
+    std::vector<std::string>                   lazy_reference_columns_;
     std::string                                table_name_;
     std::vector<std::string>                   referenced_tables_;
 
@@ -603,6 +664,12 @@ struct set_state final : saveable
             item.original = iterator->original;
             item.state = iterator->state;
             item.marked_modified = iterator->marked;
+
+            // Rows a handle cached inside the rolled back transaction may no
+            // longer exist, and the restored foreign key may name a different
+            // parent than the cached payload, so the handles start over from
+            // the restored values.
+            rebind_after_write(item.entity);
         }
 
         undo_.clear();
@@ -686,8 +753,9 @@ struct set_state final : saveable
         return item.entity;
     }
 
-    // Binds every collection-shaped lazy member of the entity to this context
-    // and the entity's key. A payload a handle already holds is kept: rows
+    // Binds every lazy member of the entity to this context. Collection
+    // handles follow the owner key, reference handles follow the foreign key
+    // the relation declares. A payload a handle already holds is kept: rows
     // supplied by an include stay authoritative. A model without lazy members
     // compiles to nothing.
     void bind_lazy_members(T& entity)
@@ -707,15 +775,43 @@ struct set_state final : saveable
                 {
                     bind_lazy_collection<member>(entity);
                 }
+                else
+                {
+                    bind_lazy_reference<member>(entity);
+                }
             }
         }
     }
 
-    // Resolves the relation of every collection member once per set. The lookup
-    // only depends on reflection, so a bulk load does not pay for it per entity;
-    // a missing relation or a composite key stays an explicit error.
+    // Drops every cached lazy payload of the entity while keeping the
+    // bindings, so the next access loads again. A write that can change a
+    // foreign key or remove rows must not leave the old parent cached.
+    void reset_lazy_members(T& entity)
+    {
+        if constexpr(lazy_member_count<T>() != 0)
+        {
+            template for (constexpr auto member: lazy_members<T>())
+            {
+                entity.[:member:].reset();
+            }
+        }
+    }
+
+    // A successful write or a rollback can change a foreign key, so the
+    // touched entity's handles start over from its current values.
+    void rebind_after_write(T& entity)
+    {
+        reset_lazy_members(entity);
+        bind_lazy_members(entity);
+    }
+
+    // Resolves the relation of every lazy member once per set. The lookup only
+    // depends on reflection, so a bulk load does not pay for it per entity; a
+    // missing relation or a composite key stays an explicit error.
     void validate_lazy_relations()
     {
+        lazy_reference_columns_.assign(lazy_member_count<T>(), std::string{});
+
         template for (constexpr auto member: lazy_members<T>())
         {
             using field_type = meta::field_type_t<T, member>;
@@ -737,9 +833,58 @@ struct set_state final : saveable
                 (void)lazy_child_relation<element_type>(
                     child_model, model_.table_name, lazy_member_name<member>(), owner_keys.front().name);
             }
+            else
+            {
+                using element_type = typename field_type::element_type;
+
+                const auto parent_model = entityfy::describe_model<element_type>(owner_->database().target_dialect());
+                const auto parent_keys = entityfy::primary_key_columns(parent_model);
+
+                if(parent_keys.size() != 1)
+                {
+                    throw std::logic_error{"entityfy: composite foreign keys are not supported yet (P1.5): lazy "
+                                           "member `" +
+                                           std::string{lazy_member_name<member>()} + "` on " + model_.table_name};
+                }
+
+                const auto& relation = lazy_child_relation<T>(
+                    model_, parent_model.table_name, lazy_member_name<member>(), parent_keys.front().name);
+
+                lazy_reference_columns_[lazy_member_index<T, member>()] = relation.local_column;
+            }
         }
 
         lazy_relations_validated_ = true;
+    }
+
+    // Binds one reference handle: the context link, its generation, the
+    // owner's foreign key value, and the loader that resolves the parent on
+    // first access.
+    template <auto Member>
+    void bind_lazy_reference(T& entity)
+    {
+        using field_type = meta::field_type_t<T, Member>;
+        using element_type = typename field_type::element_type;
+
+        const std::string& foreign_key = lazy_reference_columns_[lazy_member_index<T, Member>()];
+
+        std::vector<sql_value> keys;
+        if(const auto value = entityfy::detail::read_column(entity, foreign_key))
+        {
+            keys.push_back(*value);
+        }
+        else
+        {
+            // An ignored or otherwise unreadable foreign key behaves like a
+            // null one: the loader must not query with a value the entity does
+            // not have.
+            keys.push_back(sql_value{std::monostate{}});
+        }
+
+        entity.[:Member:].bind(owner_->lazy_link(),
+                               owner_->lazy_generation(),
+                               std::move(keys),
+                               &load_parent<T, Member, element_type>);
     }
 
     // Binds one collection handle: the context link, its generation, the owner
@@ -1284,6 +1429,8 @@ save_result set_state<T>::save(db_context& owner)
                 {
                     identity[key] = index;
                 }
+
+                rebind_after_write(item.entity);
             }
         }
     }
@@ -1394,6 +1541,7 @@ save_result set_state<T>::save(db_context& owner)
                 identity[key] = index;
             }
 
+            rebind_after_write(item.entity);
             continue;
         }
 
@@ -1520,6 +1668,10 @@ save_result set_state<T>::save(db_context& owner)
 
         item.original = item.entity;
         item.marked_modified = false;
+
+        // The UPDATE may have written a new foreign key, so the handles start
+        // over from the values that were just persisted.
+        rebind_after_write(item.entity);
     }
 
     const bool has_removed = needs_compaction_;

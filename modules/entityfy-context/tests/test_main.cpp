@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -209,7 +210,11 @@ struct [[= entityfy::table{"ck_slugs"}]] ck_slug
 
 // Lazy loading: the collection is a plain [[= entityfy::ignore]] handle. The
 // context binds it to the owner's key and filters on the foreign key declared
-// by the "references" annotation, so no member pointer is needed.
+// by the "references" annotation, so no member pointer is needed. A reference
+// handle is the same idea for the parent side: it loads the one row the
+// foreign key points at.
+struct lz_user;
+
 struct [[= entityfy::table{"lz_posts"}]] lz_post
 {
     [[= entityfy::primary_key, = entityfy::auto_increment]]
@@ -220,6 +225,9 @@ struct [[= entityfy::table{"lz_posts"}]] lz_post
 
     [[= entityfy::not_null, = entityfy::varchar{200}]]
     std::string title;
+
+    [[= entityfy::ignore]]
+    entityfy::lazy<lz_user> author;
 };
 
 struct [[= entityfy::table{"lz_users"}]] lz_user
@@ -235,6 +243,24 @@ struct [[= entityfy::table{"lz_users"}]] lz_user
 };
 
 static_assert(entityfy::detail::is_ignored_member(^^lz_user::posts), "posts must be ignored");
+static_assert(entityfy::detail::is_ignored_member(^^lz_post::author), "author must be ignored");
+
+// A nullable foreign key has no parent to load, so its handle caches nullptr
+// without issuing a query.
+struct [[= entityfy::table{"lz_notes"}]] lz_note
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::indexed, = entityfy::references{"lz_users"}]]
+    std::optional<std::int64_t> user_id;
+
+    [[= entityfy::not_null, = entityfy::varchar{200}]]
+    std::string title;
+
+    [[= entityfy::ignore]]
+    entityfy::lazy<lz_user> author;
+};
 
 // Composite owner keys cannot be expressed by a one-column foreign key yet
 // (P1.5), so binding them is an explicit error instead of a wrong key.
@@ -257,6 +283,20 @@ struct [[= entityfy::table{"lz_pair_rows"}]] lz_pair_row
 
     [[= entityfy::ignore]]
     entityfy::lazy<std::vector<lz_pair_post>> children;
+};
+
+// The reference direction of the same limitation: the parent's key has two
+// columns, so a one-column foreign key cannot name it (P1.5).
+struct [[= entityfy::table{"lz_pair_children"}]] lz_pair_child
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::indexed, = entityfy::not_null, = entityfy::references{"lz_pair_rows"}]]
+    std::int64_t pair_id = 0;
+
+    [[= entityfy::ignore]]
+    entityfy::lazy<lz_pair_row> pair;
 };
 
 // EF Core style context: the sets are declared once, the framework derives
@@ -2312,24 +2352,36 @@ status run_lazy_loading_checks()
     std::filesystem::remove(path);
 
     std::int64_t ada_id = 0;
+    std::int64_t grace_id = 0;
+    std::int64_t linus_id = 0;
+    std::int64_t ada_post_id = 0;
+    std::int64_t grace_post_id = 0;
     {
         // Seed rows and close the context, so the checks below bind the handles
         // through attach() (a materialized row) instead of add().
         entityfy::db_context seed{"sqlite://rc_lazy.db"};
         seed.migrate<lz_user>();
         seed.migrate<lz_post>();
+        seed.migrate<lz_note>();
 
         auto users = seed.set<lz_user>();
         auto posts = seed.set<lz_post>();
 
         auto& ada = users.add(lz_user{.name = "Ada"});
+        auto& grace = users.add(lz_user{.name = "Grace"});
+        auto& linus = users.add(lz_user{.name = "Linus"});
         seed.save_changes();
         require(ada.id != 0, "seed owner got a generated id");
         ada_id = ada.id;
+        grace_id = grace.id;
+        linus_id = linus.id;
 
-        posts.add(lz_post{.user_id = ada.id, .title = "first"});
+        auto& first = posts.add(lz_post{.user_id = ada.id, .title = "first"});
         posts.add(lz_post{.user_id = ada.id, .title = "second"});
-        require(seed.save_changes().inserted == 2, "seed children inserted");
+        auto& grace_post = posts.add(lz_post{.user_id = grace.id, .title = "grace"});
+        require(seed.save_changes().inserted == 3, "seed children inserted");
+        ada_post_id = first.id;
+        grace_post_id = grace_post.id;
     }
 
     entityfy::db_context ctx{"sqlite://rc_lazy.db"};
@@ -2339,6 +2391,7 @@ status run_lazy_loading_checks()
 
     auto users = ctx.set<lz_user>();
     auto posts = ctx.set<lz_post>();
+    auto notes = ctx.set<lz_note>();
 
     statements.clear();
     auto* ada = users.find(ada_id);
@@ -2384,6 +2437,126 @@ status run_lazy_loading_checks()
     require_not(ada->posts.is_loaded(), "refresh() drops the cached payload");
     const auto& reloaded = ada->posts.get();
     require(reloaded.size() == 2, "the rebound handle loads the children again");
+
+    // Reference handles resolve the row the foreign key points at. The parent
+    // is attached through find(), so a reference and find() agree on identity.
+    auto* ada_post = posts.find(ada_post_id);
+    require(ada_post != nullptr, "the post is found");
+    require(ada_post->author.is_attached(), "find() binds the lazy reference");
+    require_not(ada_post->author.is_loaded(), "find() does not load the lazy reference");
+    require(ada_post->author.keys().size() == 1 &&
+                as_integer(ada_post->author.keys().front()) == ada_post->user_id,
+            "the reference is bound to the foreign key");
+
+    statements.clear();
+    auto* ada_parent = ada_post->author.get();
+    require(ada_parent == ada, "the reference resolves the tracked parent");
+    require(ada_parent->name == "Ada", "the reference names the right parent");
+    require(statements.empty(), "a tracked parent is served from the identity map");
+
+    // Changing the foreign key must not keep the old parent cached: the save
+    // resets and rebinds the handle to the value it wrote.
+    ada_post->user_id = linus_id;
+    require(ctx.save_changes().updated == 1, "the foreign key change is saved");
+    require_not(ada_post->author.is_loaded(), "save() drops the stale reference cache");
+    require(ada_post->author.keys().size() == 1 &&
+                as_integer(ada_post->author.keys().front()) == linus_id,
+            "save() rebinds the reference to the new foreign key");
+
+    statements.clear();
+    auto* linus = ada_post->author.get();
+    require(linus != nullptr && linus->name == "Linus", "the rebound reference loads the new parent");
+    require(statements.size() == 1, "the new parent is loaded with one statement");
+    require(statements.front().rfind("SELECT", 0) == 0, "the reference load is a select");
+    require(ada_post->author.is_loaded(), "the new parent is cached");
+    require(users.find(ada_post->user_id) == linus, "both paths return the same tracked parent");
+
+    statements.clear();
+    require(ada_post->author.get() == linus, "the second reference access returns the cache");
+    require(statements.empty(), "the second reference access issues no SQL");
+
+    // First access to an untracked parent is exactly one SELECT, and the
+    // second access never reaches the database.
+    auto* grace_post = posts.find(grace_post_id);
+    require(grace_post != nullptr, "the second post is found");
+    require(grace_post->author.is_attached(), "attach() binds the lazy reference");
+    require_not(grace_post->author.is_loaded(), "attach() does not load the lazy reference");
+
+    statements.clear();
+    auto* grace = grace_post->author.get();
+    require(grace != nullptr && grace->name == "Grace", "the reference loads the parent");
+    require(statements.size() == 1, "first reference access issues exactly one statement");
+    require(statements.front().rfind("SELECT", 0) == 0, "the reference load is a select");
+    require(statements.front().find("\"id\" = ?") != std::string::npos,
+            "the reference looks the parent up by its key");
+    require(grace_post->author.is_loaded(), "the loaded parent is cached");
+    require(users.find(grace_post->user_id) == grace, "the reference and find() return the same pointer");
+
+    statements.clear();
+    require(grace_post->author.get() == grace, "the second reference access returns the cache");
+    require(statements.empty(), "the second reference access issues no SQL");
+
+    // A nullable foreign key has no parent: get() is nullptr, the handle counts
+    // as loaded, dereferencing reports not_found, and no SQL is issued.
+    auto& note = notes.add(lz_note{.user_id = std::nullopt, .title = "orphan"});
+    require(ctx.save_changes().inserted == 1, "the null foreign key note is saved");
+    require(note.id != 0, "the note got a generated id");
+
+    statements.clear();
+    require(note.author.get() == nullptr, "a null foreign key has no parent");
+    require(note.author.is_loaded(), "a missing parent counts as loaded");
+    require(statements.empty(), "a null foreign key issues no SQL");
+
+    bool not_found = false;
+    try
+    {
+        (void)*note.author;
+    }
+    catch(const entityfy::lazy_error& error)
+    {
+        not_found = error.reason() == entityfy::lazy_error_reason::not_found;
+    }
+    require(not_found, "dereferencing a missing parent reports lazy_error::not_found");
+    require(statements.empty(), "operator* does not fall back to SQL");
+
+    // A save that fails rolls the entity back; the handle must drop the parent
+    // cached inside the failed transaction and follow the restored key.
+    grace_post->user_id = 999999; // no such user: the UPDATE violates the foreign key
+    bool constraint_failed = false;
+    try
+    {
+        ctx.save_changes();
+    }
+    catch(const std::exception&)
+    {
+        constraint_failed = true;
+    }
+
+    require(constraint_failed, "a dangling foreign key fails the save");
+    // save_changes() rollback restores the pre-save image, which still holds the
+    // user's pending edit; the handle must follow that restored value instead
+    // of the parent it cached before the failed transaction.
+    require(grace_post->user_id == 999999, "rollback keeps the pending foreign key edit");
+    require_not(grace_post->author.is_loaded(), "rollback_save drops the cached parent");
+    require(grace_post->author.keys().size() == 1 &&
+                as_integer(grace_post->author.keys().front()) == 999999,
+            "rollback_save rebinds the handle to the restored foreign key");
+
+    statements.clear();
+    require(grace_post->author.get() == nullptr, "the rolled back reference does not return the cached parent");
+    require(statements.size() == 1, "the rebound reference queries the restored key");
+    require(grace_post->author.is_loaded(), "the missing parent is cached");
+    require(grace_post->author.get() == nullptr, "the stale parent never comes back");
+    require(statements.size() == 1, "the second access issues no SQL");
+
+    // Restore the row and the handle for the rest of the scenario. refresh()
+    // swaps in the stored row, which rebinds the reference to its foreign key.
+    posts.refresh(*grace_post);
+    require(grace_post->user_id == grace_id, "refresh() restores the stored foreign key");
+    require(grace_post->author.keys().size() == 1 &&
+                as_integer(grace_post->author.keys().front()) == grace_id,
+            "refresh() rebinds the reference to the stored foreign key");
+    require_not(grace_post->author.is_loaded(), "refresh() drops the cached payload");
 
     // No-tracking rows are plain values: their handles are never bound.
     const auto untracked = users.as_no_tracking().where(entityfy::where(&lz_user::id) == ada_id).to_list();
@@ -2477,6 +2650,20 @@ status run_lazy_loading_checks()
         composite = std::string{error.what()}.find("P1.5") != std::string::npos;
     }
     require(composite, "a composite owner key is an explicit logic_error");
+
+    // The reference direction of the same limitation: a parent with a two
+    // column key cannot be named by the one-column foreign key (P1.5).
+    auto pair_children = ctx.set<lz_pair_child>();
+    bool composite_parent = false;
+    try
+    {
+        pair_children.add(lz_pair_child{.pair_id = 1});
+    }
+    catch(const std::logic_error& error)
+    {
+        composite_parent = std::string{error.what()}.find("P1.5") != std::string::npos;
+    }
+    require(composite_parent, "a composite parent key is an explicit logic_error");
 
     return status::passed;
 }
