@@ -99,12 +99,22 @@
 
 ## Next
 
-The focus is SQLite and PostgreSQL. The other backends stay buildable and tested but get no new
-features for now (see [Deferred](#deferred-other-providers)). Everything above this section is
-implemented and covered by the test suite.
+EF Core parity on SQLite and PostgreSQL. The slice plan, contracts and acceptance criteria live in
+[parity-plan.md](parity-plan.md); each slice is committed only when its tests and the full suite
+are green.
 
-No open SQLite/PostgreSQL items. The next round picks from [Deferred](#deferred-other-providers)
-if the focus changes.
+1. **P0 composite and non-integral keys** — `entityfy::row_key`, descriptor key lists, table-level
+   primary keys, key-based statements, context identity/concurrency and migration diff. In
+   progress.
+2. **P1 lazy loading** — `entityfy::lazy<T>` handles bound to tracked entities, typed errors for
+   detached/no-tracking entities, include-cache integration, composite foreign keys.
+3. **P2 async I/O** — `entityfy::task<T>` and executors, native nonblocking PostgreSQL through
+   libpq, an honest SQLite thread-offload facade, async client/table/context/pool surfaces.
+4. **P3 ODBC** — decision only: SQLite and PostgreSQL keep their native drivers; the frozen SQL
+   Server backend's gaps stay documented in the parity plan.
+
+The other backends stay buildable and tested but get no new features for now (see
+[Deferred](#deferred-other-providers)).
 
 ## Deferred: other providers
 
