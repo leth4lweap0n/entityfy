@@ -187,6 +187,8 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
   keys, split according to the batch parameter limit.
 - **Value converter**: with `entityfy::value_converter<T>` your own type is written to and read
   from a single column (JSON, composite values, enum-like fields).
+- **Partial UPDATE in core**: `db.update_partial(entity, &T::a, &T::b)` writes only the named
+  columns; `update(entity)` still rewrites the row (core keeps no snapshot).
 - **SQL logger**: `client::set_logger(...)` reports every statement before it executes.
 
 ## entityfy-context
@@ -292,8 +294,8 @@ the ratios are more stable.
 ctest --preset release
 ```
 
-39 CTest entries: 37 core Catch2 test executable entries (139 assertions) and the migrate/context
-test binaries — which contain 9 and 17 scenarios respectively.
+41 CTest entries: 39 core Catch2 test cases (149 assertions) and the migrate/context test
+binaries - which contain 9 and 17 scenarios respectively.
 PostgreSQL tests run when `ENTITYFY_PG_URI` is provided; with `ENTITYFY_REQUIRE_PG=1` a skipped
 test counts as a failure. Tests write to a temporary workspace and do not pollute the source tree.
 

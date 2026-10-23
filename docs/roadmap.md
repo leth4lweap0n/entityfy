@@ -48,20 +48,19 @@
 - A single SQLite dependency (sl3); the duplicated `third_party/sqlite` copy was removed
 - Unified test registration under CTest (core + migration + context)
 - `entityfy_bench`: SQLite comparative benchmark + PostgreSQL mode (libpq baseline)
+- **Partial UPDATE in core**: `update_partial(entity, &T::a, ...)` writes only the named columns
 - **Streaming row materialization**: `find`/`find_one`/`find_many`/`exists` materialize in place
   without an intermediate row vector (measured: no significant single-row gain, small gain for
   many-row reads - see `docs/benchmarks.md`)
 
 ## Planned
 
-1. **Dirty-column update** — because core keeps no snapshot, `table_client::update` writes all
-   columns; partial UPDATE exists only in the context layer.
-2. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
+1. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
    in practice covered by `entityfy::value_converter<T>` (a composite type is written to a single
    column), but owned types **split across** columns (as in EF, e.g. `address_city`) and a TPH
    discriminator do not exist yet.
-3. **Additional providers** — MySQL / SQL Server.
-4. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
+2. **Additional providers** — MySQL / SQL Server.
+3. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
    **from the live schema** (the DB → model direction exists); the reverse direction (model → DB)
    is covered by the `snapshot` + `apply` commands, with no separate generation command.
 

@@ -156,6 +156,14 @@ public:
         return backend_->execute(update_statement(model, model_)).rows_affected;
     }
 
+    // Writes only the given columns. Use it when the caller already knows what
+    // changed and does not want to rewrite (or compare) the whole row.
+    template <typename... Members>
+    [[nodiscard]] std::uint64_t update_partial(const Model& model, Members Model::*... members)
+    {
+        return backend_->execute(update_partial_statement(model, model_, members...)).rows_affected;
+    }
+
     [[nodiscard]] std::vector<Model> find_many(condition filter = {})
     {
         return collect(select_statement(model_, std::move(filter)));

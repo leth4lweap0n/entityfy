@@ -226,6 +226,12 @@ public:
         return this->template table<Model>().update(model);
     }
 
+    template <typename Model, typename... Members>
+    [[nodiscard]] std::uint64_t update_partial(const Model& model, Members Model::*... members)
+    {
+        return this->template table<Model>().update_partial(model, members...);
+    }
+
     template <typename Model>
     [[nodiscard]] std::vector<Model> find_many(condition filter = {})
     {

@@ -6,6 +6,16 @@ Reads stream: `backend::query_each` hands one reused row buffer to the caller, s
 `find_one`, `find_many` and `exists` materialize straight into the model instead of building a
 `vector<vector<sql_value>>` first. `exists` stops at the first row.
 
+Writes: `table.update(entity)` writes every column, because the core keeps no snapshot.
+`table.update_partial(entity, &T::name, ...)` writes exactly the columns the caller names - the
+statement carries only those binds and no `updated_at` guesswork:
+
+```cpp
+auto& stored = ...;
+stored.name = "Ada Lovelace";
+db.update_partial(stored, &user::name);   // the rest of the row is left as it is
+```
+
 ## Model definition
 
 An entity is a plain C++ struct; which column it maps to in the table is specified with an

@@ -568,6 +568,67 @@ template <typename Model>
     return output;
 }
 
+// Partial UPDATE: writes exactly the columns named by the member pointers, so
+// a caller that knows what changed does not have to rewrite every column (the
+// core keeps no snapshot and update_statement() writes everything).
+template <typename Model, typename... Members>
+[[nodiscard]] statement update_partial_statement(const Model& object,
+                                                 const model_descriptor<Model>& model,
+                                                 Members Model::*... members)
+{
+    statement output;
+    output.sql = "UPDATE ";
+    output.sql.append(detail::quote_identifier(model.table_name));
+    output.sql.append(" SET ");
+
+    bool first = true;
+
+    const auto append_member = [&](auto member) {
+        if(!first)
+        {
+            output.sql.append(", ");
+        }
+
+        first = false;
+        output.sql.append(detail::quote_identifier(entityfy::column_name(member)));
+        output.sql.append(" = ?");
+        output.binds.emplace_back(detail::to_sql_value(object.*member));
+    };
+
+    (append_member(members), ...);
+
+    if(first)
+    {
+        throw std::logic_error{"entityfy ORM partial update requires at least one column"};
+    }
+
+    const auto primary_key = primary_key_column(model);
+    bool       bound = false;
+
+    meta::for_each_persistent_field_reflection<Model, ignore_t>([&]<auto meta_field>() {
+        if(bound)
+        {
+            return;
+        }
+
+        if(std::string_view{detail::annotated_column_name<meta_field>().view()} == primary_key.name)
+        {
+            output.binds.emplace_back(detail::to_sql_value(object.[:meta_field:]));
+            bound = true;
+        }
+    });
+
+    if(!bound)
+    {
+        throw std::logic_error{"entityfy ORM partial update requires a primary key column"};
+    }
+
+    output.sql.append(" WHERE ");
+    output.sql.append(detail::quote_identifier(primary_key.name));
+    output.sql.append(" = ?");
+    return output;
+}
+
 template <typename Model>
 [[nodiscard]] statement update_many_statement(const Model& patch, const model_descriptor<Model>& model, condition filter)
 {
