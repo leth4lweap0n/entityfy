@@ -2785,6 +2785,32 @@ status run_lazy_loading_checks()
     }
     require(context_cleared, "clear() reports lazy_error::context_cleared");
 
+    // A pool lease release calls clear(); a handle bound on that lease must not
+    // read through the pooled context afterwards.
+    entityfy::db_context_pool pool{"sqlite://:memory:", 1};
+    lz_user pool_orphan;
+    {
+        auto lease = pool.acquire();
+        lease->migrate<lz_user>();
+        lease->migrate<lz_post>();
+
+        auto& pooled = lease->set<lz_user>().add(lz_user{.name = "Pooled"});
+        lease->save_changes();
+        pool_orphan = pooled;
+        require(pool_orphan.posts.is_attached(), "a pool lease binds the handle");
+    }
+
+    bool lease_cleared = false;
+    try
+    {
+        (void)pool_orphan.posts.get();
+    }
+    catch(const entityfy::lazy_error& error)
+    {
+        lease_cleared = error.reason() == entityfy::lazy_error_reason::context_cleared;
+    }
+    require(lease_cleared, "a released pool lease reports lazy_error::context_cleared");
+
     // A generated key is assigned during save, after the handle was bound, so
     // the handle has to follow the id the database assigned.
     auto& fresh = users.add(lz_user{.name = "Fresh"});
