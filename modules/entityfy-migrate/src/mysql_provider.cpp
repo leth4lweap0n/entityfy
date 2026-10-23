@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -243,6 +244,12 @@ using mysql_handle = std::unique_ptr<MYSQL, handle_deleter>;
     return message;
 }
 
+struct dump_cell
+{
+    bool        is_null = false;
+    std::string text;
+};
+
 class mysql_connection
 {
 public:
@@ -302,6 +309,36 @@ public:
         std::string_view sql,
         const std::vector<std::string>& params)
     {
+        auto cells = query_cells(sql, params);
+
+        std::vector<std::vector<std::string>> output;
+        output.reserve(cells.size());
+
+        for(auto& row: cells)
+        {
+            std::vector<std::string> flat;
+            flat.reserve(row.size());
+
+            for(auto& cell: row)
+            {
+                flat.push_back(std::move(cell.text));
+            }
+
+            output.push_back(std::move(flat));
+        }
+
+        return output;
+    }
+
+    [[nodiscard]] std::vector<std::vector<dump_cell>> query_dump(std::string_view sql)
+    {
+        return query_cells(sql, {});
+    }
+
+    [[nodiscard]] std::vector<std::vector<dump_cell>> query_cells(
+        std::string_view sql,
+        const std::vector<std::string>& params)
+    {
         mysql_thread_init();
 
         std::unique_ptr<MYSQL_STMT, decltype(&mysql_stmt_close)> statement{mysql_stmt_init(handle_.get()),
@@ -342,7 +379,7 @@ public:
         }
 
         MYSQL_RES* raw_metadata = mysql_stmt_result_metadata(statement.get());
-        std::vector<std::vector<std::string>> output;
+        std::vector<std::vector<dump_cell>> output;
 
         if(raw_metadata == nullptr)
         {
@@ -391,12 +428,13 @@ public:
                 throw std::runtime_error{"entityfy/migrate:mysql: fetch failed: " + error_text(handle_.get())};
             }
 
-            std::vector<std::string> current(column_count);
+            std::vector<dump_cell> current(column_count);
 
             for(unsigned int index = 0; index < column_count; ++index)
             {
                 if(result_nulls[index] != 0)
                 {
+                    current[index].is_null = true;
                     continue;
                 }
 
@@ -418,7 +456,7 @@ public:
                 }
 
                 text.resize(column_length);
-                current[index] = std::move(text);
+                current[index].text = std::move(text);
             }
 
             output.emplace_back(std::move(current));
@@ -543,6 +581,56 @@ std::vector<std::string> split_columns(std::string_view value)
     }
 
     return output;
+}
+
+[[nodiscard]] bool is_numeric_type(std::string_view type)
+{
+    const auto base = type.substr(0, type.find('('));
+    return base == "INTEGER" || base == "BIGINT" || base == "BOOLEAN" || base == "DECIMAL" ||
+           base == "DOUBLE" || base == "FLOAT";
+}
+
+[[nodiscard]] bool is_binary_type(std::string_view type)
+{
+    const auto base = type.substr(0, type.find('('));
+    return base == "BINARY" || base == "VARBINARY" || base == "BLOB" || base == "TINYBLOB" ||
+           base == "MEDIUMBLOB" || base == "LONGBLOB";
+}
+
+[[nodiscard]] std::string hex_literal(std::string_view value)
+{
+    static constexpr char digits[] = "0123456789abcdef";
+
+    std::string output = "0x";
+    output.reserve(value.size() * 2 + 2);
+
+    for(const unsigned char byte: value)
+    {
+        output.push_back(digits[byte >> 4]);
+        output.push_back(digits[byte & 0x0F]);
+    }
+
+    return output;
+}
+
+[[nodiscard]] std::string dump_value(const dump_cell& cell, std::string_view type)
+{
+    if(cell.is_null)
+    {
+        return "NULL";
+    }
+
+    if(is_numeric_type(type))
+    {
+        return cell.text;
+    }
+
+    if(is_binary_type(type))
+    {
+        return hex_literal(cell.text);
+    }
+
+    return quote_literal(cell.text);
 }
 
 class mysql_provider final : public provider
@@ -956,11 +1044,91 @@ public:
         return connection_.query_params(sql, params);
     }
 
-    void backup(std::string_view) override
+    [[nodiscard]] std::string_view backup_extension() const override
     {
-        throw std::runtime_error{
-            "entityfy/migrate:mysql: mysqldump based backups are not implemented; pass --no-backup"
-        };
+        return ".sql";
+    }
+
+    void backup(std::string_view path) override
+    {
+        const auto schema = introspect();
+
+        std::vector<const table*> tables;
+        tables.reserve(schema.tables.size());
+        for(const auto& value: schema.tables)
+        {
+            tables.push_back(&value);
+        }
+
+        const auto ordered = order_for_creation(tables);
+
+        std::ofstream out{std::string{path}, std::ios::binary | std::ios::trunc};
+        if(!out)
+        {
+            throw std::runtime_error{"entityfy/migrate:mysql: cannot open backup file `" + std::string{path} + "`"};
+        }
+
+        out << "-- entityfy migrate backup\n";
+        out << "SET NAMES utf8mb4;\n";
+        out << "SET SESSION sql_mode = CONCAT_WS(',', @@SESSION.sql_mode, 'ANSI_QUOTES', 'NO_BACKSLASH_ESCAPES');\n";
+        out << "SET FOREIGN_KEY_CHECKS=0;\n";
+        out << "START TRANSACTION;\n\n";
+
+        for(const table* value: ordered)
+        {
+            out << create_table_sql(*value, false) << ";\n";
+        }
+
+        for(const table* value: ordered)
+        {
+            for(const auto& entry: value->indexes)
+            {
+                out << create_index_sql(*value, entry) << ";\n";
+            }
+        }
+
+        out << "\n";
+
+        for(const table* value: ordered)
+        {
+            const auto rows = connection_.query_dump("SELECT * FROM " + quote_ident(value->name));
+
+            for(const auto& row: rows)
+            {
+                out << "INSERT INTO " << quote_ident(value->name) << " (";
+
+                for(std::size_t index = 0; index < value->columns.size(); ++index)
+                {
+                    if(index != 0)
+                    {
+                        out << ", ";
+                    }
+
+                    out << quote_ident(value->columns[index].name);
+                }
+
+                out << ") VALUES (";
+
+                for(std::size_t index = 0; index < row.size() && index < value->columns.size(); ++index)
+                {
+                    if(index != 0)
+                    {
+                        out << ", ";
+                    }
+
+                    out << dump_value(row[index], value->columns[index].type);
+                }
+
+                out << ");\n";
+            }
+        }
+
+        out << "\nCOMMIT;\nSET FOREIGN_KEY_CHECKS=1;\n";
+
+        if(!out)
+        {
+            throw std::runtime_error{"entityfy/migrate:mysql: writing backup `" + std::string{path} + "` failed"};
+        }
     }
 
     [[nodiscard]] std::vector<std::string> render_rebuild(const table&, const table&) override

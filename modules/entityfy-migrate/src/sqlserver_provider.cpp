@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -269,6 +270,12 @@ struct sqlserver_connection_options
     return "unknown ODBC error";
 }
 
+struct dump_cell
+{
+    bool        is_null = false;
+    std::string text;
+};
+
 class sqlserver_connection
 {
 public:
@@ -362,6 +369,36 @@ public:
         std::string_view sql,
         const std::vector<std::string>& params)
     {
+        auto cells = query_cells(sql, params);
+
+        std::vector<std::vector<std::string>> output;
+        output.reserve(cells.size());
+
+        for(auto& row: cells)
+        {
+            std::vector<std::string> flat;
+            flat.reserve(row.size());
+
+            for(auto& cell: row)
+            {
+                flat.push_back(std::move(cell.text));
+            }
+
+            output.push_back(std::move(flat));
+        }
+
+        return output;
+    }
+
+    [[nodiscard]] std::vector<std::vector<dump_cell>> query_dump(std::string_view sql)
+    {
+        return query_cells(sql, {});
+    }
+
+    [[nodiscard]] std::vector<std::vector<dump_cell>> query_cells(
+        std::string_view sql,
+        const std::vector<std::string>& params)
+    {
         SQLHSTMT statement = SQL_NULL_HSTMT;
         if(SQLAllocHandle(SQL_HANDLE_STMT, connection_, &statement) != SQL_SUCCESS)
         {
@@ -418,7 +455,7 @@ public:
 
         SQLSMALLINT columns = 0;
         SQLNumResultCols(statement, &columns);
-        std::vector<std::vector<std::string>> output;
+        std::vector<std::vector<dump_cell>> output;
 
         if(columns == 0)
         {
@@ -441,13 +478,14 @@ public:
                 throw std::runtime_error{"entityfy/migrate:sqlserver: fetch failed: " + message};
             }
 
-            std::vector<std::string> current(columns);
+            std::vector<dump_cell> current(columns);
 
             for(SQLSMALLINT index = 0; index < columns; ++index)
             {
                 std::wstring value;
                 wchar_t      buffer[2048];
                 SQLLEN       indicator = 0;
+                bool         is_null = false;
 
                 while(true)
                 {
@@ -462,6 +500,7 @@ public:
 
                     if(chunk == SQL_NULL_DATA)
                     {
+                        is_null = true;
                         break;
                     }
 
@@ -475,6 +514,13 @@ public:
                         break;
                     }
 
+                    // ODBC reports NULL through the indicator, not the return code.
+                    if(indicator == SQL_NULL_DATA)
+                    {
+                        is_null = true;
+                        break;
+                    }
+
                     const auto characters = indicator > 0 ? static_cast<std::size_t>(indicator / static_cast<SQLLEN>(sizeof(wchar_t)))
                                                           : std::size_t{0};
                     value.append(buffer, characters);
@@ -485,7 +531,8 @@ public:
                     }
                 }
 
-                current[static_cast<std::size_t>(index)] = utf16_to_utf8(value.data(), value.size());
+                current[static_cast<std::size_t>(index)].is_null = is_null;
+                current[static_cast<std::size_t>(index)].text = utf16_to_utf8(value.data(), value.size());
             }
 
             output.emplace_back(std::move(current));
@@ -690,6 +737,69 @@ std::vector<std::string> split_columns(std::string_view value)
     }
 
     return output;
+}
+
+[[nodiscard]] bool is_numeric_type(std::string_view type)
+{
+    const auto base = type.substr(0, type.find('('));
+    return base == "INTEGER" || base == "BIGINT" || base == "BIT" || base == "FLOAT" ||
+           base == "DECIMAL" || base == "NUMERIC" || base == "MONEY" || base == "SMALLMONEY";
+}
+
+[[nodiscard]] bool is_binary_type(std::string_view type)
+{
+    const auto base = type.substr(0, type.find('('));
+    return base == "BINARY" || base == "VARBINARY";
+}
+
+[[nodiscard]] std::string dump_value(const dump_cell& cell, std::string_view type)
+{
+    if(cell.is_null)
+    {
+        return "NULL";
+    }
+
+    if(is_numeric_type(type))
+    {
+        return cell.text;
+    }
+
+    if(is_binary_type(type))
+    {
+        return cell.text.empty() ? std::string{"0x"} : "0x" + cell.text;
+    }
+
+    return "N" + quote_literal(cell.text);
+}
+
+// Binary columns are selected as hex text because SQLGetData would truncate
+// them in the wide-character conversion.
+[[nodiscard]] std::string dump_select(const table& value)
+{
+    std::string sql = "SELECT ";
+
+    for(std::size_t index = 0; index < value.columns.size(); ++index)
+    {
+        if(index != 0)
+        {
+            sql += ", ";
+        }
+
+        const auto& entry = value.columns[index];
+
+        if(is_binary_type(entry.type))
+        {
+            sql += "CONVERT(NVARCHAR(MAX), " + quote_ident(entry.name) + ", 2) AS " +
+                   quote_ident(entry.name);
+        }
+        else
+        {
+            sql += quote_ident(entry.name);
+        }
+    }
+
+    sql += " FROM " + quote_ident(value.name);
+    return sql;
 }
 
 class sqlserver_provider final : public provider
@@ -1182,11 +1292,108 @@ public:
         return connection_.query_params(sql, params);
     }
 
-    void backup(std::string_view) override
+    [[nodiscard]] std::string_view backup_extension() const override
     {
-        throw std::runtime_error{
-            "entityfy/migrate:sqlserver: backups are not implemented; pass --no-backup"
-        };
+        return ".sql";
+    }
+
+    void backup(std::string_view path) override
+    {
+        const auto schema = introspect();
+
+        std::vector<const table*> tables;
+        tables.reserve(schema.tables.size());
+        for(const auto& value: schema.tables)
+        {
+            tables.push_back(&value);
+        }
+
+        const auto ordered = order_for_creation(tables);
+
+        std::ofstream out{std::string{path}, std::ios::binary | std::ios::trunc};
+        if(!out)
+        {
+            throw std::runtime_error{"entityfy/migrate:sqlserver: cannot open backup file `" + std::string{path} + "`"};
+        }
+
+        out << "-- entityfy migrate backup\n";
+        out << "SET NOCOUNT ON;\n";
+        out << "SET XACT_ABORT ON;\n";
+        out << "BEGIN TRANSACTION;\n\n";
+
+        for(const table* value: ordered)
+        {
+            out << create_table_sql(*value, false) << ";\n";
+        }
+
+        for(const table* value: ordered)
+        {
+            for(const auto& entry: value->indexes)
+            {
+                out << create_index_sql(*value, entry) << ";\n";
+            }
+        }
+
+        out << "\n";
+
+        for(const table* value: ordered)
+        {
+            const auto rows = connection_.query_dump(dump_select(*value));
+
+            if(rows.empty())
+            {
+                continue;
+            }
+
+            const bool identity = std::ranges::any_of(
+                value->columns, [](const column& entry) { return entry.auto_increment; });
+
+            if(identity)
+            {
+                out << "SET IDENTITY_INSERT " << quote_ident(value->name) << " ON;\n";
+            }
+
+            for(const auto& row: rows)
+            {
+                out << "INSERT INTO " << quote_ident(value->name) << " (";
+
+                for(std::size_t index = 0; index < value->columns.size(); ++index)
+                {
+                    if(index != 0)
+                    {
+                        out << ", ";
+                    }
+
+                    out << quote_ident(value->columns[index].name);
+                }
+
+                out << ") VALUES (";
+
+                for(std::size_t index = 0; index < row.size() && index < value->columns.size(); ++index)
+                {
+                    if(index != 0)
+                    {
+                        out << ", ";
+                    }
+
+                    out << dump_value(row[index], value->columns[index].type);
+                }
+
+                out << ");\n";
+            }
+
+            if(identity)
+            {
+                out << "SET IDENTITY_INSERT " << quote_ident(value->name) << " OFF;\n";
+            }
+        }
+
+        out << "\nCOMMIT;\n";
+
+        if(!out)
+        {
+            throw std::runtime_error{"entityfy/migrate:sqlserver: writing backup `" + std::string{path} + "` failed"};
+        }
     }
 
     [[nodiscard]] std::vector<std::string> render_rebuild(const table&, const table&) override

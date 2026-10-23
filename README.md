@@ -429,11 +429,12 @@ through `sl3`, and there is no second copy of SQLite.
   class. Composite/JSON values are stored through `value_converter`, and
   `[[= entityfy::owned]]` value objects are split into prefixed columns.
 - MySQL/MariaDB and SQL Server are opt-in (`ENTITYFY_ENABLE_MYSQL`, `ENTITYFY_ENABLE_SQLSERVER`).
-  MySQL has no transactional DDL (a failed migration cannot be rolled back) and neither provider
-  implements backups (destructive steps need `--no-backup`); `[[= entityfy::json]]` maps to
-  `LONGTEXT` on MySQL because MariaDB reports its JSON alias that way; both backends report a
-  statement cache capacity of zero; the SQL Server migrate provider rebuilds dependent indexes
-  around `ALTER COLUMN` and refuses primary-key/identity changes.
+  MySQL has no transactional DDL (a failed migration cannot be rolled back); their migrate
+  providers write a SQL dump (`CREATE TABLE` + `INSERT`) instead of a native dump, which can take
+  a while on large databases; `[[= entityfy::json]]` maps to `LONGTEXT` on MySQL because MariaDB
+  reports its JSON alias that way; both backends report a statement cache capacity of zero; the
+  SQL Server migrate provider rebuilds dependent indexes around `ALTER COLUMN` and refuses
+  primary-key/identity changes.
 - Row reading is costly through `vector<vector<sql_value>>`; single-row reads need a separate
   path.
 - No `install()` / `find_package()` export yet: consume the project with `add_subdirectory` or

@@ -59,6 +59,13 @@ public:
     // Backup taken before a destructive operation. Throws if unsupported.
     virtual void backup(std::string_view path) = 0;
 
+    // File extension for the dump produced by backup(); providers that write
+    // SQL scripts override it.
+    [[nodiscard]] virtual std::string_view backup_extension() const
+    {
+        return ".db";
+    }
+
     // Returns the rebuild steps as a list of SQL statements for script generation.
     [[nodiscard]] virtual std::vector<std::string> render_rebuild(const table& desired, const table& actual) = 0;
 

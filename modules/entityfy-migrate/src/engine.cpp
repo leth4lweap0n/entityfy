@@ -382,7 +382,8 @@ apply_report engine::apply(const schema& current, std::ostream& out)
 
         if(options_.backup && migration_plan.destructive)
         {
-            const auto backup_path = options_.root / ("backup-" + file.id + ".db");
+            const auto backup_path =
+                options_.root / ("backup-" + file.id + std::string{backend_->backup_extension()});
             backend_->backup(backup_path.string());
             out << "  backup: " << backup_path.string() << "\n";
         }
@@ -702,7 +703,8 @@ void engine::rollback_last(std::ostream& out)
 
     if(options_.backup && migration_plan.destructive)
     {
-        const auto backup_path = options_.root / ("backup-rollback-" + target + ".db");
+        const auto backup_path =
+            options_.root / ("backup-rollback-" + target + std::string{backend_->backup_extension()});
         backend_->backup(backup_path.string());
         out << "  backup: " << backup_path.string() << "\n";
     }

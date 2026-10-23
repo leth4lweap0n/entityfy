@@ -106,7 +106,10 @@ and check the pending migrations.
 
 - By default destructive operations (drop, type change) are rejected; they are enabled with
   `--allow-destructive`.
-- A backup is taken before a destructive operation (disabled with `--no-backup`).
+- A backup is taken before a destructive operation (disabled with `--no-backup`). SQLite uses
+  `VACUUM INTO` (`.db`), PostgreSQL needs none because its DDL is transactional, and the MySQL and
+  SQL Server providers write a SQL dump (`.sql`) with `CREATE TABLE`/`INSERT` statements that can be
+  replayed on a clean database.
 - Before applying, the expected schema is compared with the database; a mismatch raises an error.
 - A migration file is protected by checksum; if the file is changed afterwards, applying stops.
 

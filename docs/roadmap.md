@@ -59,8 +59,7 @@
   cast to FLOAT
 - **MySQL/MariaDB support**: opt-in core backend (`mysql://`, `mysql` dialect, prepared statement
   path, `information_schema` introspection, error classification), context integration and a
-  migrate provider with its own DDL/diff path and tests; MySQL has no transactional DDL and the
-  migrate provider has no backup
+  migrate provider with its own DDL/diff path and tests; MySQL has no transactional DDL
 - **TPH inheritance**: `[[= entityfy::type_tag{...}]]` derived models share the base table and
   inherit its columns, `migrate_tph<Base, Types...>()` creates the union table (subtype columns
   nullable), CRUD is discriminator-scoped and `find_all_types()` loads the hierarchy as variants;
@@ -77,9 +76,7 @@ surface that has to change, so a session can pick one up without redoing the
 analysis. Everything above this section is implemented and covered by the test
 suite.
 
-1. **Backups for the MySQL and SQL Server migrate providers** — `mysqldump` / `BACKUP DATABASE`
-   integration so destructive steps do not need `--no-backup`.
-2. **Statement caching for MySQL and SQL Server** — the clients prepare each statement again; a
+1. **Statement caching for MySQL and SQL Server** — the clients prepare each statement again; a
    bounded cache like the PostgreSQL one would cut the parse round trip.
 
 ## Smaller follow-ups
