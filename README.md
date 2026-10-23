@@ -295,7 +295,7 @@ ctest --preset release
 ```
 
 50 CTest entries in the default build: 48 core Catch2 test cases (233 assertions) and the
-migrate/context test binaries - which contain 10 and 17 scenarios respectively. Each opt-in
+migrate/context test binaries - which contain 11 and 20 scenarios respectively. Each opt-in
 backend (`ENTITYFY_ENABLE_MYSQL`, `ENTITYFY_ENABLE_SQLSERVER`) adds two core cases and one
 scenario to the migrate and context binaries (52 entries with MySQL, 52 with SQL Server).
 
