@@ -5,6 +5,7 @@
 #include <entityfy/value.hpp>
 
 #include <algorithm>
+#include <concepts>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -24,34 +25,6 @@ namespace entityfy
 {
 namespace detail
 {
-
-consteval std::meta::info find_primary_key(std::meta::info type)
-{
-    for(const auto member: std::meta::nonstatic_data_members_of(type, std::meta::access_context::unchecked()))
-    {
-        if(!std::meta::has_identifier(member))
-        {
-            continue;
-        }
-
-        bool candidate = std::meta::identifier_of(member) == "id";
-
-        for(const auto annotation: std::meta::annotations_of(member))
-        {
-            if(std::meta::type_of(annotation) == ^^entityfy::primary_key_t)
-            {
-                candidate = true;
-            }
-        }
-
-        if(candidate)
-        {
-            return member;
-        }
-    }
-
-    throw "entityfy: model has no primary key";
-}
 
 consteval std::meta::info find_member(std::meta::info type, std::string_view name)
 {
@@ -104,6 +77,66 @@ consteval bool is_ignored_member(std::meta::info member)
     return !std::meta::annotations_of_with_type(member, ^^entityfy::ignore_t).empty();
 }
 
+// Every primary key member, in declaration order. The annotations are the key
+// definition; a model that annotates no key at all falls back to its `id`
+// member, matching describe_model(). Composite keys are the same list with
+// more than one entry.
+consteval std::vector<std::meta::info> primary_key_members(std::meta::info type)
+{
+    std::vector<std::meta::info> keys;
+
+    for(const auto member: std::meta::nonstatic_data_members_of(type, std::meta::access_context::unchecked()))
+    {
+        if(!std::meta::has_identifier(member) || is_ignored_member(member))
+        {
+            continue;
+        }
+
+        if(!std::meta::annotations_of_with_type(member, ^^entityfy::primary_key_t).empty() ||
+           !std::meta::annotations_of_with_type(member, ^^entityfy::auto_increment_t).empty())
+        {
+            keys.push_back(member);
+        }
+    }
+
+    if(keys.empty())
+    {
+        if(const auto fallback = find_member(type, "id"); fallback != std::meta::info{})
+        {
+            keys.push_back(fallback);
+        }
+    }
+
+    if(keys.empty())
+    {
+        throw "entityfy: model has no primary key";
+    }
+
+    return keys;
+}
+
+// The key member of a model whose key the database generates; empty for any
+// other model. A generated key always has exactly one integral key column.
+consteval std::meta::info generated_key_member(std::meta::info type)
+{
+    const auto keys = primary_key_members(type);
+
+    return keys.size() == 1 ? keys.front() : std::meta::info{};
+}
+
+consteval bool is_primary_key_member(std::meta::info type, std::meta::info member)
+{
+    for(const auto candidate: primary_key_members(type))
+    {
+        if(candidate == member)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 consteval std::meta::info find_member_of_type(std::meta::info type, std::meta::info desired)
 {
     for(const auto member: std::meta::nonstatic_data_members_of(type, std::meta::access_context::unchecked()))
@@ -132,7 +165,7 @@ consteval auto update_members()
             continue;
         }
 
-        if(member == find_primary_key(^^T) || member == concurrency_token_member<T>())
+        if(is_primary_key_member(^^T, member) || member == concurrency_token_member<T>())
         {
             continue;
         }
@@ -144,26 +177,18 @@ consteval auto update_members()
 }
 
 template <typename T>
-std::int64_t key_of(const T& entity)
-{
-    constexpr auto member = find_primary_key(^^T);
-    using member_type = std::remove_cvref_t<decltype(entity.[:member:])>;
-
-    static_assert(std::is_integral_v<member_type>,
-                  "entityfy: Phase 1 requires an integral primary key for change tracking");
-
-    return static_cast<std::int64_t>(entity.[:member:]);
-}
-
-template <typename T>
 void assign_generated_id(T& entity, std::int64_t value)
 {
-    constexpr auto member = find_primary_key(^^T);
-    using member_type = std::remove_cvref_t<decltype(entity.[:member:])>;
+    constexpr auto member = generated_key_member(^^T);
 
-    if constexpr(std::is_integral_v<member_type>)
+    if constexpr(member != std::meta::info{})
     {
-        entity.[:member:] = static_cast<member_type>(value);
+        using member_type = std::remove_cvref_t<decltype(entity.[:member:])>;
+
+        if constexpr(std::is_integral_v<member_type>)
+        {
+            entity.[:member:] = static_cast<member_type>(value);
+        }
     }
 }
 
@@ -187,7 +212,7 @@ template <typename T>
 [[nodiscard]] concurrency_entry make_concurrency_entry(
     db_context& owner,
     const entityfy::model_descriptor<T>& model,
-    std::int64_t key,
+    const row_key& key,
     std::string_view token_column,
     const sql_value& original_token)
 {
@@ -201,10 +226,14 @@ template <typename T>
         entry.columns.push_back(column.name);
     }
 
+    // SELECT * keeps the row in the table's own column order, which is what
+    // `entry.columns` reports.
+    auto filter = entityfy::detail::primary_key_filter(model, key);
+
     entityfy::statement lookup;
-    lookup.sql = "SELECT * FROM " + entityfy::detail::quote_identifier(model.table_name) + " WHERE " +
-                 entityfy::detail::quote_identifier(primary_key_column(model).name) + " = ?";
-    lookup.binds.emplace_back(entityfy::detail::to_sql_value(key));
+    lookup.sql =
+        "SELECT * FROM " + entityfy::detail::quote_identifier(model.table_name) + " WHERE " + filter.sql;
+    lookup.binds = std::move(filter.binds);
 
     auto rows = owner.database().query(lookup);
     if(!rows.empty())
@@ -318,8 +347,8 @@ struct set_state final : saveable
         bool         marked = false;
     };
 
-    std::deque<std::unique_ptr<tracked>>      items;
-    std::unordered_map<std::int64_t, std::size_t> identity;
+    std::deque<std::unique_ptr<tracked>>                              items;
+    std::unordered_map<row_key, std::size_t, row_key_hash>             identity;
     std::vector<undo_entry>                    undo_;
     // Change tracking hints: a save only visits the indices named here, so the
     // work stays proportional to what changed. Every entry is validated
@@ -333,19 +362,66 @@ struct set_state final : saveable
     bool                                       needs_compaction_ = false;
     std::uint64_t                              save_generation_ = 0;
     db_context*                                owner_ = nullptr;
+    // Resolved once per entity type: key extraction and the update path read
+    // the descriptor on every tracked operation.
+    entityfy::model_descriptor<T>              model_;
+    // True when the database assigns the key (exactly one auto increment key
+    // column). Only then does the default key mean "not assigned yet".
+    bool                                       generated_key_ = false;
     std::string                                table_name_;
     std::vector<std::string>                   referenced_tables_;
 
     explicit set_state(db_context& owner)
         : owner_{&owner}
+        , model_{entityfy::describe_model<T>(owner.database().target_dialect())}
     {
-        const auto model = entityfy::describe_model<T>(owner.database().target_dialect());
-        table_name_ = model.table_name;
+        table_name_ = model_.table_name;
 
-        for(const auto& relation: model.relations)
+        for(const auto& relation: model_.relations)
         {
             referenced_tables_.push_back(relation.referenced_table);
         }
+
+        generated_key_ = std::ranges::any_of(model_.columns, [](const entityfy::column_descriptor& column) {
+            return column.flags.auto_increment;
+        });
+    }
+
+    // The entity's key in descriptor order. The model descriptor is the key
+    // definition, so this covers single, string and composite keys alike.
+    [[nodiscard]] row_key key_of(const T& value) const
+    {
+        return entityfy::detail::primary_key_of(value, model_);
+    }
+
+    // "Unset" is a generated-key concept, not a zero sentinel: only a model
+    // whose key the database generates treats the default value as "not
+    // assigned yet". An explicit key is always real, including 0 and "".
+    [[nodiscard]] bool key_is_unset(const row_key& key) const
+    {
+        if(!generated_key_ || key.size() != 1)
+        {
+            return false;
+        }
+
+        const auto& part = key.part(0);
+
+        if(const auto* number = std::get_if<std::int64_t>(&part))
+        {
+            return *number == 0;
+        }
+
+        if(const auto* number = std::get_if<std::uint64_t>(&part))
+        {
+            return *number == 0;
+        }
+
+        return false;
+    }
+
+    [[nodiscard]] bool key_is_unset(const T& value) const
+    {
+        return key_is_unset(key_of(value));
     }
 
     [[nodiscard]] std::string table_name() const override
@@ -428,12 +504,13 @@ struct set_state final : saveable
                              T& entity,
                              const entityfy::model_descriptor<T>& model,
                              std::string_view token_column,
-                             std::int64_t key);
+                             const row_key& key);
 
     T& add(T value)
     {
-        const std::int64_t key = key_of(value);
-        if(key != 0 && identity.contains(key))
+        const row_key key = key_of(value);
+        const bool assigned = !key_is_unset(key);
+        if(assigned && identity.contains(key))
         {
             throw std::runtime_error{"entityfy: an entity with the same key is already tracked"};
         }
@@ -443,7 +520,7 @@ struct set_state final : saveable
         item.original = item.entity;
         item.state = entity_state::added;
 
-        if(key != 0)
+        if(assigned)
         {
             identity[key] = items.size() - 1;
         }
@@ -463,9 +540,9 @@ struct set_state final : saveable
     // (EF Core: Attach with original values).
     T& attach(T value, T original)
     {
-        const std::int64_t key = key_of(value);
+        const row_key key = key_of(value);
 
-        if(key != 0)
+        if(!key_is_unset(key))
         {
             if(const auto found = identity.find(key); found != identity.end())
             {
@@ -477,7 +554,7 @@ struct set_state final : saveable
         auto& item = *items.back();
         item.state = entity_state::unchanged;
 
-        if(key != 0)
+        if(!key_is_unset(key))
         {
             identity[key] = items.size() - 1;
         }
@@ -488,8 +565,8 @@ struct set_state final : saveable
     // Reads the row as it exists now without touching the tracked entity.
     [[nodiscard]] std::optional<T> database_values(db_context& owner, const T& value)
     {
-        const std::int64_t key = key_of(value);
-        if(key == 0)
+        const row_key key = key_of(value);
+        if(key_is_unset(key))
         {
             return std::nullopt;
         }
@@ -593,7 +670,7 @@ struct set_state final : saveable
             return item.marked_modified ? entity_state::modified : entity_state::unchanged;
         }
 
-        const auto model = entityfy::describe_model<T>(entityfy::dialect::sqlite);
+        const auto& model = model_;
         constexpr auto token_member = concurrency_token_member<T>();
         constexpr bool has_token_member = token_member != std::meta::info{};
 
@@ -604,7 +681,7 @@ struct set_state final : saveable
         {
             if constexpr(!is_ignored_member(member))
             {
-                if constexpr(member == find_primary_key(^^T))
+                if constexpr(is_primary_key_member(^^T, member))
                 {
                     continue;
                 }
@@ -665,8 +742,8 @@ struct set_state final : saveable
             throw std::runtime_error{"entityfy: refresh() called for an untracked entity"};
         }
 
-        const std::int64_t key = key_of(value);
-        if(key == 0)
+        const row_key key = key_of(value);
+        if(key_is_unset(key))
         {
             throw std::runtime_error{"entityfy: cannot refresh an unsaved entity"};
         }
@@ -704,8 +781,8 @@ struct set_state final : saveable
         identity.clear();
         for(std::size_t index = 0; index < items.size(); ++index)
         {
-            const std::int64_t key = key_of(items[index]->entity);
-            if(key != 0)
+            const row_key key = key_of(items[index]->entity);
+            if(!key_is_unset(key))
             {
                 identity[key] = index;
             }
@@ -714,8 +791,8 @@ struct set_state final : saveable
 
     [[nodiscard]] std::optional<std::size_t> index_of(const T& value) const
     {
-        const std::int64_t key = key_of(value);
-        if(key != 0)
+        const row_key key = key_of(value);
+        if(!key_is_unset(key))
         {
             if(const auto found = identity.find(key); found != identity.end())
             {
@@ -739,7 +816,7 @@ template <typename T>
 save_result set_state<T>::delete_removed(db_context& owner)
 {
     save_result result;
-    const auto model = entityfy::describe_model<T>(owner.database().target_dialect());
+    const auto& model = model_;
 
     constexpr auto token_member = concurrency_token_member<T>();
     constexpr bool has_token_member = token_member != std::meta::info{};
@@ -761,8 +838,8 @@ save_result set_state<T>::delete_removed(db_context& owner)
             continue;
         }
 
-        const std::int64_t key = key_of(item.entity);
-        if(key != 0)
+        const row_key key = key_of(item.entity);
+        if(!key_is_unset(key))
         {
             sql_value original_token{};
 
@@ -775,16 +852,16 @@ save_result set_state<T>::delete_removed(db_context& owner)
             }
 
             auto command = has_token
-                               ? entityfy::delete_by_id_statement(model, key, token_column, original_token)
-                               : entityfy::delete_by_id_statement(model, key);
+                               ? entityfy::delete_by_key_statement(model, key, token_column, original_token)
+                               : entityfy::delete_by_key_statement(model, key);
             owner.log(command.sql);
 
             const auto removed = owner.database().execute(command);
             if(removed.rows_affected == 0)
             {
                 throw entityfy::concurrency_error{
-                    has_token ? "entityfy: optimistic concurrency conflict for delete of key " + std::to_string(key)
-                              : "entityfy: delete affected zero rows for key " + std::to_string(key),
+                    has_token ? "entityfy: optimistic concurrency conflict for delete of key " + key.to_string()
+                              : "entityfy: delete affected zero rows for key " + key.to_string(),
                     {make_concurrency_entry(owner, model, key, token_column, original_token)}};
             }
 
@@ -805,14 +882,14 @@ void set_state<T>::reload_system_token(db_context& owner,
                                        T& entity,
                                        const entityfy::model_descriptor<T>& model,
                                        std::string_view token_column,
-                                       std::int64_t key)
+                                       const row_key& key)
 {
-    const auto primary_key = entityfy::primary_key_column(model);
+    auto filter = entityfy::detail::primary_key_filter(model, key);
+
     entityfy::statement lookup;
     lookup.sql = "SELECT " + entityfy::detail::quote_identifier(token_column) + " FROM " +
-                 entityfy::detail::quote_identifier(model.table_name) + " WHERE " +
-                 entityfy::detail::quote_identifier(primary_key.name) + " = ?";
-    lookup.binds.push_back(entityfy::detail::to_sql_value(key));
+                 entityfy::detail::quote_identifier(model.table_name) + " WHERE " + filter.sql;
+    lookup.binds = std::move(filter.binds);
 
     const auto rows = owner.database().query(lookup);
     if(rows.empty() || rows.front().empty())
@@ -828,10 +905,8 @@ save_result set_state<T>::save(db_context& owner)
 {
     save_result result;
 
-    const auto model = entityfy::describe_model<T>(owner.database().target_dialect());
+    const auto& model = model_;
     const std::string table = entityfy::detail::quote_identifier(model.table_name);
-    constexpr auto primary_key = find_primary_key(^^T);
-    const std::string primary_key_column{annotated_column_name<find_primary_key(^^T)>().view()};
 
     constexpr auto token_member = concurrency_token_member<T>();
     constexpr bool has_token_member = token_member != std::meta::info{};
@@ -849,15 +924,6 @@ save_result set_state<T>::save(db_context& owner)
         token_column = std::string{member_column_name<token_member>().view()};
         has_token = is_persisted_column(model, token_column);
         system_token = has_token && is_system_column(model, token_column);
-    }
-
-    bool generated_primary_key = false;
-    for(const auto& column: model.columns)
-    {
-        if(column.flags.primary_key && column.flags.auto_increment)
-        {
-            generated_primary_key = true;
-        }
     }
 
     const auto generated_column = [&](std::string_view name) {
@@ -901,7 +967,7 @@ save_result set_state<T>::save(db_context& owner)
 
     for(const std::size_t index: added_indices)
     {
-        if(generated_primary_key && key_of(items[index]->entity) != 0)
+        if(generated_key_ && !key_is_unset(items[index]->entity))
         {
             throw std::runtime_error{"entityfy: explicit primary key is not allowed for an auto-increment model"};
         }
@@ -918,7 +984,7 @@ save_result set_state<T>::save(db_context& owner)
         }
     }
 
-    if(!added_indices.empty() && !insert_columns.empty() && !generated_primary_key)
+    if(!added_indices.empty() && !insert_columns.empty() && !generated_key_)
     {
         std::string prefix = "INSERT INTO " + table + " (";
         for(std::size_t index = 0; index < insert_columns.size(); ++index)
@@ -1010,7 +1076,8 @@ save_result set_state<T>::save(db_context& owner)
                 item.original = item.entity;
                 item.state = entity_state::unchanged;
 
-                if(const std::int64_t key = key_of(item.entity); key != 0)
+                const row_key key = key_of(item.entity);
+                if(!key_is_unset(key))
                 {
                     identity[key] = index;
                 }
@@ -1062,7 +1129,7 @@ save_result set_state<T>::save(db_context& owner)
 
         if(item.state == entity_state::added)
         {
-            if(generated_primary_key && key_of(item.entity) != 0)
+            if(generated_key_ && !key_is_unset(item.entity))
             {
                 throw std::runtime_error{"entityfy: explicit primary key is not allowed for an auto-increment model"};
             }
@@ -1075,7 +1142,7 @@ save_result set_state<T>::save(db_context& owner)
             const auto inserted = owner.database().execute(command);
             result.inserted += static_cast<std::size_t>(inserted.rows_affected);
 
-            if(generated_primary_key && key_of(item.entity) == 0)
+            if(generated_key_ && key_is_unset(item.entity))
             {
                 std::int64_t generated = inserted.last_insert_id;
 
@@ -1116,7 +1183,8 @@ save_result set_state<T>::save(db_context& owner)
             item.original = item.entity;
             item.state = entity_state::unchanged;
 
-            if(const std::int64_t key = key_of(item.entity); key != 0)
+            const row_key key = key_of(item.entity);
+            if(!key_is_unset(key))
             {
                 identity[key] = index;
             }
@@ -1126,10 +1194,10 @@ save_result set_state<T>::save(db_context& owner)
 
         if(item.state == entity_state::removed)
         {
-            const std::int64_t key = key_of(item.entity);
-            if(key != 0)
+            const row_key key = key_of(item.entity);
+            if(!key_is_unset(key))
             {
-                auto command = entityfy::delete_by_id_statement(model, key);
+                auto command = entityfy::delete_by_key_statement(model, key);
                 owner.log(command.sql);
                 result.removed += static_cast<std::size_t>(owner.database().execute(command).rows_affected);
             }
@@ -1192,8 +1260,10 @@ save_result set_state<T>::save(db_context& owner)
             }
         }
 
-        sql += " WHERE " + entityfy::detail::quote_identifier(primary_key_column) + " = ?";
-        binds.push_back(entityfy::detail::to_sql_value(item.entity.[:primary_key:]));
+        const row_key key = key_of(item.entity);
+        const auto key_filter = entityfy::detail::primary_key_filter(model, key);
+        sql += " WHERE " + key_filter.sql;
+        binds.insert(binds.end(), key_filter.binds.begin(), key_filter.binds.end());
 
         sql_value original_token{};
 
@@ -1214,11 +1284,9 @@ save_result set_state<T>::save(db_context& owner)
 
         if(updated.rows_affected == 0)
         {
-            const auto key = key_of(item.entity);
-
             throw entityfy::concurrency_error{
-                has_token ? "entityfy: optimistic concurrency conflict for key " + std::to_string(key)
-                          : "entityfy: update affected zero rows for key " + std::to_string(key),
+                has_token ? "entityfy: optimistic concurrency conflict for key " + key.to_string()
+                          : "entityfy: update affected zero rows for key " + key.to_string(),
                 {make_concurrency_entry(owner, model, key, token_column, original_token)}};
         }
 
@@ -1397,17 +1465,17 @@ public:
     }
 
     // Loads an entity by primary key. Returns nullptr when it does not exist.
-    [[nodiscard]] T* find(std::int64_t id)
+    [[nodiscard]] T* find(const row_key& key)
     {
         auto tracked_state = state();
 
-        if(const auto found = tracked_state->identity.find(id); found != tracked_state->identity.end())
+        if(const auto found = tracked_state->identity.find(key); found != tracked_state->identity.end())
         {
             return &tracked_state->items[found->second]->entity;
         }
 
         const auto model = entityfy::describe_model<T>(owner_->database().target_dialect());
-        auto command = entityfy::select_by_id_statement(model, id);
+        auto command = entityfy::select_by_key_statement(model, key);
         owner_->log(command.sql);
 
         T* found_entity = nullptr;
@@ -1417,6 +1485,15 @@ public:
         });
 
         return found_entity;
+    }
+
+    // Single-value convenience for a one-column key (int64, string, ...); it
+    // builds the one-part row_key the general lookup expects.
+    template <typename Id>
+        requires(!std::same_as<std::remove_cvref_t<Id>, row_key>)
+    [[nodiscard]] T* find(Id&& id)
+    {
+        return find(entityfy::detail::single_part_key(std::forward<Id>(id)));
     }
 
     // Loads every row of the table and tracks it.
@@ -1632,6 +1709,12 @@ public:
         const auto child_model = entityfy::describe_model<Child>(dialect);
         const auto& relation = entityfy::detail::find_relation<Child, T>(child_model, parent_model);
 
+        if(entityfy::primary_key_columns(parent_model).size() > 1)
+        {
+            throw std::logic_error{"entityfy: composite foreign keys are not supported yet (P1.5): relation from " +
+                                   child_model.table_name + " to " + parent_model.table_name};
+        }
+
         const auto parent_key_column = entityfy::primary_key_column(parent_model).name;
         if(relation.referenced_column != parent_key_column)
         {
@@ -1678,7 +1761,7 @@ public:
 
         owner_->log(sql);
 
-        std::unordered_map<std::string, std::vector<Child*>> grouped;
+        std::unordered_map<row_key, std::vector<Child*>, row_key_hash> grouped;
         auto child_set = owner_->template set<Child>();
 
         owner_->database().query_each(
@@ -1693,15 +1776,16 @@ public:
                 }
 
                 auto& stored = child_set.attach(std::move(child));
-                grouped[entityfy::detail::canonical_key(*key)].push_back(&stored);
+                grouped[entityfy::detail::single_part_key(*key)].push_back(&stored);
                 return true;
             }
         );
 
         for(T* parent: parents)
         {
-            const auto key = entityfy::detail::primary_key_value(*parent, parent_model);
-            auto bucket = grouped[entityfy::detail::canonical_key(key)];
+            const auto key =
+                entityfy::detail::single_part_key(entityfy::detail::primary_key_value(*parent, parent_model));
+            auto bucket = grouped[key];
 
             constexpr auto pointer_navigation = detail::find_member_of_type(^^T, ^^std::vector<Child*>);
             constexpr auto value_navigation = detail::find_member_of_type(^^T, ^^std::vector<Child>);
@@ -1747,6 +1831,12 @@ public:
         const auto parent_model = entityfy::describe_model<Parent>(dialect);
         const auto& relation = entityfy::detail::find_relation<T, Parent>(child_model, parent_model);
 
+        if(entityfy::primary_key_columns(parent_model).size() > 1)
+        {
+            throw std::logic_error{"entityfy: composite foreign keys are not supported yet (P1.5): relation from " +
+                                   child_model.table_name + " to " + parent_model.table_name};
+        }
+
         const auto parent_key_column = entityfy::primary_key_column(parent_model).name;
         if(relation.referenced_column != parent_key_column)
         {
@@ -1754,7 +1844,7 @@ public:
                                      parent_model.table_name + " does not point at the primary key"};
         }
 
-        std::vector<std::string> keys;
+        std::vector<row_key> keys;
         std::vector<entityfy::sql_value> binds;
 
         for(auto* child: children)
@@ -1765,10 +1855,10 @@ public:
                 continue;
             }
 
-            const auto canonical = entityfy::detail::canonical_key(*key);
-            if(std::ranges::find(keys, canonical) == keys.end())
+            const auto child_key = entityfy::detail::single_part_key(*key);
+            if(std::ranges::find(keys, child_key) == keys.end())
             {
-                keys.push_back(canonical);
+                keys.push_back(child_key);
                 binds.push_back(*key);
             }
         }
@@ -1812,7 +1902,7 @@ public:
 
         owner_->log(sql);
 
-        std::unordered_map<std::string, Parent*> loaded;
+        std::unordered_map<row_key, Parent*, row_key_hash> loaded;
         auto parent_set = owner_->template set<Parent>();
 
         owner_->database().query_each(
@@ -1821,7 +1911,7 @@ public:
                 auto value = entityfy::detail::materialize_row<Parent>(row);
                 const auto key = entityfy::detail::primary_key_value(value, parent_model);
                 Parent& stored = parent_set.attach(std::move(value));
-                loaded[entityfy::detail::canonical_key(key)] = &stored;
+                loaded[entityfy::detail::single_part_key(key)] = &stored;
                 return true;
             }
         );
@@ -1835,7 +1925,7 @@ public:
                 continue;
             }
 
-            const auto found = loaded.find(entityfy::detail::canonical_key(*key));
+            const auto found = loaded.find(entityfy::detail::single_part_key(*key));
             output.emplace_back(child, found == loaded.end() ? nullptr : found->second);
         }
 

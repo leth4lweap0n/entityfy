@@ -1,6 +1,7 @@
 #pragma once
 
 #include <entityfy/error.hpp>
+#include <entityfy/key.hpp>
 #include <entityfy/value.hpp>
 
 #include <cstdint>
@@ -15,11 +16,12 @@ namespace entityfy
 // One failed optimistic concurrency check. `database_values` is the row as it
 // exists now (empty when the row is gone); `original_token` is the value the
 // failed statement matched against. `token_column` is empty when the model has
-// no concurrency token.
+// no concurrency token. `key` is the full primary key of the conflicting row:
+// one part for a single-column key, every part for a composite one.
 struct concurrency_entry
 {
     std::string              table;
-    std::int64_t             key = 0;
+    row_key                  key;
     std::string              token_column;
     sql_value                original_token{};
     std::vector<std::string> columns;

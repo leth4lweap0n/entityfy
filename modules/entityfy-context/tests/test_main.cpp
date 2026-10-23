@@ -181,6 +181,32 @@ struct [[= entityfy::table{"rc_xmin_rows"}]] rc_xmin_row
     std::uint32_t revision = 0;
 };
 
+// Composite and string primary keys: the context identity map is keyed by
+// row_key, so the tracker never assumes a single integral `id`.
+struct [[= entityfy::table{"ck_people"}]] ck_person
+{
+    [[= entityfy::primary_key]]
+    std::int64_t id = 0;
+
+    [[= entityfy::primary_key, = entityfy::varchar{32}]]
+    std::string region;
+
+    [[= entityfy::not_null, = entityfy::varchar{120}]]
+    std::string name;
+
+    [[= entityfy::concurrency_token, = entityfy::not_null]]
+    std::int64_t revision = 0;
+};
+
+struct [[= entityfy::table{"ck_slugs"}]] ck_slug
+{
+    [[= entityfy::primary_key, = entityfy::varchar{120}]]
+    std::string slug;
+
+    [[= entityfy::not_null, = entityfy::varchar{120}]]
+    std::string name;
+};
+
 // EF Core style context: the sets are declared once, the framework derives
 // everything else (table, columns, primary key, foreign keys) from reflection.
 struct ef_context : entityfy::db_context
@@ -634,7 +660,7 @@ status run_concurrency_resolution_checks()
 
             const auto& entry = error.entries().front();
             require(entry.table == "rc_users", "entry names the table");
-            require(entry.key == id, "entry carries the key");
+            require(entry.key == entityfy::row_key{entityfy::sql_value{id}}, "entry carries the key");
             require(entry.token_column == "version", "entry names the token column");
             require(as_integer(entry.original_token) == 0, "entry carries the stale token");
             require(entry.row_exists(), "entry carries the database row");
@@ -1471,6 +1497,200 @@ status run_async_checks()
     return status::passed;
 }
 
+status run_composite_key_checks()
+{
+    const char* path = "rc_composite_key.db";
+    std::filesystem::remove(path);
+
+    {
+        entityfy::db_context ctx{"sqlite://:memory:"};
+        ctx.migrate<ck_person>();
+        ctx.migrate<ck_slug>();
+
+        std::vector<std::string> statements;
+        ctx.set_logger([&](std::string_view sql) { statements.emplace_back(sql); });
+
+        auto people = ctx.set<ck_person>();
+
+        auto& alpha = people.add(ck_person{.id = 1, .region = "eu", .name = "alpha"});
+        auto& beta = people.add(ck_person{.id = 2, .region = "eu", .name = "beta"});
+        (void)beta;
+
+        bool duplicate = false;
+        try
+        {
+            people.add(ck_person{.id = 1, .region = "eu", .name = "duplicate"});
+        }
+        catch(const std::runtime_error&)
+        {
+            duplicate = true;
+        }
+
+        require(duplicate, "a duplicate composite key is rejected by the tracker");
+
+        const auto alpha_key = entityfy::row_key{entityfy::sql_value{std::int64_t{1}},
+                                                 entityfy::sql_value{std::string{"eu"}}};
+
+        require(people.find(alpha_key) == &alpha, "find(row_key) returns the tracked composite entity");
+        require(people.find(alpha_key) == &alpha, "the identity map reuses the tracked instance");
+
+        const auto inserted = ctx.save_changes();
+        require(inserted.inserted == 2, "both composite rows are inserted");
+        require(ctx.database().table<ck_person>().count() == 2, "composite rows reached the database");
+
+        require(people.state(alpha) == entityfy::entity_state::unchanged, "a saved entity starts unchanged");
+
+        // Both key parts are excluded from change detection: moving them in
+        // place must not report a modification.
+        const std::int64_t saved_id = alpha.id;
+        const std::string saved_region = alpha.region;
+        alpha.id = 7;
+        alpha.region = "us";
+        require(people.state(alpha) == entityfy::entity_state::unchanged,
+                "state_of skips every primary key member");
+        alpha.id = saved_id;
+        alpha.region = saved_region;
+
+        statements.clear();
+        alpha.name = "alpha2";
+        require(people.state(alpha) == entityfy::entity_state::modified, "a changed column is detected");
+
+        const auto updated = ctx.save_changes();
+        require(updated.updated == 1, "composite key update writes one row");
+
+        const auto update_sql = std::ranges::find_if(statements, [](const std::string& sql) {
+            return sql.starts_with("UPDATE \"ck_people\"");
+        });
+        require(update_sql != statements.end(), "the update statement was logged");
+        require(update_sql->find("SET \"name\" = ?") != std::string::npos,
+                "only the non-key column is in the SET list");
+        require(update_sql->find("WHERE \"id\" = ? AND \"region\" = ?") != std::string::npos,
+                "the WHERE clause binds every key part in order");
+
+        require(people.find(entityfy::row_key{entityfy::sql_value{std::int64_t{1}},
+                                              entityfy::sql_value{std::string{"us"}}}) == nullptr,
+                "a different composite key is not the tracked entity");
+
+        const auto database_row = people.database_values(alpha);
+        require(database_row.has_value() && database_row->name == "alpha2",
+                "database_values loads a composite row");
+
+        statements.clear();
+        people.remove(alpha);
+        const auto removed = ctx.save_changes();
+        require(removed.removed == 1, "composite key delete removes one row");
+
+        const auto delete_sql = std::ranges::find_if(statements, [](const std::string& sql) {
+            return sql.starts_with("DELETE FROM \"ck_people\"");
+        });
+        require(delete_sql != statements.end(), "the delete statement was logged");
+        require(delete_sql->find("WHERE \"id\" = ? AND \"region\" = ?") != std::string::npos,
+                "the DELETE predicate binds every key part in order");
+
+        require(ctx.database().table<ck_person>().count() == 1, "one composite row remains");
+
+        // An explicit zero key is a real key, not the generated "not assigned"
+        // default.
+        auto& zero = people.add(ck_person{.id = 0, .region = "zero", .name = "zero"});
+        require(ctx.save_changes().inserted == 1, "an explicit zero key is inserted");
+        require(people.find(entityfy::row_key{entityfy::sql_value{std::int64_t{0}},
+                                              entityfy::sql_value{std::string{"zero"}}}) == &zero,
+                "find returns the entity tracked under a zero key");
+
+        // String primary key: the same tracker path, no integral member.
+        auto slugs = ctx.set<ck_slug>();
+
+        const auto slug_key = entityfy::row_key{entityfy::sql_value{std::string{"entityfy"}}};
+
+        auto& slot = slugs.add(ck_slug{.slug = "entityfy", .name = "Entityfy"});
+        require(ctx.save_changes().inserted == 1, "the string-key row is inserted");
+        require(slugs.find(slug_key) == &slot, "find(row_key) returns the tracked string-key entity");
+
+        slot.name = "Entityfy ORM";
+        require(ctx.save_changes().updated == 1, "the string-key row is updated");
+
+        auto* reloaded = slugs.find(std::string{"entityfy"});
+        require(reloaded == &slot && reloaded->name == "Entityfy ORM",
+                "the single-value find overload builds the one-part key");
+
+        const auto empty_key = entityfy::row_key{entityfy::sql_value{std::string{}}};
+        auto& empty = slugs.add(ck_slug{.slug = "", .name = "empty"});
+        require(ctx.save_changes().inserted == 1, "an empty string key is a real key");
+        require(slugs.find(empty_key) == &empty, "find returns the entity tracked under an empty key");
+
+        slugs.remove(*reloaded);
+        require(ctx.save_changes().removed == 1, "the string-key row is removed");
+        require(slugs.find(slug_key) == nullptr, "a removed key is no longer tracked");
+    }
+
+    {
+        const auto key = entityfy::row_key{entityfy::sql_value{std::int64_t{7}},
+                                           entityfy::sql_value{std::string{"eu"}}};
+
+        entityfy::db_context writer{"sqlite://rc_composite_key.db"};
+        writer.migrate<ck_person>();
+
+        auto writer_set = writer.set<ck_person>();
+        auto& created = writer_set.add(ck_person{.id = 7, .region = "eu", .name = "before"});
+        require(writer.save_changes().inserted == 1, "the concurrency row is inserted");
+        require(created.revision == 0, "a new row starts at revision zero");
+
+        entityfy::db_context stale{"sqlite://rc_composite_key.db"};
+        auto stale_set = stale.set<ck_person>();
+        auto* stale_row = stale_set.find(key);
+        require(stale_row != nullptr, "the stale context loads the composite row");
+        require(stale_row->revision == 0, "the stale context sees revision zero");
+
+        auto* winner = writer_set.find(key);
+        require(winner == &created, "the writer tracks the same instance by row_key");
+        winner->name = "winner";
+        require(writer.save_changes().updated == 1, "the writer updates the composite row");
+
+        stale_row->name = "loser";
+
+        bool conflict = false;
+        try
+        {
+            stale.save_changes();
+        }
+        catch(const entityfy::concurrency_error& error)
+        {
+            conflict = true;
+            require(error.entries().size() == 1, "one conflicting entry for the composite row");
+
+            const auto& entry = error.entries().front();
+            require(entry.key.size() == 2, "the concurrency entry carries both key parts");
+            require(entry.key.to_string().find("7") != std::string::npos, "the entry names the id part");
+            require(entry.key.to_string().find("eu") != std::string::npos, "the entry names the region part");
+            require(entry.token_column == "revision", "the annotated token column is used");
+            require(entry.row_exists(), "the entry carries the current database row");
+        }
+
+        require(conflict, "a stale composite save conflicts");
+
+        entityfy::db_context attached_ctx{"sqlite://rc_composite_key.db"};
+        auto attached_set = attached_ctx.set<ck_person>();
+
+        ck_person detached{.id = 7, .region = "eu", .name = "detached", .revision = 0};
+        ck_person original{.id = 7, .region = "eu", .name = "before", .revision = 0};
+
+        auto& tracked = attached_set.attach(detached, std::move(original));
+        require(attached_set.find(key) == &tracked, "attach registers the composite key in the identity map");
+
+        attached_set.refresh(tracked);
+        require(tracked.name == "winner" && tracked.revision == 1,
+                "refresh reloads the composite row through its row_key");
+
+        require(attached_ctx.save_changes().updated == 0, "a refreshed entity produces no update");
+    }
+
+    // The contexts above still hold the file, so it is removed once they are
+    // destroyed.
+    std::filesystem::remove(path);
+
+    return status::passed;
+}
+
 status run_postgres_checks()
 {
     const char* uri = std::getenv("ENTITYFY_PG_URI");
@@ -2049,6 +2269,7 @@ int main()
     const entry entries[] = {
         {"ef_surface", run_ef_surface_checks},
         {"sqlite", run_sqlite_checks},
+        {"composite_key", run_composite_key_checks},
         {"rollback", run_rollback_checks},
         {"concurrency", run_concurrency_checks},
         {"concurrency_resolution", run_concurrency_resolution_checks},
