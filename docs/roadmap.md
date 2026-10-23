@@ -116,16 +116,14 @@ picked up again.
 - **SQL Server / ODBC**: the migrate provider refuses primary-key/identity changes and rebuilds
   dependent indexes around `ALTER COLUMN`; backups are SQL dumps (no `BACKUP DATABASE`).
 - **Concurrency parity P0/P1 above is provider-agnostic** (context/core), so it also applies to
-  these backends; P2 (`xmin`) is PostgreSQL-only by design.
+  these backends; the `xmin` system-column token is PostgreSQL-only.
 
 ## Known limitations
 
 - The context module uses `entityfy::db_query_builder`; it is named this way to avoid a name
   collision with core's `entityfy::query_builder`.
-- The migration module uses its own providers; there is no statement cache there (tracked as a
-  measured decision for SQLite/PostgreSQL).
-- Concurrency: until the change tracker items land, a conflict without a token column is a plain
-  error, deletes are not versioned, and resolving a conflict means reloading and re-applying edits.
+- The migration module uses its own providers and runs every statement once; the statement-cache
+  decision was made against implementation by measurement (`docs/benchmarks.md`).
 - `save_changes_async()` is a thread offload, not I/O asynchrony (the drivers are synchronous).
 - The `db_set<T>` members of a context must be declared by hand: C++26 reflection can inspect
   members but cannot synthesize them, so `ctx.users` cannot be generated from the entity type
