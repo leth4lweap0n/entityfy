@@ -2,6 +2,10 @@
 
 Model definition, SQL generation, query DSL, backends, and statement cache.
 
+Reads stream: `backend::query_each` hands one reused row buffer to the caller, so `find`,
+`find_one`, `find_many` and `exists` materialize straight into the model instead of building a
+`vector<vector<sql_value>>` first. `exists` stops at the first row.
+
 ## Model definition
 
 An entity is a plain C++ struct; which column it maps to in the table is specified with an

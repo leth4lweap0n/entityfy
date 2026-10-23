@@ -158,14 +158,12 @@ public:
 
     [[nodiscard]] std::vector<Model> find_many(condition filter = {})
     {
-        const auto rows = backend_->query(select_statement(model_, std::move(filter)));
-        return materialize_many(rows);
+        return collect(select_statement(model_, std::move(filter)));
     }
 
     [[nodiscard]] std::vector<Model> find_many(query_options<Model> options)
     {
-        const auto rows = backend_->query(select_statement(model_, std::move(options)));
-        return materialize_many(rows);
+        return collect(select_statement(model_, std::move(options)));
     }
 
     [[nodiscard]] std::vector<Model> find_many(const query_builder<Model>& query)
@@ -175,24 +173,12 @@ public:
 
     [[nodiscard]] std::optional<Model> find_one(condition filter = {})
     {
-        const auto rows = backend_->query(select_one_statement(model_, std::move(filter)));
-        if(rows.empty())
-        {
-            return std::nullopt;
-        }
-
-        return detail::materialize_row<Model>(rows.front());
+        return collect_one(select_one_statement(model_, std::move(filter)));
     }
 
     [[nodiscard]] std::optional<Model> find_one(query_options<Model> options)
     {
-        const auto rows = backend_->query(select_one_statement(model_, std::move(options)));
-        if(rows.empty())
-        {
-            return std::nullopt;
-        }
-
-        return detail::materialize_row<Model>(rows.front());
+        return collect_one(select_one_statement(model_, std::move(options)));
     }
 
     [[nodiscard]] std::optional<Model> find_one(const query_builder<Model>& query)
@@ -223,7 +209,13 @@ public:
 
     [[nodiscard]] bool exists(condition filter = {})
     {
-        return !backend_->query(exists_statement(model_, std::move(filter))).empty();
+        bool found = false;
+        backend_->query_each(exists_statement(model_, std::move(filter)), [&](const detail::row&) {
+            found = true;
+            return false;
+        });
+
+        return found;
     }
 
     [[nodiscard]] bool exists(query_options<Model> options)
@@ -356,6 +348,30 @@ private:
         }
     }
 
+    // Streams the statement and materializes every row in place: no outer
+    // vector of rows and no per-row copy of sql_value vectors.
+    [[nodiscard]] std::vector<Model> collect(const entityfy::statement& command)
+    {
+        std::vector<Model> output;
+        backend_->query_each(command, [&](const detail::row& current) {
+            output.emplace_back(detail::materialize_row<Model>(current));
+            return true;
+        });
+
+        return output;
+    }
+
+    [[nodiscard]] std::optional<Model> collect_one(const entityfy::statement& command)
+    {
+        std::optional<Model> output;
+        backend_->query_each(command, [&](const detail::row& current) {
+            output.emplace(detail::materialize_row<Model>(current));
+            return false;
+        });
+
+        return output;
+    }
+
     [[nodiscard]] static std::vector<Model> materialize_many(const std::vector<detail::row>& rows)
     {
         std::vector<Model> output;
@@ -373,13 +389,7 @@ public:
     template <typename Id>
     [[nodiscard]] std::optional<Model> find(Id&& id)
     {
-        const auto rows = backend_->query(select_by_id_statement(model_, std::forward<Id>(id)));
-        if(rows.empty())
-        {
-            return std::nullopt;
-        }
-
-        return detail::materialize_row<Model>(rows.front());
+        return collect_one(select_by_id_statement(model_, std::forward<Id>(id)));
     }
 
     template <typename Id>

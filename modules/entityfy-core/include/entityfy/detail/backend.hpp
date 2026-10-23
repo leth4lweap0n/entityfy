@@ -37,6 +37,22 @@ public:
     [[nodiscard]] virtual dialect target_dialect() const noexcept = 0;
     virtual execution_result execute(const entityfy::statement& input) = 0;
     [[nodiscard]] virtual std::vector<row> query(const entityfy::statement& input) = 0;
+
+    // Streams rows to a consumer without collecting them: the backend reuses a
+    // single row buffer, so the consumer has to materialize (copy out) what it
+    // needs inside the callback. Returning false stops the iteration, which is
+    // how single-row reads avoid fetching the rest.
+    virtual void query_each(const entityfy::statement& input,
+                            const std::function<bool(const row&)>& consumer)
+    {
+        for(const auto& current: query(input))
+        {
+            if(!consumer(current))
+            {
+                return;
+            }
+        }
+    }
     [[nodiscard]] virtual std::vector<std::string> table_columns(std::string_view table) = 0;
     [[nodiscard]] virtual entityfy::table_info inspect_table(std::string_view table) = 0;
 

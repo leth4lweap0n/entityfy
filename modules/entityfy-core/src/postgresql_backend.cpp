@@ -465,6 +465,71 @@ public:
         }
     }
 
+    void query_each(const entityfy::statement& input,
+                    const std::function<bool(const row&)>& consumer) override
+    {
+        const std::lock_guard lock{mutex_};
+        bool in_consumer = false;
+
+        try
+        {
+            if(logger_)
+            {
+                logger_(input.sql);
+            }
+
+            auto sql = postgres_placeholders(input.sql);
+            auto parameters = to_pg_parameters(input.binds);
+            tao::pq::parameter<max_pg_parameters> bound;
+            bind_parameters(bound, parameters);
+
+            const std::string prepared = statement_name_for(sql);
+            auto result = run_statement(sql, prepared, bound);
+
+            const auto* raw_result = result.underlying_raw_ptr();
+            row output;
+
+            for(const auto& pg_row: result)
+            {
+                output.clear();
+                output.reserve(pg_row.columns());
+
+                for(std::size_t index = 0; index < pg_row.columns(); ++index)
+                {
+                    const auto field = pg_row[index];
+                    if(field.is_null())
+                    {
+                        output.emplace_back(std::monostate{});
+                    }
+                    else
+                    {
+                        output.emplace_back(postgresql_text_value_to_sql_value(
+                            field.get(),
+                            PQftype(raw_result, static_cast<int>(index))
+                        ));
+                    }
+                }
+
+                in_consumer = true;
+                const bool keep = consumer(output);
+                in_consumer = false;
+                if(!keep)
+                {
+                    break;
+                }
+            }
+        }
+        catch(const std::exception& error)
+        {
+            if(in_consumer)
+            {
+                throw;
+            }
+
+            throw_classified_sql_error("PostgreSQL", "query", input.sql, error.what());
+        }
+    }
+
     [[nodiscard]] std::vector<std::string> table_columns(std::string_view table) override
     {
         statement input;

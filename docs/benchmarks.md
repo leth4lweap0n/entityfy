@@ -139,6 +139,20 @@ the server side cache the ORM layer adds 1,3–1,6 times the raw driver instead 
 against `PQexecParams` (prepare on every call) entityfy is now faster (0,7–0,8x). What remains is
 the per-call round trip, not parsing or planning.
 
+## Row materialization
+
+Reads no longer collect `vector<vector<sql_value>>`: `backend::query_each` streams one reused
+row buffer and `table_client` materializes into the model in place (`find`, `find_one`, `find_many`,
+`exists`). Measured on the SQLite benchmark (100.000 rows, 5 repetitions), the change is **within
+machine noise** for single-row reads - `find` (primary key) 1,98 µs → 2,04 µs, `find_one` (unique
+email) 3,30 µs → 3,39 µs - and a small gain for many-row reads (`find_many` LIKE LIMIT 20:
+26,0 µs → 24,6 µs).
+
+**Honest conclusion:** the intermediate row vector was not the bottleneck; the remaining per-row
+cost is the SQLite step plus constructing `sql_value` per column, which the streaming path does not
+remove. The streaming API stays because it removes an allocation per row and lets `exists` stop
+after the first row, but it is not a headline speed-up.
+
 ## Context layer (change tracking)
 
 `entityfy_bench` also measures the context layer, i.e. the `db_set` / `db_context` path that the

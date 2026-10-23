@@ -188,6 +188,51 @@ public:
         }
     }
 
+    void query_each(const entityfy::statement& input,
+                    const std::function<bool(const row&)>& consumer) override
+    {
+        std::lock_guard lock{mutex_};
+        bool in_consumer = false;
+
+        try
+        {
+            if(logger_)
+            {
+                logger_(input.sql);
+            }
+
+            auto& command = command_for(input.sql);
+            command.resetParameters(to_sl3_values(input.binds));
+
+            row output;
+
+            command.execute(
+                [&](sl3::Columns columns) {
+                    output.clear();
+
+                    for(int index = 0; index < columns.count(); ++index)
+                    {
+                        output.emplace_back(from_sl3_column(columns, index));
+                    }
+
+                    in_consumer = true;
+                    const bool keep = consumer(output);
+                    in_consumer = false;
+                    return keep;
+                }
+            );
+        }
+        catch(const std::exception& error)
+        {
+            if(in_consumer)
+            {
+                throw;
+            }
+
+            throw_classified_sql_error("SQLite", "query", input.sql, error.what());
+        }
+    }
+
     [[nodiscard]] std::vector<std::string> table_columns(std::string_view table) override
     {
         statement input;
