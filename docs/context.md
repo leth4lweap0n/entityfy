@@ -386,6 +386,11 @@ entityfy::db_context_pool pool{"sqlite://app.db", 8};
 The pool must outlive the leases. On a context returning to the pool, the change tracker is
 cleared; the logger, retry policy, and batch limit are kept.
 
+`acquire_async()` returns a `task<lease>` from a lazily created worker pool sized to the pool's
+capacity. A queued acquire waits for a lease to be released; cancellation before the job starts
+completes as `task_cancelled`, and a started acquire is not interrupted. The pool must also
+outlive tasks that are still pending (the executor drains in its destructor).
+
 ## Naming
 
 The context module mirrors Entity Framework Core's *shape* — `db_context` / `db_set<T>` (the

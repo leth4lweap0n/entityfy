@@ -100,7 +100,7 @@ integral auto-increment models.
 
 ### P0.3 Migration, introspection and validation
 
-**Status:** implemented for creating table-level keys, key add/drop and introspection; altering the columns of an existing key (P0.3b2) is still open.
+**Status:** implemented: table-level key creation, key add/drop, in-place key membership/type changes on SQLite (rebuild) and PostgreSQL (constraint swap), and introspection.
 
 - `entityfy-migrate`'s table model carries the ordered primary-key column list, not only
   per-column flags; JSON round-trips it and old files without the list are read as the current
@@ -186,7 +186,7 @@ cancellation.
 
 ### P2.2 PostgreSQL native async
 
-**Status:** implemented (commits 19338ab, 94965eb): raw libpq port, per-backend reactor, nonblocking execute/query/pipeline batch, single-flight and cancellation. `transaction_async` remains.
+**Status:** implemented (commits 19338ab, 94965eb): raw libpq port, per-backend reactor, nonblocking execute/query/pipeline batch, single-flight and cancellation.
 
 Follow the audit decision B: the PostgreSQL backend owns one raw `PGconn*` and serves both the
 sync and async paths through shared parameter/result/SQLSTATE helpers (taopq is removed from the
@@ -202,7 +202,7 @@ fallbacks) is enforced.
 
 ### P2.3 Client and table surface
 
-**Status:** implemented (commit f5585c4): `async_mode`, async execute/query/batch/each and async table CRUD. `transaction_async` remains.
+**Status:** implemented (commits f5585c4, 227dc13): `async_mode`, async execute/query/batch/each, async table CRUD and `transaction_async`.
 
 `async_capability async_mode()`, `execute_async`, `query_async`, `query_each_async`,
 `execute_batch_async`, `transaction_async`, and `table_client` async CRUD mirroring the sync
@@ -220,7 +220,7 @@ single-context by definition.
 
 ### P2.5 Context and pool
 
-**Status:** partially implemented (commit 6a60d8d): `save_changes_async` returns a task on a lazy single-worker executor and the save gate rejects overlap; a destroyed context drains. Native `saveable` async methods and `db_context_pool::acquire_async` remain.
+**Status:** implemented (commits 6a60d8d, 227dc13): `save_changes_async` returns a task on a lazy single-worker executor, the save gate rejects overlap, a destroyed context drains, and `db_context_pool::acquire_async` returns a task-backed lease with queued acquires. Native `saveable` async internals remain a performance follow-up; the public task API is unchanged.
 
 `save_changes_async` returns `task<save_result>`; retry delays await the executor instead of
 blocking a thread; a save gate rejects concurrent sync/async saves. Phase 1 lands the offload

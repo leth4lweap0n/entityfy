@@ -214,9 +214,10 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
 - **Async I/O**: `entityfy::task<T>` / `task<void>` (move-only results, exceptions, cancellation
   hook, `on_complete`, flattened `then`), `inline_executor` and a bounded
   `thread_pool_executor`. The client exposes `async_mode`, `execute_async`, `query_async`,
-  `execute_batch_async` and `query_each_async`, and `table_client` mirrors CRUD asynchronously.
-  PostgreSQL uses native nonblocking libpq (one in-flight operation per connection, cancellation
-  through the task hook); SQLite reports `thread_offload` and serializes async work on one worker.
+  `execute_batch_async`, `query_each_async` and `transaction_async`, and `table_client` mirrors
+  CRUD asynchronously. PostgreSQL uses native nonblocking libpq (one in-flight operation per
+  connection, cancellation through the task hook); SQLite reports `thread_offload` and serializes
+  async work on one worker. `db_context_pool::acquire_async` returns a task-backed lease.
 
 ### Async completion threads
 
@@ -351,10 +352,10 @@ the ratios are more stable.
 ctest --preset release
 ```
 
-155 CTest entries in the default build: 153 core Catch2 test cases (1634 assertions with
-PostgreSQL enabled; SQLite-only runs execute 129 cases and 1407 assertions) and the
-migrate/context test binaries - which contain 10 and 27 scenarios respectively (24 executed with
-SQLite only, 25 with PostgreSQL). Each opt-in backend (`ENTITYFY_ENABLE_MYSQL`,
+161 CTest entries in the default build: 159 core Catch2 test cases (1664 assertions with
+PostgreSQL enabled; SQLite-only runs execute 132 cases and 1422 assertions) and the
+migrate/context test binaries - which contain 10 and 28 scenarios respectively (25 executed with
+SQLite only, 26 with PostgreSQL). Each opt-in backend (`ENTITYFY_ENABLE_MYSQL`,
 `ENTITYFY_ENABLE_SQLSERVER`) adds three core cases (two backend tests and a statement cache test)
 and one scenario to the migrate and context binaries.
 

@@ -115,6 +115,10 @@
 - **Async context save (P2.5)**: `save_changes_async()` returns `entityfy::task<save_result>`, a
   single-worker executor runs the save/retries, and a save gate rejects overlapping saves;
   destroying a context drains an in-flight save
+- **Async transactions and pool leases**: `client::transaction_async` returns a task and runs the
+  existing transaction on a client-owned worker; `db_context_pool::acquire_async` returns a
+  `task<lease>` from a lazy pool sized to the pool's capacity, with queued acquires and pre-start
+  cancellation
 
 ## Next
 
@@ -123,14 +127,14 @@ EF Core parity on SQLite and PostgreSQL. The slice plan, contracts and acceptanc
 are green.
 
 1. **P0 composite and non-integral keys** — complete (row_key, key lists, table-level and
-   string/UUID keys, key-based statements, identity/concurrency, migration diff). Altering the
-   columns of an existing key (P0.3b2) remains.
+   string/UUID keys, key-based statements, identity/concurrency, migration diff, and in-place
+   primary-key membership/type changes).
 2. **P1 lazy loading** — complete: P1.1-P1.4 (handles, binding, loaders, include cache,
    lifetimes) and P1.5 (composite foreign keys in include/lazy navigation).
-3. **P2 async I/O** — complete for the implemented slices: task/executors, native nonblocking
-   PostgreSQL, client/table async, SQLite thread-offload facade, task-based context save with a
-   save gate. Remaining: `transaction_async`, native async `saveable` methods and
-   `db_context_pool::acquire_async`.
+3. **P2 async I/O** — complete: task/executors, native nonblocking PostgreSQL, async
+   client/table, SQLite thread-offload facade, task-based context save with a save gate, async
+   transactions and pool leases. Native async `saveable` internals remain a performance follow-up;
+   the context save is an honest offload.
 4. **P3 ODBC** — decided, no code: SQLite and PostgreSQL keep their native drivers; the frozen SQL
    Server backend's gaps stay documented in the parity plan.
 
@@ -141,7 +145,7 @@ are green.
 | P0.0 | `row_key`, canonical ordering | complete |
 | P0.1 | composite/string keys in models, DDL, statements | complete |
 | P0.2 | key-based identity map and concurrency entries | complete |
-| P0.3 | migration diff for new keys, key add/drop, introspection | complete; altering an existing key (P0.3b2) open |
+| P0.3 | migration diff, key add/drop/alter, introspection | complete |
 | P0.4 | key tests and docs | complete |
 | P1.1 | `lazy<T>` handles, cache, typed errors | complete |
 | P1.2 | context binding, lifetimes, write/rollback invalidation | complete |
@@ -149,10 +153,10 @@ are green.
 | P1.4 | lazy tests and docs | complete |
 | P1.5 | composite foreign keys in relations/navigation | complete |
 | P2.1 | `task<T>`, executors | complete |
-| P2.2 | native nonblocking PostgreSQL | complete; `transaction_async` open |
+| P2.2 | native nonblocking PostgreSQL | complete |
 | P2.3 | async client/table surface | complete |
 | P2.4 | SQLite thread-offload facade | complete |
-| P2.5 | task-based context save, save gate | complete; native async `saveable` and `acquire_async` open |
+| P2.5 | task-based context save, save gate, async transactions and pool leases | complete; native async `saveable` internals open |
 | P2.6 | async tests and docs | complete for the shipped slices |
 | P3 | ODBC decision | decided: no new ODBC work |
 
@@ -178,9 +182,11 @@ picked up again.
 - The migration module uses its own providers and runs every statement once; the statement-cache
   decision was made against implementation by measurement (`docs/benchmarks.md`).
 - `save_changes_async()` is a thread offload, not I/O asynchrony (the drivers are synchronous).
-- Migrations add and drop key columns, but altering the columns of an existing primary key in
-  place (P0.3b2) is not implemented. Composite foreign keys are created and navigated; the migrate
-  providers still describe them one column at a time.
+- Migrations can add, drop and alter primary-key columns (including the key membership and a key
+  column's type). Composite foreign keys are created and navigated; the migrate providers still
+  describe them one column at a time.
+- `save_changes_async()` is an honest thread offload; a native async `saveable` path is a
+  performance follow-up, not a public API difference.
 - The `db_set<T>` members of a context must be declared by hand: C++26 reflection can inspect
   members but cannot synthesize them, so `ctx.users` cannot be generated from the entity type
   alone.
