@@ -22,7 +22,7 @@ plus runnable SQL script generation and model header generation from the live sc
 | `rollback` | Reverts the last applied migration |
 | `rename-table` | Renames a table in the database in place (`--to` gives the target) |
 
-Options: `--db <uri>`, `--provider sqlite|postgres`, `--root <directory>`,
+Options: `--db <uri>`, `--provider sqlite|postgres|mysql|sqlserver`, `--root <directory>`,
 `--rename table.column=new`, `--allow-destructive`, `--no-backup`, `--dry-run`,
 `--output <file>`, `--force`.
 
