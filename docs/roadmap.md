@@ -18,6 +18,8 @@
 **Context**
 
 - Identity map, snapshot-based change tracking, partial UPDATE
+- **Manual change tracking**: `set_auto_detect(false)` + `mark_modified(entity)`; a save visits only
+  the changed entities (measured 5,5 µs at 50.000 tracked rows against 10,6 ms with auto detection)
 - **No-tracking reads**: `query().select(...)` (tuples) and `as_no_tracking()` (full entities by
   value, EF Core `AsNoTracking`); measured 332 ns/row against 460 ns/row tracked
 - FK dependency order: INSERT parent-first, DELETE child-first (`ON DELETE RESTRICT` supported)
@@ -53,20 +55,16 @@
 
 1. **Dirty-column update** — because core keeps no snapshot, `table_client::update` writes all
    columns; partial UPDATE exists only in the context layer.
-2. **Write tracking in the context** — `save_changes()` compares every tracked entity against its
-   snapshot, so a one-row update is O(tracked entities) even though the undo log already records
-   only what a save touches (see `docs/benchmarks.md`). Removing the remaining scan needs write
-   hooks: an explicit `mark_modified(entity)` API or proxy-style setters.
-3. **Compile-time no-tracking view** — `as_no_tracking()` returns `std::vector<T>` by value, so
+2. **Compile-time no-tracking view** — `as_no_tracking()` returns `std::vector<T>` by value, so
    mutating a returned entity compiles and is silently ignored (the EF Core `AsNoTracking`
    footgun). A const-only wrapper would make that a compile error; it needs a view type that
    keeps the value movable, so it is a design decision, not a rename.
-4. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
+3. **Owned types and TPH inheritance** — not supported in the model layer. The owned/JSON need is
    in practice covered by `entityfy::value_converter<T>` (a composite type is written to a single
    column), but owned types **split across** columns (as in EF, e.g. `address_city`) and a TPH
    discriminator do not exist yet.
-5. **Additional providers** — MySQL / SQL Server.
-6. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
+4. **Additional providers** — MySQL / SQL Server.
+5. **Model scaffold from DB** — the `scaffold` command in the CLI generates a C++ model header
    **from the live schema** (the DB → model direction exists); the reverse direction (model → DB)
    is covered by the `snapshot` + `apply` commands, with no separate generation command.
 

@@ -168,8 +168,9 @@ attach instead of hitting the identity map.
 | `find` (database hit, cold) | 32 µs | SELECT + materialization + attach |
 | `to_list` (5.000 rows into a fresh context) | 460 ns/row | real load + attach; the bench prints the measured ratio (71x cheaper per row than a cold `find`, 63-71x across runs) |
 | `to_list` (same rows, `as_no_tracking()`) | 332 ns/row | materialize only: no snapshot, no identity map entry - tracking costs **1,39-1,52x** per loaded row |
-| `save_changes` with 1 dirty row | grows with the tracked set | 244 µs @2k, 973 µs @8k, 2,62-2,88 ms @20k |
-| `save_changes` **per tracked entity** | 141 ns | the snapshot scan, divided by the tracked set (20k); 141-144 ns across runs |
+| `save_changes` with 1 dirty row (auto detection) | grows with the tracked set | 363 µs @2k, 1,47 ms @8k, 3,81 ms @20k, 10,6 ms @50k |
+| `save_changes` with 1 marked row (manual) | **O(changed)** | 4,8 µs @2k, 4,7 µs @8k, 5,0 µs @20k, 5,5 µs @50k - flat |
+| `save_changes` **per tracked entity** | 178 ns | the snapshot scan at 20k; auto detection only |
 
 Every number is a median over `repetitions`; the cold lookup and both bulk loads open a **fresh
 context per repetition**, so the ratios compare measured medians rather than single runs.
@@ -179,8 +180,8 @@ without tracking (the last three runs, the only ones that measured it) and 2,62-
 one-row save - 141-144 ns per tracked entity. The printed ratios stayed between 63x and 71x
 (cold find / tracked load) and 1,39-1,52x (tracked / no-tracking).
 
-A one-row update is O(tracked entities) for two independent reasons, and only one of them
-remains:
+A one-row update is O(tracked entities) with auto detection and O(changed) with manual
+detection. Two O(n) terms existed originally, and both are gone:
 
 1. **Snapshot comparison (remains).** `save_changes()` has to decide which entities changed, and
    without write hooks the only way is comparing every tracked entity against its snapshot. Every
@@ -195,8 +196,10 @@ remains:
    2,62 ms.
 
 The columns of the modified row are still the only ones written - the scan is CPU work, not extra
-SQL. Removing the remaining term needs write tracking (explicit `mark_modified()` or proxy
-setters), which is on the roadmap.
+SQL. Manual detection removes it: `ctx.set_auto_detect(false)` + `users.mark_modified(entity)`
+keeps a save at ~5 µs regardless of the tracked set size, because the save visits only the marked
+indices (the change lists are validated against the item state, so stale entries cost nothing).
+Auto detection stays the default; EF Core's `DetectChanges` compares for the same reason.
 
 ## Honest assessment
 

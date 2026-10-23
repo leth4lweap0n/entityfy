@@ -151,6 +151,7 @@ void run_context_bench(const std::vector<std::string>& emails,
     double identity_ns = 0.0;
     double load_ns = 0.0;
     double update_ns = 0.0;
+    double marked_ns = 0.0;
 
     {
         entityfy::db_context ctx{"sqlite://:memory:"};
@@ -198,6 +199,29 @@ void run_context_bench(const std::vector<std::string>& emails,
         }
 
         update_ns = median_of(update_samples);
+
+        // Manual mode: the same one-row update, with auto detection off and the
+        // entity marked explicitly. The snapshot scan disappears from the save.
+        ctx.set_auto_detect(false);
+
+        std::vector<double> marked_samples;
+        marked_samples.reserve(repetitions);
+
+        for(std::size_t repetition = 0; repetition < repetitions; ++repetition)
+        {
+            first->name = "Marked " + std::to_string(repetition);
+            users.mark_modified(*first);
+
+            const auto started = clock_type::now();
+            const auto result = ctx.save_changes();
+            const auto finished = clock_type::now();
+
+            marked_samples.push_back(std::chrono::duration<double, std::nano>(finished - started).count());
+            g_sink += result.updated;
+        }
+
+        marked_ns = median_of(marked_samples);
+        ctx.set_auto_detect(true);
     }
 
     // ---- cold lookup: fresh context per repetition, every key once (file database) ----
@@ -296,9 +320,15 @@ void run_context_bench(const std::vector<std::string>& emails,
     std::cout << std::format("{:<34}{:>16.0f} ns/row\n", "to_list (load + track)", load_ns);
     std::cout << std::format("{:<34}{:>16.0f} ns/row\n", "to_list (no tracking)", untracked_ns);
     std::cout << std::format("{:<34}{:>16.0f} ns\n", "save_changes (1 dirty row)", update_ns);
+    std::cout << std::format("{:<34}{:>16.0f} ns\n", "save_changes (1 marked row, manual)", marked_ns);
     std::cout << std::format("{:<34}{:>16.1f} ns\n",
                              "save_changes per tracked entity",
                              update_ns / static_cast<double>(rows));
+
+    if(marked_ns > 0.0)
+    {
+        std::cout << std::format("manual / auto save per call: {:.0f}x\n", update_ns / marked_ns);
+    }
 
     if(load_ns > 0.0)
     {

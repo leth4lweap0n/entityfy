@@ -222,6 +222,9 @@ struct set_state final : saveable
         T            entity;
         T            original;
         entity_state state = entity_state::unchanged;
+        // Set by mark_modified(): with auto detection off this is the only
+        // signal that an entity changed.
+        bool marked_modified = false;
         // Generation of the last save that recorded an undo entry for this
         // item, so the log stays proportional to what the save touched.
         std::uint64_t undo_generation = 0;
@@ -236,18 +239,31 @@ struct set_state final : saveable
         T            entity;
         T            original;
         entity_state state = entity_state::unchanged;
+        bool         marked = false;
     };
 
     std::deque<std::unique_ptr<tracked>>      items;
     std::unordered_map<std::int64_t, std::size_t> identity;
     std::vector<undo_entry>                    undo_;
+    // Change tracking hints: a save only visits the indices named here, so the
+    // work stays proportional to what changed. Every entry is validated
+    // against the item state before use; stale entries are simply skipped.
+    std::vector<std::size_t>                   added_indices_;
+    std::vector<std::size_t>                   removed_indices_;
+    std::vector<std::size_t>                   modified_indices_;
+    std::vector<std::size_t>                   backup_added_;
+    std::vector<std::size_t>                   backup_removed_;
+    std::vector<std::size_t>                   backup_modified_;
+    bool                                       needs_compaction_ = false;
     std::uint64_t                              save_generation_ = 0;
+    db_context*                                owner_ = nullptr;
     std::string                                table_name_;
     std::vector<std::string>                   referenced_tables_;
 
-    explicit set_state(entityfy::dialect target)
+    explicit set_state(db_context& owner)
+        : owner_{&owner}
     {
-        const auto model = entityfy::describe_model<T>(target);
+        const auto model = entityfy::describe_model<T>(owner.database().target_dialect());
         table_name_ = model.table_name;
 
         for(const auto& relation: model.relations)
@@ -270,11 +286,21 @@ struct set_state final : saveable
     {
         undo_.clear();
         ++save_generation_;
+        backup_added_ = added_indices_;
+        backup_removed_ = removed_indices_;
+        backup_modified_ = modified_indices_;
     }
 
     void commit_save() noexcept override
     {
         undo_.clear();
+        backup_added_.clear();
+        backup_removed_.clear();
+        backup_modified_.clear();
+        added_indices_.clear();
+        removed_indices_.clear();
+        modified_indices_.clear();
+        needs_compaction_ = false;
     }
 
     // Records the current image of an item before the save mutates it.
@@ -293,6 +319,7 @@ struct set_state final : saveable
             .entity = item.entity,
             .original = item.original,
             .state = item.state,
+            .marked = item.marked_modified,
         });
     }
 
@@ -304,9 +331,16 @@ struct set_state final : saveable
             item.entity = iterator->entity;
             item.original = iterator->original;
             item.state = iterator->state;
+            item.marked_modified = iterator->marked;
         }
 
         undo_.clear();
+        added_indices_ = backup_added_;
+        removed_indices_ = backup_removed_;
+        modified_indices_ = backup_modified_;
+        backup_added_.clear();
+        backup_removed_.clear();
+        backup_modified_.clear();
         rebuild_identity();
     }
 
@@ -331,6 +365,7 @@ struct set_state final : saveable
             identity[key] = items.size() - 1;
         }
 
+        added_indices_.push_back(items.size() - 1);
         return item.entity;
     }
 
@@ -361,24 +396,36 @@ struct set_state final : saveable
 
     void remove(const T& value)
     {
-        const std::int64_t key = key_of(value);
-        if(const auto found = identity.find(key); found != identity.end())
+        const auto index = index_of(value);
+        if(!index)
         {
-            items[found->second]->state = entity_state::removed;
-            return;
+            throw std::runtime_error{"entityfy: remove() called for an untracked entity"};
         }
 
-        for(auto& holder: items)
+        auto& item = *items[*index];
+        if(item.state != entity_state::removed)
         {
-            auto& item = *holder;
-            if(&item.entity == &value)
-            {
-                item.state = entity_state::removed;
-                return;
-            }
+            item.state = entity_state::removed;
+            removed_indices_.push_back(*index);
+        }
+    }
+
+    // Manual change tracking: with auto detection off, only entities marked
+    // here are compared and written.
+    void mark_modified(const T& value)
+    {
+        const auto index = index_of(value);
+        if(!index)
+        {
+            throw std::runtime_error{"entityfy: mark_modified() called for an untracked entity"};
         }
 
-        throw std::runtime_error{"entityfy: remove() called for an untracked entity"};
+        auto& item = *items[*index];
+        if(item.state == entity_state::unchanged && !item.marked_modified)
+        {
+            item.marked_modified = true;
+            modified_indices_.push_back(*index);
+        }
     }
 
     [[nodiscard]] entity_state state_of(const T& value) const
@@ -393,6 +440,11 @@ struct set_state final : saveable
         if(item.state != entity_state::unchanged)
         {
             return item.state;
+        }
+
+        if(owner_ != nullptr && !owner_->auto_detect())
+        {
+            return item.marked_modified ? entity_state::modified : entity_state::unchanged;
         }
 
         const auto model = entityfy::describe_model<T>(entityfy::dialect::sqlite);
@@ -444,6 +496,8 @@ struct set_state final : saveable
         }
 
         items[*index]->state = entity_state::detached;
+        forget_index(*index);
+        needs_compaction_ = true;
     }
 
     void refresh(db_context& owner, T& value)
@@ -472,7 +526,20 @@ struct set_state final : saveable
         item.entity = value;
         item.original = value;
         item.state = entity_state::unchanged;
+        item.marked_modified = false;
         identity[key] = *index;
+        forget_index(*index);
+    }
+
+    void forget_index(std::size_t index)
+    {
+        const auto drop = [index](std::vector<std::size_t>& list) {
+            list.erase(std::remove(list.begin(), list.end(), index), list.end());
+        };
+
+        drop(added_indices_);
+        drop(removed_indices_);
+        drop(modified_indices_);
     }
 
     void rebuild_identity()
@@ -517,7 +584,7 @@ save_result set_state<T>::delete_removed(db_context& owner)
     save_result result;
     const auto model = entityfy::describe_model<T>(owner.database().target_dialect());
 
-    for(std::size_t index = 0; index < items.size(); ++index)
+    for(const std::size_t index: removed_indices_)
     {
         auto& item = *items[index];
         if(item.state != entity_state::removed)
@@ -535,6 +602,7 @@ save_result set_state<T>::delete_removed(db_context& owner)
 
         mark_undo(index);
         item.state = entity_state::detached;
+        needs_compaction_ = true;
     }
 
     return result;
@@ -599,8 +667,12 @@ save_result set_state<T>::save(db_context& owner)
         insert_columns.push_back(column);
     }
 
+    const bool auto_detect = owner.auto_detect();
+
     std::vector<std::size_t> added_indices;
-    for(std::size_t index = 0; index < items.size(); ++index)
+    added_indices.reserve(added_indices_.size());
+
+    for(const std::size_t index: added_indices_)
     {
         if(items[index]->state == entity_state::added)
         {
@@ -616,13 +688,14 @@ save_result set_state<T>::save(db_context& owner)
         }
     }
 
-    for(std::size_t index = 0; index < items.size(); ++index)
+    for(const std::size_t index: removed_indices_)
     {
         auto& item = *items[index];
         if(item.state == entity_state::removed)
         {
             mark_undo(index);
             item.state = entity_state::detached;
+            needs_compaction_ = true;
         }
     }
 
@@ -716,7 +789,40 @@ save_result set_state<T>::save(db_context& owner)
         }
     }
 
-    for(std::size_t index = 0; index < items.size(); ++index)
+    // Auto detection has to visit everything; manual mode visits the entities
+    // that were marked (plus the pending inserts), so a one-row save does not
+    // walk the tracked set.
+    std::vector<std::size_t> pending;
+    if(auto_detect)
+    {
+        pending.resize(items.size());
+        for(std::size_t index = 0; index < items.size(); ++index)
+        {
+            pending[index] = index;
+        }
+    }
+    else
+    {
+        pending.reserve(added_indices.size() + modified_indices_.size());
+
+        for(const std::size_t index: added_indices)
+        {
+            if(items[index]->state == entity_state::added)
+            {
+                pending.push_back(index);
+            }
+        }
+
+        for(const std::size_t index: modified_indices_)
+        {
+            if(items[index]->state == entity_state::unchanged && items[index]->marked_modified)
+            {
+                pending.push_back(index);
+            }
+        }
+    }
+
+    for(const std::size_t index: pending)
     {
         auto& item = *items[index];
 
@@ -793,6 +899,12 @@ save_result set_state<T>::save(db_context& owner)
             continue;
         }
 
+        // Manual mode: an entity that was not marked is never compared.
+        if(!auto_detect && !item.marked_modified)
+        {
+            continue;
+        }
+
         // Allocated only once a field actually differs, so unchanged entities
         // cost two comparisons and nothing else.
         std::string sql;
@@ -827,6 +939,7 @@ save_result set_state<T>::save(db_context& owner)
         {
             mark_undo(index);
             item.original = item.entity;
+            item.marked_modified = false;
             continue;
         }
 
@@ -880,11 +993,10 @@ save_result set_state<T>::save(db_context& owner)
         }
 
         item.original = item.entity;
+        item.marked_modified = false;
     }
 
-    const bool has_removed = std::ranges::any_of(items, [](const std::unique_ptr<tracked>& holder) {
-        return holder->state == entity_state::removed || holder->state == entity_state::detached;
-    });
+    const bool has_removed = needs_compaction_;
 
     if(has_removed)
     {
@@ -898,9 +1010,25 @@ save_result set_state<T>::save(db_context& owner)
         }
 
         items.swap(kept);
+        needs_compaction_ = false;
+        // Compaction shifts the indices, so the identity map has to be rebuilt.
+        // Without it the map is still valid and a save stays O(changed).
+        rebuild_identity();
     }
 
-    rebuild_identity();
+    // The lists name indices that the compaction may have shifted; after a
+    // successful save everything they tracked has been written anyway.
+    for(const std::size_t index: modified_indices_)
+    {
+        if(index < items.size())
+        {
+            items[index]->marked_modified = false;
+        }
+    }
+
+    added_indices_.clear();
+    removed_indices_.clear();
+    modified_indices_.clear();
 
     return result;
 }
@@ -978,6 +1106,14 @@ public:
     void refresh(T& value)
     {
         state()->refresh(*owner_, value);
+    }
+
+    // Manual change tracking: marks a tracked entity as modified. With
+    // db_context::set_auto_detect(false) this is the only signal save_changes()
+    // uses; with auto detection on it is redundant but harmless.
+    void mark_modified(T& value)
+    {
+        state()->mark_modified(value);
     }
 
     // Loads an entity by primary key. Returns nullptr when it does not exist.
@@ -2045,7 +2181,7 @@ std::shared_ptr<detail::set_state<T>> db_context::state_for()
 
     if(found == states_.end())
     {
-        auto state = std::make_shared<detail::set_state<T>>(database_.target_dialect());
+        auto state = std::make_shared<detail::set_state<T>>(*this);
         found = states_.emplace(key, state).first;
         order_.push_back(state);
     }

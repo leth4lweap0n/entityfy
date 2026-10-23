@@ -937,6 +937,79 @@ status run_column_alias_version_checks()
     return status::passed;
 }
 
+status run_manual_tracking_checks()
+{
+    entityfy::db_context ctx{"sqlite://:memory:"};
+    ctx.migrate<rc_user>();
+
+    auto users = ctx.set<rc_user>();
+    users.add(rc_user{.email = "a@manual.test", .name = "A"});
+    users.add(rc_user{.email = "b@manual.test", .name = "B"});
+    ctx.save_changes();
+
+    require(ctx.auto_detect(), "auto detection is on by default");
+    ctx.set_auto_detect(false);
+    require(!ctx.auto_detect(), "auto detection can be turned off");
+
+    auto* first = users.find(1);
+    auto* second = users.find(2);
+    require(first != nullptr && second != nullptr, "manual mode loads both rows");
+
+    first->name = "A changed without a mark";
+    second->name = "B marked";
+    users.mark_modified(*second);
+
+    require(users.state(*first) == entityfy::entity_state::unchanged,
+            "manual mode reports an unmarked entity as unchanged");
+    require(users.state(*second) == entityfy::entity_state::modified,
+            "manual mode reports a marked entity as modified");
+
+    const auto saved = ctx.save_changes();
+    require(saved.updated == 1, "manual mode writes only the marked entity");
+
+    const auto rows = ctx.database().table<rc_user>().find_many();
+    std::string first_name;
+    std::string second_name;
+    for(const auto& row: rows)
+    {
+        if(row.email == "a@manual.test")
+        {
+            first_name = row.name;
+        }
+        else if(row.email == "b@manual.test")
+        {
+            second_name = row.name;
+        }
+    }
+
+    require(first_name == "A", "the unmarked edit stayed in memory");
+    require(second_name == "B marked", "the marked edit reached the database");
+
+    ctx.set_auto_detect(true);
+    const auto detected = ctx.save_changes();
+    require(detected.updated == 1, "auto detection writes the pending edit");
+
+    rc_user stranger{.email = "stranger@manual.test", .name = "X"};
+    bool rejected = false;
+    try
+    {
+        users.mark_modified(stranger);
+    }
+    catch(const std::exception&)
+    {
+        rejected = true;
+    }
+
+    require(rejected, "mark_modified rejects untracked entities");
+
+    auto& fresh = users.add(rc_user{.email = "c@manual.test", .name = "C"});
+    users.mark_modified(fresh);
+    const auto inserted = ctx.save_changes();
+    require(inserted.inserted == 1, "marking an added entity does not disturb the insert");
+
+    return status::passed;
+}
+
 status run_no_tracking_checks()
 {
     entityfy::db_context ctx{"sqlite://:memory:"};
@@ -1450,6 +1523,7 @@ int main()
         {"column_alias", run_column_alias_checks},
         {"column_alias_version", run_column_alias_version_checks},
         {"no_tracking", run_no_tracking_checks},
+        {"manual_tracking", run_manual_tracking_checks},
         {"batch", run_batch_checks},
         {"dependency", run_dependency_checks},
         {"pool", run_pool_checks},

@@ -148,6 +148,20 @@ public:
     // Drops the tracked entities and the identity map; the DB connection is kept.
     void clear();
 
+    // Change detection strategy. With auto detection disabled, save_changes()
+    // compares only the entities passed to db_set::mark_modified(); everything
+    // else is skipped, which turns a one-row update from O(tracked entities)
+    // into O(1). The trade-off is explicit: unmarked edits are not written.
+    void set_auto_detect(bool enabled) noexcept
+    {
+        auto_detect_ = enabled;
+    }
+
+    [[nodiscard]] bool auto_detect() const noexcept
+    {
+        return auto_detect_;
+    }
+
     // Tracks an entity in the set that belongs to its type.
     template <typename T>
     T& add(T entity)
@@ -261,6 +275,7 @@ private:
     [[nodiscard]] save_result save_changes_with_retry();
 
     entityfy::client                                        database_;
+    bool                                                    auto_detect_ = true;
     std::unordered_map<std::type_index, std::shared_ptr<detail::saveable>> states_;
     std::vector<std::shared_ptr<detail::saveable>>         order_;
     std::vector<model_info>                                models_;

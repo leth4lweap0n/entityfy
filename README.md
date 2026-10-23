@@ -196,6 +196,9 @@ Sources live in [`modules/entityfy-core/examples/`](modules/entityfy-core/exampl
   keys; `model()` exposes the derived metadata and `migrate_all()` creates the tables parents-first.
 - Identity map and snapshot-based change tracking; `save_changes()` writes only the changed
   columns.
+- **Manual change tracking**: `ctx.set_auto_detect(false)` plus `users.mark_modified(entity)` makes
+  a save visit only the entities that changed - measured 5,5 µs at 50.000 tracked rows against
+  10,6 ms with auto detection (see [docs/benchmarks.md](docs/benchmarks.md)).
 - Control over tracking through `state(entity)`, `refresh`, `detach`, `clear`.
 - **FK dependency order**: insert/update parent-first, delete child-first. In tables using
   `ON DELETE RESTRICT`, a parent and its child can be deleted in the same save.
