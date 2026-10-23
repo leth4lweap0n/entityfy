@@ -79,20 +79,24 @@ surface that has to change, so a session can pick one up without redoing the
 analysis. Everything above this section is implemented and covered by the test
 suite.
 
-1. **Statement caching for MySQL and SQL Server** — the clients prepare each statement again; a
-   bounded cache like the PostgreSQL one would cut the parse round trip.
-
-## Smaller follow-ups
-
-Measured or diagnosed, not started:
-
-- **PostgreSQL pipeline mode / batching** — with the statement cache in place the per-call round
-  trip is the dominant cost (`docs/benchmarks.md`); taocpp supports pipelines.
-- **Statement cache in the migration providers** — they prepare on every statement (known
-  limitation).
-- **`as_no_tracking()` with eager loading** — `include` would have to return read-only pairs.
-- **Deduplicate the context read path** — `include`/`join` still collect `vector<row>`; `find`,
-  `to_list`, `from_sql` and `as_no_tracking` already stream through `client::query_each`.
+1. **`as_no_tracking()` with eager loading** — a no-tracking query currently rejects `include`;
+   the include path in `db_set` would have to carry read-only pairs and merge them by key.
+   Surface: `modules/entityfy-context/include/entityfy/db_set.hpp`, the context test suite.
+   Acceptance: an eager-loaded no-tracking read returns the same rows as the tracked variant, with
+   a scenario in the context binary.
+2. **Deduplicate the context read path** — `include`/`join` still collect `vector<row>` before
+   materializing; `find`, `to_list`, `from_sql` and `as_no_tracking` already stream through
+   `client::query_each`. Surface: the same file. Acceptance: the include path builds rows in the
+   consumer without an intermediate vector, all suites green, and the delta recorded in
+   `docs/benchmarks.md`.
+3. **PostgreSQL pipeline mode / batching** — with the statement cache in place the per-call round
+   trip dominates (`docs/benchmarks.md`); taocpp supports pipelines. Surface:
+   `postgresql_backend.cpp` batch path. Acceptance: batched writes use a pipeline, the benchmark
+   table records the before/after numbers, and the PostgreSQL suite stays green.
+4. **Statement cache in the migration providers** — they prepare every statement. Decide by
+   measurement first: count the statements a typical migration issues and time the prepare cost;
+   implement the LRU only if it is visible. Acceptance: the measurement lands in
+   `docs/benchmarks.md` and the outcome (implementation or documented decision) is recorded.
 
 ## Known limitations
 
