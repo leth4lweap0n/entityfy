@@ -5,12 +5,18 @@
 #include <entityfy/table.hpp>
 #include <entityfy/value.hpp>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -80,6 +86,158 @@ TEST_CASE("sqlite client reports thread-offload async capability", "[async][clie
         entityfy::statement{.sql = "SELECT 2"},
     }).get();
     REQUIRE(batch.size() == 2);
+}
+
+TEST_CASE("sqlite client transaction_async commits and rolls back on its worker", "[async][client][sqlite]")
+{
+    entityfy::client db{"sqlite://:memory:"};
+    db.migrate<async_item>();
+
+    std::thread::id body_thread;
+    db.transaction_async([&](entityfy::client& tx) {
+        body_thread = std::this_thread::get_id();
+        tx.table<async_item>().insert(async_item{.id = 1, .name = "committed", .score = 1});
+    }).get();
+
+    // The body really ran off the calling thread, and its insert committed.
+    REQUIRE(body_thread != std::this_thread::get_id());
+    REQUIRE(db.table<async_item>().count() == 1);
+    REQUIRE(db.table<async_item>().find(std::int64_t{1})->name == "committed");
+
+    auto failing = db.transaction_async([&]() -> std::int64_t {
+        db.table<async_item>().insert(async_item{.id = 2, .name = "rolled back", .score = 2});
+        throw std::runtime_error{"sqlite transaction_async body failed"};
+    });
+
+    REQUIRE_THROWS_WITH(failing.get(), "sqlite transaction_async body failed");
+    REQUIRE(db.table<async_item>().count() == 1);
+    REQUIRE_FALSE(db.table<async_item>().find(std::int64_t{2}).has_value());
+
+    // The rollback released the connection: another async transaction commits.
+    REQUIRE(db.transaction_async([&](entityfy::client& tx) {
+        return tx.table<async_item>().insert(async_item{.id = 3, .name = "after rollback", .score = 3}).rows_affected;
+    }).get() == 1);
+    REQUIRE(db.table<async_item>().count() == 2);
+}
+
+TEST_CASE("sqlite client transaction_async cancels a queued transaction before it starts", "[async][client][sqlite]")
+{
+    entityfy::client db{"sqlite://:memory:"};
+    db.migrate<async_item>();
+
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool body_started = false;
+    bool release_body = false;
+
+    // The only worker is busy until the main thread releases the gate, so the
+    // second transaction is still queued when it is cancelled.
+    auto first = db.transaction_async([&](entityfy::client& tx) {
+        {
+            const std::lock_guard lock{gate_mutex};
+            body_started = true;
+        }
+        gate_cv.notify_all();
+
+        {
+            std::unique_lock lock{gate_mutex};
+            gate_cv.wait(lock, [&] { return release_body; });
+        }
+
+        tx.table<async_item>().insert(async_item{.id = 1, .name = "kept", .score = 1});
+    });
+
+    {
+        std::unique_lock lock{gate_mutex};
+        gate_cv.wait(lock, [&] { return body_started; });
+    }
+
+    auto queued = db.transaction_async([&](entityfy::client& tx) {
+        tx.table<async_item>().insert(async_item{.id = 2, .name = "cancelled", .score = 2});
+    });
+    queued.request_cancel();
+
+    {
+        const std::lock_guard lock{gate_mutex};
+        release_body = true;
+    }
+    gate_cv.notify_all();
+
+    first.get();
+    REQUIRE_THROWS_AS(queued.get(), entityfy::task_cancelled);
+
+    // The started transaction still committed; the cancelled one never touched
+    // the connection.
+    REQUIRE(db.table<async_item>().count() == 1);
+    REQUIRE(db.table<async_item>().find(std::int64_t{1}).has_value());
+    REQUIRE_FALSE(db.table<async_item>().find(std::int64_t{2}).has_value());
+}
+
+TEST_CASE("sqlite client waits for an in-flight transaction before it is destroyed", "[async][client][sqlite]")
+{
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto path = (std::filesystem::temp_directory_path() /
+                       ("entityfy_transaction_async_destroy_" + std::to_string(stamp) + ".db"))
+                          .string();
+    std::filesystem::remove(path);
+
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool body_started = false;
+    bool release_body = false;
+    bool body_finished = false;
+
+    {
+        auto db = std::make_unique<entityfy::client>("sqlite://" + path);
+        db->migrate<async_item>();
+
+        auto pending = db->transaction_async([&](entityfy::client& tx) {
+            {
+                const std::lock_guard lock{gate_mutex};
+                body_started = true;
+            }
+            gate_cv.notify_all();
+
+            {
+                std::unique_lock lock{gate_mutex};
+                gate_cv.wait(lock, [&] { return release_body; });
+            }
+
+            tx.table<async_item>().insert(async_item{.id = 1, .name = "committed on destroy", .score = 1});
+
+            {
+                const std::lock_guard lock{gate_mutex};
+                body_finished = true;
+            }
+        });
+
+        {
+            std::unique_lock lock{gate_mutex};
+            gate_cv.wait(lock, [&] { return body_started; });
+        }
+
+        {
+            const std::lock_guard lock{gate_mutex};
+            release_body = true;
+        }
+        gate_cv.notify_all();
+
+        // The worker is still inside the transaction when the client goes away;
+        // its destructor drains and joins before the backend is released.
+        db.reset();
+
+        REQUIRE(body_finished);
+        pending.get();
+    }
+
+    // The committed row survived the client that produced it.
+    {
+        entityfy::client reopened{"sqlite://" + path};
+        REQUIRE(reopened.table<async_item>().count() == 1);
+        REQUIRE(reopened.table<async_item>().find(std::int64_t{1})->name == "committed on destroy");
+    }
+
+    std::filesystem::remove(path);
 }
 
 #endif // ENTITYFY_ENABLE_SQLITE
@@ -153,6 +311,113 @@ TEST_CASE("client async execute, batch and query match the sync path", "[async][
     });
     REQUIRE(synchronous.size() == 3);
     REQUIRE(entityfy::detail::value_to_string(synchronous[2][0]) == "third");
+
+    db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"async_client_items\""});
+}
+
+TEST_CASE("client transaction_async commits on its worker and returns the body value", "[async][client][postgresql]")
+{
+    const auto uri = postgres_uri();
+    if(uri.empty())
+    {
+        SKIP("ENTITYFY_PG_URI is not set");
+    }
+
+    entityfy::client db{uri};
+
+    db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"async_client_items\""});
+    db.migrate<async_item>();
+
+    std::thread::id body_thread;
+    bool same_client = false;
+
+    auto committed = db.transaction_async([&](entityfy::client& tx) {
+        body_thread = std::this_thread::get_id();
+        same_client = &tx == &db;
+
+        const auto inserted = tx.table<async_item>().insert(async_item{.id = 1, .name = "committed", .score = 5});
+        if(inserted.rows_affected != 1)
+        {
+            throw std::runtime_error{"transaction_async insert did not affect one row"};
+        }
+
+        return std::int64_t{21};
+    });
+
+    REQUIRE(committed.get() == 21);
+    REQUIRE(body_thread != std::this_thread::get_id());
+    // The body receives the same client, so it uses the same connection.
+    REQUIRE(same_client);
+
+    REQUIRE(db.table<async_item>().count() == 1);
+    REQUIRE(db.table<async_item>().find(std::int64_t{1})->name == "committed");
+
+    db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"async_client_items\""});
+}
+
+TEST_CASE("client transaction_async rolls back a failing body and rethrows", "[async][client][postgresql]")
+{
+    const auto uri = postgres_uri();
+    if(uri.empty())
+    {
+        SKIP("ENTITYFY_PG_URI is not set");
+    }
+
+    entityfy::client db{uri};
+
+    db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"async_client_items\""});
+    db.migrate<async_item>();
+
+    // A no-argument body: transaction_async mirrors transaction's deduction.
+    auto failing = db.transaction_async([&]() -> std::int64_t {
+        db.table<async_item>().insert(async_item{.id = 2, .name = "rolled back", .score = 6});
+        throw std::runtime_error{"transaction_async body failed"};
+    });
+
+    REQUIRE_THROWS_WITH(failing.get(), "transaction_async body failed");
+    REQUIRE(db.table<async_item>().count() == 0);
+    REQUIRE_FALSE(db.table<async_item>().find(std::int64_t{2}).has_value());
+
+    // The rollback finished before the task published the exception, so the
+    // same client commits the next transaction.
+    REQUIRE(db.transaction_async([&](entityfy::client& tx) {
+        return tx.table<async_item>().insert(async_item{.id = 3, .name = "after rollback", .score = 7}).rows_affected;
+    }).get() == 1);
+    REQUIRE(db.table<async_item>().count() == 1);
+
+    db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"async_client_items\""});
+}
+
+TEST_CASE("client transaction_async surfaces the backend error while the connection is busy", "[async][client][postgresql]")
+{
+    const auto uri = postgres_uri();
+    if(uri.empty())
+    {
+        SKIP("ENTITYFY_PG_URI is not set");
+    }
+
+    entityfy::client db{uri};
+
+    db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"async_client_items\""});
+    db.migrate<async_item>();
+
+    auto slow = db.query_async(entityfy::statement{.sql = "SELECT pg_sleep(0.2)"});
+    auto rejected = db.transaction_async([&](entityfy::client& tx) {
+        tx.table<async_item>().insert(async_item{.id = 4, .name = "rejected", .score = 8});
+    });
+
+    // The job's first statement is BEGIN, which surfaces the backend's own
+    // single-flight logic_error unchanged.
+    REQUIRE_THROWS_WITH(rejected.get(), "connection busy with an async operation");
+
+    REQUIRE(slow.get().size() == 1);
+
+    // The rejected job never entered the transaction, so the depth stayed zero.
+    REQUIRE(db.transaction_async([&](entityfy::client& tx) {
+        return tx.table<async_item>().insert(async_item{.id = 5, .name = "accepted", .score = 9}).rows_affected;
+    }).get() == 1);
+    REQUIRE(db.table<async_item>().count() == 1);
+    REQUIRE_FALSE(db.table<async_item>().find(std::int64_t{4}).has_value());
 
     db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"async_client_items\""});
 }

@@ -1,11 +1,16 @@
 #pragma once
 
 #include <entityfy/db_context.hpp>
+#include <entityfy/executor.hpp>
+#include <entityfy/task.hpp>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -113,6 +118,56 @@ public:
         return lease{this, std::move(created)};
     }
 
+    // Acquires on a lazily created executor of max_size() workers; each job
+    // calls the blocking acquire(), so this is a thread offload, not native
+    // I/O asynchrony. A lease must not outlive the pool (as with acquire()).
+    //
+    // request_cancel() takes effect only before the job starts: the job checks
+    // a shared flag before touching the pool and completes with set_cancelled()
+    // instead. A started acquire is not interrupted, so its task still produces
+    // a lease even when the cancel request arrived meanwhile. A continuation
+    // runs on a pool worker and must not release the last owner of the pool
+    // (see the lifetime rule in entityfy/task.hpp).
+    [[nodiscard]] entityfy::task<lease> acquire_async()
+    {
+        auto pair = entityfy::make_task<lease>();
+        auto completer = std::make_shared<entityfy::task_completer<lease>>(std::move(pair.completer));
+        auto cancelled = std::make_shared<std::atomic<bool>>(false);
+
+        completer->set_cancel_hook([cancelled] { cancelled->store(true, std::memory_order_release); });
+
+        acquire_executor().submit([this, completer, cancelled] {
+            if(cancelled->load(std::memory_order_acquire))
+            {
+                completer->set_cancelled();
+                return;
+            }
+
+            std::exception_ptr   error;
+            std::optional<lease> acquired;
+
+            try
+            {
+                acquired.emplace(acquire());
+            }
+            catch(...)
+            {
+                error = std::current_exception();
+            }
+
+            if(error)
+            {
+                completer->set_exception(std::move(error));
+            }
+            else
+            {
+                completer->set_value(std::move(*acquired));
+            }
+        });
+
+        return std::move(pair.value);
+    }
+
     [[nodiscard]] std::size_t idle_count() const
     {
         std::unique_lock lock{mutex_};
@@ -140,12 +195,31 @@ private:
         available_.notify_one();
     }
 
+    // Creates the worker pool that runs async acquires on first use.
+    [[nodiscard]] entityfy::thread_pool_executor& acquire_executor()
+    {
+        const std::lock_guard lock{executor_mutex_};
+
+        if(!acquire_executor_)
+        {
+            acquire_executor_ = std::make_unique<entityfy::thread_pool_executor>(max_size_, max_size_ * 2);
+        }
+
+        return *acquire_executor_;
+    }
+
     std::string                              uri_;
     std::size_t                              max_size_;
     mutable std::mutex                       mutex_;
     std::condition_variable                  available_;
     std::vector<std::unique_ptr<db_context>> idle_;
     std::size_t                              created_ = 0;
+    std::mutex                               executor_mutex_;
+    // Declared last on purpose: members are destroyed in reverse order, so the
+    // executor joins its workers (draining a pending or in-flight acquire)
+    // before the idle contexts, the mutex and the condition variable it uses
+    // are destroyed.
+    std::unique_ptr<entityfy::thread_pool_executor> acquire_executor_;
 };
 
 } // namespace entityfy

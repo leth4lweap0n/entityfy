@@ -2,18 +2,22 @@
 
 #include <entityfy/detail/backend.hpp>
 #include <entityfy/error.hpp>
+#include <entityfy/executor.hpp>
 #include <entityfy/introspection.hpp>
 #include <entityfy/query.hpp>
 #include <entityfy/schema_validation.hpp>
 #include <entityfy/statement.hpp>
 #include <entityfy/table.hpp>
+#include <entityfy/task.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <concepts>
 #include <cstdint>
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -136,6 +140,82 @@ public:
 
             throw;
         }
+    }
+
+    // Asynchronous transaction: the body runs on the client's own single worker
+    // thread, on this connection, and is handed to the synchronous
+    // transaction() so savepoints, nesting and error classification stay in one
+    // place. The callable may take `client&` or nothing, exactly like
+    // transaction(), and a void body produces task<void>. It is copied into the
+    // job (moved when the argument is an rvalue), so it must be copyable or
+    // movable, and its references must stay valid until the task completes.
+    //
+    // The transaction commits or rolls back before the task publishes its
+    // outcome: an exception from the body reaches task::get() unchanged after
+    // the rollback. request_cancel() before the job starts completes the task
+    // with task_cancelled without touching the connection; a transaction that
+    // already began runs to completion, because a running statement cannot be
+    // interrupted. One statement at a time may use the connection, so a job
+    // that starts while another async operation is in flight fails with the
+    // backend's own logic_error, delivered through the task.
+    //
+    // The worker is created on the first call and lives in the last member, so
+    // destroying the client drains and joins it before the backend is released,
+    // which also means a destroyed client waits for an in-flight transaction.
+    template <typename Function>
+    [[nodiscard]] auto transaction_async(Function&& function)
+    {
+        using callable_type = std::decay_t<Function>;
+        using result_type = std::conditional_t<
+            std::is_invocable_v<callable_type&, client&>,
+            std::invoke_result<callable_type&, client&>,
+            std::invoke_result<callable_type&>
+        >::type;
+
+        auto pair = entityfy::make_task<result_type>();
+        auto completer = std::make_shared<entityfy::task_completer<result_type>>(std::move(pair.completer));
+        auto callable = std::make_shared<callable_type>(std::forward<Function>(function));
+        auto cancelled = std::make_shared<std::atomic<bool>>(false);
+
+        // The hook only flips the shared flag, so a cancellation that arrives
+        // while the job is queued never reaches the client itself.
+        completer->set_cancel_hook([cancelled] { cancelled->store(true, std::memory_order_release); });
+
+        try
+        {
+            transaction_pool().submit([this, completer, callable, cancelled]() {
+                if(cancelled->load(std::memory_order_acquire))
+                {
+                    completer->set_cancelled();
+                    return;
+                }
+
+                try
+                {
+                    if constexpr(std::is_void_v<result_type>)
+                    {
+                        this->transaction(*callable);
+                        completer->set_value();
+                    }
+                    else
+                    {
+                        completer->set_value(this->transaction(*callable));
+                    }
+                }
+                catch(...)
+                {
+                    completer->set_exception(std::current_exception());
+                }
+            });
+        }
+        catch(...)
+        {
+            // The worker rejects work once it is shutting down; the caller still
+            // observes the failure through the task instead of here.
+            completer->set_exception(std::current_exception());
+        }
+
+        return std::move(pair.value);
     }
 
     template <typename Model>
@@ -637,8 +717,38 @@ private:
         }
     }
 
+    // Lazily created single worker behind transaction_async. The state is one
+    // small heap object because a std::mutex member would delete the client's
+    // defaulted move operations; a move only transfers the pointer. Only the
+    // worker and its queue are lazy: a client that never calls
+    // transaction_async never starts a thread.
+    struct transaction_executor_state
+    {
+        std::mutex                            mutex;
+        std::unique_ptr<thread_pool_executor> executor;
+    };
+
+    static constexpr std::size_t transaction_queue_capacity = 16;
+
+    [[nodiscard]] thread_pool_executor& transaction_pool()
+    {
+        const std::lock_guard lock{transaction_executor_->mutex};
+
+        if(!transaction_executor_->executor)
+        {
+            transaction_executor_->executor = std::make_unique<thread_pool_executor>(1, transaction_queue_capacity);
+        }
+
+        return *transaction_executor_->executor;
+    }
+
     std::unique_ptr<detail::backend> backend_;
     std::size_t                      transaction_depth_ = 0;
+
+    // Declared after every member its jobs use: destruction drains the queue,
+    // joins the worker and only then releases the backend, so an in-flight
+    // transaction finishes before the connection disappears.
+    std::unique_ptr<transaction_executor_state> transaction_executor_ = std::make_unique<transaction_executor_state>();
 };
 
 namespace detail

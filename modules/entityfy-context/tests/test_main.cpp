@@ -1627,6 +1627,141 @@ status run_pool_checks()
     return status::passed;
 }
 
+// The pool keeps every context it created for its whole lifetime, so contexts
+// built from "sqlite://:memory:" would not share a schema or rows. The async
+// checks use a real file, which is removed when the scenario ends.
+status run_pool_async_checks()
+{
+    struct temp_database
+    {
+        std::filesystem::path path;
+
+        ~temp_database()
+        {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+    };
+
+    // Two concurrently running copies of this binary (for example the dev and
+    // release suites) must not share one database file.
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::filesystem::path database_path =
+        std::filesystem::temp_directory_path() / ("entityfy_pool_async_" + std::to_string(stamp) + ".db");
+    const temp_database cleanup{database_path};
+
+    entityfy::db_context_pool pool{"sqlite://" + database_path.generic_string(), 2};
+
+    {
+        // The first acquire creates its context on the worker; the second one
+        // reuses it instead of opening a new connection.
+        auto lease = pool.acquire_async().get();
+        require(pool.created_count() == 1, "an async acquire creates its context lazily");
+        lease->migrate<rc_tag>();
+        lease->set<rc_tag>().add(rc_tag{.id = 1, .name = "async pooled"});
+        require(lease->save_changes().inserted == 1, "an async lease saves through its context");
+    }
+
+    require(pool.idle_count() == 1, "an async lease returns its context to the pool");
+
+    {
+        auto lease = pool.acquire_async().get();
+        require(pool.created_count() == 1, "a sequential async acquire reuses the idle context");
+        require(lease->database().table<rc_tag>().count() == 1, "the reused context sees the saved row");
+    }
+
+    {
+        // Two overlapping acquires occupy the whole pool, so a third one waits
+        // for one of the releases to hand a context back.
+        std::optional<entityfy::db_context_pool::lease> first = pool.acquire_async().get();
+        auto second_task = pool.acquire_async();
+        std::optional<entityfy::db_context_pool::lease> second = second_task.get();
+
+        require(pool.created_count() == 2, "the second concurrent async acquire creates the second context");
+        require(first->get() != second->get(), "concurrent async acquires lease distinct contexts");
+
+        auto* released_context = first->get();
+        auto third_task = pool.acquire_async();
+
+        require_not(third_task.is_ready(), "a third async acquire waits while both contexts are leased");
+        require(pool.created_count() == 2, "a waiting async acquire never creates past max_size");
+
+        first.reset();
+
+        auto third = third_task.get();
+        require(third.get() == released_context, "the waiting async acquire takes the released context");
+        require(third->database().table<rc_tag>().count() == 1, "the waited-for lease is usable");
+        require(pool.created_count() == 2, "the waiting async acquire reuses the released context");
+    }
+
+    require(pool.idle_count() == 2, "every async lease so far returns its context");
+
+    {
+        // Cancellation only applies before the job starts. Both worker slots
+        // are busy inside blocking acquire() calls, so the cancelled job stays
+        // queued in the executor and never touches the pool.
+        std::optional<entityfy::db_context_pool::lease> hold_a = pool.acquire();
+        std::optional<entityfy::db_context_pool::lease> hold_b = pool.acquire();
+        require(pool.created_count() == 2, "the cancellation check holds both pooled contexts");
+
+        auto blocked_one = pool.acquire_async();
+        auto blocked_two = pool.acquire_async();
+        auto queued = pool.acquire_async();
+
+        queued.request_cancel();
+        require(queued.is_cancel_requested(), "the cancellation request is recorded on the task");
+
+        hold_a.reset();
+
+        bool cancelled_before_start = false;
+        try
+        {
+            (void)queued.get();
+        }
+        catch(const entityfy::task_cancelled&)
+        {
+            cancelled_before_start = true;
+        }
+
+        require(cancelled_before_start, "an acquire cancelled before its job starts throws task_cancelled");
+        require(pool.created_count() == 2, "the cancelled acquire never created a context");
+
+        hold_b.reset();
+
+        auto first_lease = blocked_one.get();
+        auto second_lease = blocked_two.get();
+
+        auto tags = first_lease->set<rc_tag>();
+        tags.add(rc_tag{.id = 2, .name = "after cancel"});
+        require(first_lease->save_changes().inserted == 1, "the context released past a cancel is usable");
+        require(second_lease->database().table<rc_tag>().count() == 2,
+                "the cancelled acquire left the pooled database intact");
+        require(pool.created_count() == 2, "the started acquires reused the pooled contexts");
+    }
+
+    require(pool.idle_count() == 2, "every async lease returns its context to the pool");
+    require(pool.created_count() == 2, "the pool never exceeded max_size");
+
+    {
+        // A pool destroyed while an acquire is pending joins its worker before
+        // the pooled contexts go away. The task handle is dropped first, so the
+        // lease the worker produces is released back into the pool on that
+        // worker and never outlives it.
+        auto draining_pool = std::make_unique<entityfy::db_context_pool>("sqlite://" + database_path.generic_string(), 1);
+
+        std::optional<entityfy::db_context_pool::lease> held = draining_pool->acquire();
+        auto pending = draining_pool->acquire_async();
+        pending = entityfy::task<entityfy::db_context_pool::lease>{};
+
+        held.reset();
+        draining_pool.reset();
+
+        require(draining_pool == nullptr, "a pool destroyed with a pending acquire drains it");
+    }
+
+    return status::passed;
+}
+
 // Holds a save inside its first logged statement until release() is called, so
 // a test can observe the context while a save is genuinely in flight.
 struct save_hold
@@ -3151,6 +3286,7 @@ int main()
         {"batch", run_batch_checks},
         {"dependency", run_dependency_checks},
         {"pool", run_pool_checks},
+        {"pool_async", run_pool_async_checks},
         {"async", run_async_checks},
         {"async_drain", run_async_drain_checks},
         {"postgres", run_postgres_checks},
