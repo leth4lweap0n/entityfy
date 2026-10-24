@@ -137,7 +137,9 @@ are green.
    Generated-key/token models keep the offload path; the native path does not retry.
 4. **P3 ODBC** — hardened: SQLite and PostgreSQL keep their native drivers, and the SQL Server
    core/migrate providers gained URI/alias parsing, braced credentials, opt-in MARS, isolation
-   levels, typed 1205/Azure errors and MERGE `OUTPUT` keys. Backups remain portable `.sql` dumps.
+   levels, typed 1205/Azure errors and MERGE `OUTPUT` keys. The engine keeps portable `.sql`
+   dumps; `provider::backup_native()` is the opt-in server-side `BACKUP DATABASE ... WITH
+   COPY_ONLY, FORMAT, CHECKSUM`, validated by `RESTORE VERIFYONLY` and `RESTORE HEADERONLY`.
 
 ### Slice status
 
@@ -159,7 +161,7 @@ are green.
 | P2.4 | SQLite thread-offload facade | complete |
 | P2.5 | task-based context save, save gate, async transactions and pool leases | complete; native path for keyed/token-free models, offload fallback |
 | P2.6 | async tests and docs | complete |
-| P3 | ODBC/provider hardening | complete for the documented gaps; native `.bak` intentionally not added |
+| P3 | ODBC/provider hardening | complete for the documented gaps; portable `.sql` remains the engine backup, with opt-in native `backup_native()` |
 
 The other backends stay buildable and tested but get no new features for now (see
 [Deferred](#deferred-other-providers)).
