@@ -256,7 +256,7 @@ closed in the core client/provider:
   close the cursor; the key reader accepts `SQL_SUCCESS_WITH_INFO`.
 - Backups stay portable `.sql` dumps for the engine's rollback/restore path.
   `provider::backup_native()` is the explicit opt-in for a server-side
-  `BACKUP DATABASE ... TO DISK ... WITH COPY_ONLY, INIT, CHECKSUM` when an operator supplies a
+  `BACKUP DATABASE ... TO DISK ... WITH COPY_ONLY, FORMAT, CHECKSUM` when an operator supplies a
   path the SQL Server service account can write; the SQL Server live test verifies the file with
   `RESTORE HEADERONLY`.
 

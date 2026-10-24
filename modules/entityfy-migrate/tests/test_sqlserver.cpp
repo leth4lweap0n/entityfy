@@ -368,6 +368,17 @@ entityfy_test::status test_sqlserver()
     // portable dump the engine uses for its own pre-destructive snapshots.
     require(backend->supports_native_backup(), "sqlserver advertises native backup support");
 
+    bool rejected_empty_path = false;
+    try
+    {
+        backend->backup_native("");
+    }
+    catch(const std::invalid_argument&)
+    {
+        rejected_empty_path = true;
+    }
+    require(rejected_empty_path, "sqlserver rejects an empty native backup path");
+
     // A writable server-side volume is the deployment contract for a native
     // backup; the CI SQL Server service mounts /var/opt/mssql/backup as tmpfs.
     const std::string server_backup_path = "/var/opt/mssql/backup/entityfy_native_backup_test.bak";
