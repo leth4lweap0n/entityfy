@@ -21,7 +21,7 @@
                                  │
                  ┌───────────────┴───────────────┐
                  │ SQLite (sl3)      PostgreSQL   │
-                 │                   (taocpp::pq)  │
+                 │                   (libpq)       │
                  └───────────────────────────────┘
 ```
 
@@ -47,12 +47,12 @@ The entire library is consolidated under a single root namespace: `entityfy`.
 
 ## Dependency management
 
-All third-party dependencies are fetched at the top level in `cmake/Dependencies.cmake`:
+Third-party dependencies are resolved at the top level in `cmake/Dependencies.cmake`:
 
 | Dependency | Usage |
 |---|---|
 | `sl3` | The SQLite backend and the migration provider use the **same** SQLite copy |
-| `taocpp::pq` | PostgreSQL backend (libpq) |
+| `libpq` (`PostgreSQL::PostgreSQL`) | PostgreSQL backend; system package found by CMake |
 | `nlohmann_json` | Migration snapshot/script JSON |
 | `Catch2` | Core tests |
 | `spdlog` | Core examples |
