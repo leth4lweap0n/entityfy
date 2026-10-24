@@ -302,6 +302,21 @@ public:
             throw std::runtime_error{"entityfy/migrate:sqlserver: `" + std::string{sql} + "` failed: " + message};
         }
 
+        // SQL Server can return the first result of a long-running command
+        // (BACKUP DATABASE is the one we rely on) before the command has
+        // completely finished. Draining every result keeps exec synchronous:
+        // a backup is readable as soon as this method returns.
+        for(SQLRETURN more = SQLMoreResults(statement); more != SQL_NO_DATA;
+            more = SQLMoreResults(statement))
+        {
+            if(!succeeded(more))
+            {
+                const auto message = diagnostics(SQL_HANDLE_STMT, statement);
+                SQLFreeHandle(SQL_HANDLE_STMT, statement);
+                throw std::runtime_error{"entityfy/migrate:sqlserver: `" + std::string{sql} + "` failed: " + message};
+            }
+        }
+
         SQLFreeHandle(SQL_HANDLE_STMT, statement);
     }
 
