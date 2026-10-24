@@ -219,7 +219,7 @@ jobs:
 
       - name: Test
         env:
-          ENTITYFY_SQLSERVER_URI: mssql://sa:Str0ng%3BPassw0rd@mssql:1433/entityfy_test?mars=1
+          ENTITYFY_SQLSERVER_URI: mssql://sa:Str0ng%3BPassw0rd@mssql:1433/entityfy_test
           ENTITYFY_REQUIRE_SQLSERVER: "1"
         run: ctest --test-dir build --output-on-failure --no-tests=error
 
