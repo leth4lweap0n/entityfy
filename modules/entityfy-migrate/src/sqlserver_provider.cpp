@@ -891,18 +891,23 @@ public:
                 }
             }
 
+            // SQL Server's INFORMATION_SCHEMA.KEY_COLUMN_USAGE has no
+            // POSITION_IN_UNIQUE_CONSTRAINT column (that is MySQL); the sys
+            // catalog pairs each local column with its referenced column.
             const auto foreign_keys = connection_.query_params(
-                "SELECT k.CONSTRAINT_NAME, k.COLUMN_NAME, rk.TABLE_NAME, rk.COLUMN_NAME, "
-                "rc.UPDATE_RULE, rc.DELETE_RULE "
-                "FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE k "
-                "JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc "
-                "ON rc.CONSTRAINT_NAME = k.CONSTRAINT_NAME AND rc.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA "
-                "JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE rk "
-                "ON rk.CONSTRAINT_NAME = rc.UNIQUE_CONSTRAINT_NAME "
-                "AND rk.CONSTRAINT_SCHEMA = rc.UNIQUE_CONSTRAINT_SCHEMA "
-                "AND rk.ORDINAL_POSITION = k.POSITION_IN_UNIQUE_CONSTRAINT "
-                "WHERE k.TABLE_NAME = ? AND k.TABLE_SCHEMA = SCHEMA_NAME() "
-                "ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
+                "SELECT fk.name, pc.name, rt.name, rc.name, "
+                "REPLACE(fk.update_referential_action_desc, '_', ' '), "
+                "REPLACE(fk.delete_referential_action_desc, '_', ' ') "
+                "FROM sys.foreign_keys fk "
+                "JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id "
+                "JOIN sys.tables pt ON pt.object_id = fk.parent_object_id "
+                "JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id "
+                "AND pc.column_id = fkc.parent_column_id "
+                "JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id "
+                "JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id "
+                "AND rc.column_id = fkc.referenced_column_id "
+                "WHERE pt.name = ? AND SCHEMA_NAME(pt.schema_id) = SCHEMA_NAME() "
+                "ORDER BY fk.name, fkc.constraint_column_id",
                 {current.name});
 
             std::vector<std::pair<std::string, std::size_t>> key_indices;

@@ -237,6 +237,7 @@ TEST_CASE("sql server statements use the T-SQL dialect", "[sqlserver][statement]
     REQUIRE(upsert.sql.find("OUTPUT INSERTED", output + 1) == std::string::npos);
     REQUIRE(upsert.sql.back() == ';');
     REQUIRE(output < upsert.sql.size() - 1);
+    REQUIRE(upsert.sql.find(") OUTPUT INSERTED.\"id\";") != std::string::npos);
 
     // The OUTPUT sits inside the WHEN NOT MATCHED clause, not before it.
     REQUIRE(upsert.sql.find("WHEN NOT MATCHED THEN INSERT") < output);
@@ -380,7 +381,8 @@ TEST_CASE("sql server transaction isolation and savepoints", "[sqlserver][transa
                                        "WHEN 2 THEN 'READ COMMITTED' "
                                        "WHEN 3 THEN 'REPEATABLE READ' "
                                        "WHEN 4 THEN 'SERIALIZABLE' "
-                                       "WHEN 5 THEN 'SNAPSHOT' END AS NVARCHAR(20))"});
+                                       "WHEN 5 THEN 'SNAPSHOT' END AS NVARCHAR(20)) "
+                                       "FROM sys.dm_exec_sessions WHERE session_id = @@SPID"});
         return std::get<std::string>(rows.front().front());
     };
 

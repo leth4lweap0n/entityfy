@@ -845,6 +845,8 @@ template <typename Model>
             output.sql.append(detail::quote_identifier(merge_inserts[index].name));
         }
 
+        output.sql.push_back(')');
+
         // OUTPUT belongs to the INSERT clause of the MERGE and has to precede
         // the statement terminator. A MERGE that only updated still returns the
         // existing key, so last_insert_id is the row's key either way.
