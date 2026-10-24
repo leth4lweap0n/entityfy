@@ -114,6 +114,15 @@ jobs:
           ENTITYFY_REQUIRE_PG: "1"
         run: ctest --test-dir build --output-on-failure --no-tests=error
 
+      - name: Verify the installed package
+        run: |
+          cmake --install build --prefix "$PWD/build/install"
+          cmake -S cmake/package-consumer -B build/package-consumer -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PWD/build/install"
+          cmake --build build/package-consumer --parallel "$(nproc)"
+          ./build/package-consumer/entityfy_package_consumer
+
   linux-mysql:
     name: linux / gcc 16 / mysql
     runs-on: ubuntu-24.04
@@ -164,6 +173,15 @@ jobs:
           ENTITYFY_MYSQL_URI: mysql://root:secret@mariadb:3306/entityfy_test
           ENTITYFY_REQUIRE_MYSQL: "1"
         run: ctest --test-dir build --output-on-failure --no-tests=error
+
+      - name: Verify the installed package
+        run: |
+          cmake --install build --prefix "$PWD/build/install"
+          cmake -S cmake/package-consumer -B build/package-consumer -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PWD/build/install"
+          cmake --build build/package-consumer --parallel "$(nproc)"
+          ./build/package-consumer/entityfy_package_consumer
 
   linux-sqlserver:
     name: linux / gcc 16 / sqlserver
@@ -233,6 +251,15 @@ jobs:
           ENTITYFY_REQUIRE_SQLSERVER: "1"
           ENTITYFY_SQLSERVER_BACKUP_DIR: /var/opt/mssql/backup
         run: ctest --test-dir build --output-on-failure --no-tests=error
+
+      - name: Verify the installed package
+        run: |
+          cmake --install build --prefix "$PWD/build/install"
+          cmake -S cmake/package-consumer -B build/package-consumer -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PWD/build/install"
+          cmake --build build/package-consumer --parallel "$(nproc)"
+          ./build/package-consumer/entityfy_package_consumer
 
   windows-sqlite:
     name: windows / gcc 16 / sqlite
