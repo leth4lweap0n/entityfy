@@ -24,13 +24,14 @@ endif()
 
 add_library(entityfy_migrate STATIC ${entityfy_migrate_sources})
 add_library(entityfy::migrate ALIAS entityfy_migrate)
+set_target_properties(entityfy_migrate PROPERTIES EXPORT_NAME migrate)
 
 target_include_directories(entityfy_migrate
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(entityfy_migrate
-    PUBLIC entityfy::core
-    PRIVATE nlohmann_json::nlohmann_json
+target_link_libraries(entityfy_migrate PUBLIC entityfy::core)
+target_include_directories(entityfy_migrate PRIVATE
+    $<BUILD_INTERFACE:${nlohmann_json_SOURCE_DIR}/include>
 )
 target_compile_options(entityfy_migrate
     PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-but-set-variable -Wno-unused-parameter
@@ -42,7 +43,9 @@ if(ENTITYFY_ENABLE_SQLITE)
 endif()
 
 if(ENTITYFY_ENABLE_MYSQL)
-    target_link_libraries(entityfy_migrate PRIVATE entityfy::mysql)
+    target_link_libraries(entityfy_migrate PRIVATE
+        $<BUILD_INTERFACE:entityfy::mysql>
+        $<INSTALL_INTERFACE:entityfy::mysql>)
     target_compile_definitions(entityfy_migrate PUBLIC ENTITYFY_ENABLE_MYSQL)
 endif()
 

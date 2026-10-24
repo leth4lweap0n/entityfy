@@ -22,6 +22,7 @@ endif()
 
 add_library(entityfy_core STATIC ${core_sources})
 add_library(entityfy::core ALIAS entityfy_core)
+set_target_properties(entityfy_core PROPERTIES EXPORT_NAME core)
 
 target_include_directories(entityfy_core
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
@@ -43,7 +44,9 @@ if(ENTITYFY_ENABLE_POSTGRESQL)
 endif()
 
 if(ENTITYFY_ENABLE_MYSQL)
-    target_link_libraries(entityfy_core PRIVATE entityfy::mysql)
+    target_link_libraries(entityfy_core PRIVATE
+        $<BUILD_INTERFACE:entityfy::mysql>
+        $<INSTALL_INTERFACE:entityfy::mysql>)
     target_compile_definitions(entityfy_core PUBLIC ENTITYFY_ENABLE_MYSQL)
 endif()
 

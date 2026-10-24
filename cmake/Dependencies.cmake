@@ -22,7 +22,11 @@ if(ENTITYFY_ENABLE_SQLITE)
 
     # Shared access point for the embedded SQLite: headers and symbols.
     add_library(entityfy_sqlite INTERFACE)
-    target_link_libraries(entityfy_sqlite INTERFACE sl3)
+    set_target_properties(entityfy_sqlite PROPERTIES EXPORT_NAME sqlite)
+    target_link_libraries(entityfy_sqlite INTERFACE
+        $<BUILD_INTERFACE:sl3>
+        $<INSTALL_INTERFACE:a4z::sl3>
+    )
     add_library(entityfy::sqlite ALIAS entityfy_sqlite)
 endif()
 

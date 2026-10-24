@@ -399,10 +399,10 @@ GCC 16.2 fails to link Debug binaries against the static libstdc++ (a duplicate
 `std::runtime_error` definition that is only pulled in without optimization), so Debug binaries use
 the MinGW DLLs and need `<mingw>/bin` on `PATH` to run.
 
-CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs four parallel jobs in the
-official `gcc:16` container - SQLite, PostgreSQL 18, MariaDB 11.4 and SQL Server 2022 - and each
-job asserts that its backend was enabled before building. A skipped PostgreSQL, MySQL or SQL
-Server run is a failure there (see the `ENTITYFY_REQUIRE_*` variables).
+CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs five parallel jobs - SQLite,
+PostgreSQL 18, MariaDB 11.4, SQL Server 2022 (in the official `gcc:16` container) and Windows
+SQLite - and each backend job asserts that its backend was enabled before building. A skipped
+PostgreSQL, MySQL or SQL Server run is a failure there (see the `ENTITYFY_REQUIRE_*` variables).
 
 ```bash
 cmake --preset release
@@ -423,8 +423,30 @@ Options: `ENTITYFY_ENABLE_SQLITE`, `ENTITYFY_ENABLE_POSTGRESQL`, `ENTITYFY_ENABL
 
 ### Using it in your project
 
-There is no `install()`/`find_package()` export yet, so consume the sources as a subdirectory.
-This is the exact setup that was built and run while writing this section:
+Install the library once, then consume the exported targets:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DENTITYFY_BUILD_TESTS=OFF -DENTITYFY_BUILD_EXAMPLES=OFF -DENTITYFY_BUILD_DEMO=OFF \
+  -DCMAKE_INSTALL_PREFIX=<prefix>
+cmake --build build
+cmake --install build
+```
+
+```cmake
+find_package(entityfy CONFIG REQUIRED)
+
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE entityfy::core)   # or entityfy::db_context, entityfy::migrate
+```
+
+Put `<prefix>` on `CMAKE_PREFIX_PATH`, or pass `-DCMAKE_PREFIX_PATH=<prefix>` when configuring the
+consumer. The installed config finds the enabled backend dependencies: `sl3` for SQLite, the
+system `PostgreSQL` package for libpq, `ODBC` for SQL Server, and MariaDB Connector/C for MySQL.
+The `ENTITYFY_ENABLE_*` compile definitions and the C++26/`-freflection` compile feature travel
+with the exported targets.
+
+The source tree still supports `add_subdirectory` and `FetchContent_MakeAvailable`:
 
 ```cmake
 cmake_minimum_required(VERSION 3.30)
@@ -441,21 +463,23 @@ add_executable(app main.cpp)
 target_link_libraries(app PRIVATE entityfy::core)          # or entityfy::db_context, entityfy::migrate
 ```
 
-`add_subdirectory` and `FetchContent_MakeAvailable` both work - both were built and run while
-writing this section. The dependencies are fetched during the first configure, so that step needs
-network access; which ones are pulled follows the options:
+Both paths are covered in CI: the SQLite job installs the package and builds
+`cmake/package-consumer` with `find_package(entityfy CONFIG REQUIRED)`.
+
+The dependencies are fetched during the first configure, so that step needs network access; which
+ones are pulled follows the options:
 
 | Option | Fetches |
 |---|---|
 | `ENTITYFY_ENABLE_SQLITE=ON` (default) | `sl3` (with an embedded SQLite) |
-| always | `nlohmann_json` |
-| `ENTITYFY_ENABLE_POSTGRESQL=ON` and libpq found | `taocpp::pq` |
+| always | `nlohmann_json` (migration implementation only; not part of the consumer link interface) |
+| `ENTITYFY_ENABLE_POSTGRESQL=ON` and libpq found | nothing; uses the system libpq |
 | `ENTITYFY_BUILD_TESTS=ON` (default) | `Catch2` |
 | `ENTITYFY_BUILD_EXAMPLES=ON` (default) | `spdlog` |
 
-So the four `OFF` switches above fetch only `sl3` and `nlohmann_json`. The `-freflection` flag and
-the C++26 standard level travel with the `entityfy::core` interface, so the consumer does not set
-them.
+With tests, examples, demo and the non-SQLite backends off, configure fetches only `sl3` and
+`nlohmann_json`. The `-freflection` flag and the C++26 standard level travel with the
+`entityfy::core` interface, so the consumer does not set them.
 
 Per-target use:
 
@@ -471,7 +495,7 @@ Per-target use:
 entityfy/
 ├── CMakeLists.txt              superbuild
 ├── CMakePresets.json           dev / release / release-no-pg
-├── cmake/Dependencies.cmake    sl3, taocpp::pq, nlohmann_json, Catch2, spdlog
+├── cmake/Dependencies.cmake    sl3, nlohmann_json, Catch2, spdlog
 ├── docs/                       architecture, core, context, migration, benchmark, roadmap
 └── modules/
     ├── entityfy-core/
@@ -503,8 +527,6 @@ through `sl3`, and there is no second copy of SQLite.
   server-side `BACKUP DATABASE` for operators that supply a writable server path.
 - Row reading is costly through `vector<vector<sql_value>>`; single-row reads need a separate
   path.
-- No `install()` / `find_package()` export yet: consume the project with `add_subdirectory` or
-  `FetchContent`.
 
 Roadmap: [docs/roadmap.md](docs/roadmap.md).
 

@@ -70,3 +70,55 @@ add_subdirectory(modules/entityfy-context)
 if(ENTITYFY_BUILD_DEMO)
     add_subdirectory(modules/entityfy-demo)
 endif()
+
+# ---------------------------------------------------------------------------
+# Installation
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+install(
+    TARGETS entityfy_core entityfy_context entityfy_migrate
+    EXPORT entityfyTargets
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+)
+
+if(TARGET entityfy_sqlite)
+    install(TARGETS entityfy_sqlite EXPORT entityfyTargets)
+endif()
+
+install(
+    DIRECTORY
+        modules/entityfy-core/include/
+        modules/entityfy-context/include/
+        modules/entityfy-migrate/include/
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+)
+
+install(
+    EXPORT entityfyTargets
+    FILE entityfyTargets.cmake
+    NAMESPACE entityfy::
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/entityfy"
+)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/entityfyConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/entityfyConfig.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/entityfy"
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/entityfyConfigVersion.cmake"
+    VERSION "${PROJECT_VERSION}"
+    COMPATIBILITY SameMajorVersion
+)
+
+install(
+    FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/entityfyConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/entityfyConfigVersion.cmake"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/entityfy"
+)

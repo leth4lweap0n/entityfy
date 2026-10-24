@@ -55,6 +55,15 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --no-tests=error
 
+      - name: Verify the installed package
+        run: |
+          cmake --install build --prefix "$PWD/build/install"
+          cmake -S cmake/package-consumer -B build/package-consumer -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PWD/build/install"
+          cmake --build build/package-consumer --parallel "$(nproc)"
+          ./build/package-consumer/entityfy_package_consumer
+
   linux-postgresql:
     name: linux / gcc 16 / postgresql
     runs-on: ubuntu-24.04

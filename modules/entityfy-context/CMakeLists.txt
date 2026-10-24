@@ -2,6 +2,7 @@
 
 add_library(entityfy_context STATIC src/db_context.cpp)
 add_library(entityfy::db_context ALIAS entityfy_context)
+set_target_properties(entityfy_context PROPERTIES EXPORT_NAME db_context)
 
 target_include_directories(entityfy_context
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>

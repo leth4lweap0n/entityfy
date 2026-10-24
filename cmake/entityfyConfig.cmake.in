@@ -1,0 +1,40 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+if(@ENTITYFY_ENABLE_SQLITE@)
+    find_dependency(Threads)
+    find_dependency(sl3 CONFIG)
+endif()
+
+if(@ENTITYFY_ENABLE_POSTGRESQL@)
+    find_dependency(PostgreSQL)
+endif()
+
+if(@ENTITYFY_ENABLE_MYSQL@)
+    find_path(ENTITYFY_MYSQL_INCLUDE_DIR NAMES mysql.h PATH_SUFFIXES include include/mariadb)
+    find_library(ENTITYFY_MYSQL_LIBRARY NAMES mariadb libmariadb mysqlclient PATH_SUFFIXES lib lib/mariadb)
+
+    if(NOT ENTITYFY_MYSQL_INCLUDE_DIR OR NOT ENTITYFY_MYSQL_LIBRARY)
+        set(entityfy_FOUND FALSE)
+        set(entityfy_NOT_FOUND_MESSAGE
+            "entityfy was built with MySQL/MariaDB support, but the Connector/C headers or library were not found")
+        return()
+    endif()
+
+    if(NOT TARGET entityfy::mysql)
+        add_library(entityfy::mysql UNKNOWN IMPORTED)
+        set_target_properties(entityfy::mysql PROPERTIES
+            IMPORTED_LOCATION "${ENTITYFY_MYSQL_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${ENTITYFY_MYSQL_INCLUDE_DIR}"
+        )
+    endif()
+endif()
+
+if(@ENTITYFY_ENABLE_SQLSERVER@)
+    find_dependency(ODBC)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/entityfyTargets.cmake")
+
+check_required_components(entityfy)
