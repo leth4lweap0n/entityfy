@@ -59,8 +59,8 @@ void require_uri_wiring()
     require(tuned_text.find("Encrypt=no") != std::string::npos, "sqlserver migrate applies ?encrypt=0");
     require(tuned_text.find("TrustServerCertificate=no") != std::string::npos,
             "sqlserver migrate applies ?trust_server_certificate=0");
-    require(tuned_text.find("MARS_Connection") == std::string::npos,
-            "sqlserver migrate enables MARS as a connection attribute, not a connection-string keyword");
+    require(tuned_text.find("MARS_Connection=yes") != std::string::npos,
+            "sqlserver migrate enables MARS through the driver connection keyword");
 
     // A database is never defaulted and a non-sqlserver scheme is rejected, so
     // a typo surfaces as a parse error rather than aimless connection failure.

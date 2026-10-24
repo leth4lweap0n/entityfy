@@ -349,25 +349,44 @@ auto pending = ctx.save_changes_async();   // entityfy::task<save_result>
 const auto result = pending.get();
 ```
 
-`save_changes_async()` runs the same save work on a lazily created single-worker executor and
-returns a task; retry delays elapse on that worker. Retry attempts and classification are
-unchanged. A **save gate** rejects overlapping saves: while any save is in flight, `save_changes()`
-and `save_changes_async()` throw `std::logic_error("a save is already in progress")` instead of
+`save_changes_async()` selects a strategy (`automatic` by default):
+
+| Strategy | Behaviour |
+|---|---|
+| `automatic` | Native statements when the backend reports `async_capability::native` and every tracked model is native-capable; otherwise the single-worker offload. |
+| `offload` | Always the lazily created single-worker executor; retry delays elapse there. |
+| `native` | Refuses to start with `std::logic_error` when native support is unavailable. |
+
+```cpp
+ctx.set_async_save_strategy(entityfy::async_save_strategy::native);
+auto pending = ctx.save_changes_async();
+const auto result = pending.get();
+```
+
+The native path is currently limited to models **without a generated primary key and without a
+persisted concurrency token** (PostgreSQL is the backend with native async). It issues `BEGIN`,
+the INSERT/UPDATE/DELETE statements and `COMMIT` through `client::execute_async`; a failure runs
+`ROLLBACK`, restores the tracker and propagates the error. It does **not** retry: select
+`offload` (or the synchronous `save_changes()`) when `retry_policy` must apply. `save_changes_once_async()`
+is the public one-shot native entry point; it throws when native support is unavailable.
+
+A **save gate** rejects overlapping saves: while any save is in flight, `save_changes()` and
+`save_changes_async()` throw `std::logic_error("a save is already in progress")` instead of
 queueing. The gate is released on success, failure and submit errors, so the context is usable
-again afterwards. Destroying a context with an in-flight async save drains the job before the
-tracked sets and the connection are destroyed.
+again afterwards. Destroying a context with an in-flight native save waits for the chain to
+finish; the counter is released after the last context access and before the returned task
+completes.
 
 **Precondition:** until the returned task completes, the tracked sets must not be mutated and the
-context must not be used from another thread - the save worker reads the tracker and the
-connection. **Cancellation:** the task installs no cancel hook, so `request_cancel()` does not
-stop a save; the worker completes it and `get()` still returns the `save_result` (or rethrows the
-exception the save raised). A continuation runs on the save worker, so it must not release the
-last owner of the context (see the lifetime rule in `entityfy/task.hpp`).
+context must not be used from another thread. **Cancellation:** the task installs no cancel hook,
+so `request_cancel()` does not stop a save; `get()` still returns the `save_result` (or rethrows
+the exception the save raised).
 
-**Honest limit:** the context save path is a thread offload; the SQLite driver is serialized on
-one connection, and the PostgreSQL backend's native async path is exposed through the client
-(`execute_async`/`query_async`) rather than through `save_changes_async` in this phase. The
-context cannot be used from other threads while a save is in progress (the same rule as EF Core).
+**Measured trade-off (PostgreSQL, local server, 2.000 explicit-key rows):** the offload path
+batches inserts and reaches ~275.000 rows/s; the current native path executes one statement per
+row and reaches ~22.000 rows/s. Native wins only when the caller needs the connection's reactor
+without occupying a worker thread; bulk saves remain faster on the offload path. See
+[benchmarks.md](benchmarks.md#async-save-offload-vs-native).
 
 ## Context pool
 

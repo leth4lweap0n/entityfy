@@ -220,13 +220,15 @@ single-context by definition.
 
 ### P2.5 Context and pool
 
-**Status:** implemented (commits 6a60d8d, 227dc13): `save_changes_async` returns a task on a lazy single-worker executor, the save gate rejects overlap, a destroyed context drains, and `db_context_pool::acquire_async` returns a task-backed lease with queued acquires. Native `saveable` async internals remain a performance follow-up; the public task API is unchanged.
+**Status:** implemented (commits 6a60d8d, 227dc13, 5686bb3): `save_changes_async` returns a task;
+`automatic` uses native `execute_async` statements on PostgreSQL for models without a generated
+key or concurrency token, and falls back to a lazy single-worker executor. `save_changes_once_async`
+is the native one-shot; the save gate rejects overlap; a destroyed context drains both paths; and
+`db_context_pool::acquire_async` returns a task-backed lease with queued acquires.
 
-`save_changes_async` returns `task<save_result>`; retry delays await the executor instead of
-blocking a thread; a save gate rejects concurrent sync/async saves. Phase 1 lands the offload
-path, phase 2 the native path (`saveable` async methods, `save_changes_once_async`,
-`transaction_async`). `db_context_pool` gains `acquire_async` and discards broken connections
-after timeout/cancel.
+The native path does not retry: `retry_policy` applies to synchronous saves and to the offload
+path. Generated-key and token models stay offload-only. The measured bulk trade-off is documented
+in `docs/benchmarks.md`; native currently executes one statement per row, while offload batches.
 
 ### P2.6 Tests and docs
 
@@ -238,16 +240,24 @@ constant; single-in-flight, cancellation, retry classification, pipeline failure
 SQLite facade serialization and async pool behavior are covered. Docs state the capability
 difference and the single-owner rule.
 
-## Phase 3 — ODBC decision (no code)
+## Phase 3 — ODBC/provider hardening
 
-**Decision:** no additional ODBC requirement for this work. SQLite and PostgreSQL keep their
-native drivers (libsqlite3/sl3 and libpq); ODBC remains only the SQL Server transport, which is
-frozen. Its known gaps are
-connection-string escaping, the useless `mssql://` alias, `BEGIN`-based transactions without
-isolation/MARS attributes, native-code-only error classification (1205 deadlock and Azure
-transient codes missing), `OUTPUT`/`MERGE` key limitations, and SQL-dump-only backups. Finishing
-that provider is a separate project behind the Deferred section; it must not be pulled into the
-SQLite/PostgreSQL work.
+**Decision:** no additional ODBC requirement. SQLite and PostgreSQL keep their native drivers
+(libsqlite3/sl3 and libpq); ODBC remains only the SQL Server transport. The named gaps are now
+closed in the core client/provider:
+
+- `sqlserver://` and `mssql://` are both parsed; user/password/database are percent-decoded and
+  sent as braced ODBC values, so `;`, `=` and `{`/`}` in a password cannot inject a keyword.
+- MARS is opt-in with `?mars=1`; the client emits `SET TRANSACTION ISOLATION LEVEL <level>` for
+  the five SQL Server levels before the outer `BEGIN`.
+- Native 1205 maps to `deadlock_detected`, 1222 and the Azure transient family to
+  `transient_error`, 18456/4060 to `connection_error`, and 2601/2627/547/515 keep their typed
+  constraint errors.
+- `MERGE` emits one `OUTPUT INSERTED.<key>` for a single generated key; early `query_each` exits
+  close the cursor; the key reader accepts `SQL_SUCCESS_WITH_INFO`.
+- Backups remain a portable logical `.sql` dump. `BACKUP DATABASE ... TO DISK` depends on a
+  server-side path and bulk-admin permissions, so it is intentionally not used; the engine's
+  rollback/restore path relies on the portable dump.
 
 ## Verification
 

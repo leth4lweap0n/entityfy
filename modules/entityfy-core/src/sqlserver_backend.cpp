@@ -967,12 +967,6 @@ public:
     }
 
 private:
-    // msodbcsql.h is not available on Linux, so the MARS attribute is restated
-    // here. The values come from the driver SDK: SQL_COPT_SS_BASE is 1200 and
-    // MARS_ENABLED is BASE+24; SQL_MARS_ENABLED_YES is 1L.
-    static constexpr SQLINTEGER sql_copt_ss_mars_enabled = 1200 + 24;
-    static constexpr SQLINTEGER sql_mars_enabled_yes = 1;
-
     void connect(const sqlserver_uri_options& options)
     {
         const auto connection_string = sqlserver_connection_string(options);
@@ -996,33 +990,6 @@ private:
             // A failed login or an unreachable server is a connection problem,
             // never a statement problem, so it has no SQL text to carry.
             throw connection_error{"entityfy SQL Server connection failed: " + detail.message};
-        }
-
-        enable_mars(options.mars);
-    }
-
-    // MARS is a connection attribute rather than a connection-string keyword so
-    // that a driver without support reports a specific failure naming MARS
-    // instead of an unexplained connect error.
-    void enable_mars(bool enabled)
-    {
-        if(!enabled)
-        {
-            return;
-        }
-
-        if(!succeeded(SQLSetConnectAttrW(
-               connection_,
-               sql_copt_ss_mars_enabled,
-               reinterpret_cast<SQLPOINTER>(sql_mars_enabled_yes),
-               SQL_IS_INTEGER
-           )))
-        {
-            const auto detail = describe_sqlserver_error(SQL_HANDLE_DBC, connection_);
-            throw connection_error{
-                "entityfy SQL Server connection failed: the driver rejected MARS (Multiple Active Result Sets): " +
-                detail.message
-            };
         }
     }
 

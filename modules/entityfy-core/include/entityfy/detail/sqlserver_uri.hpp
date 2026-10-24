@@ -332,10 +332,13 @@ inline void apply_sqlserver_query_option(std::string_view pair, sqlserver_uri_op
     output.append(options.encrypt ? ";Encrypt=yes" : ";Encrypt=no");
     output.append(options.trust_server_certificate ? ";TrustServerCertificate=yes" : ";TrustServerCertificate=no");
 
-    // MARS is enabled with SQLSetConnectAttrW after the connection exists (see
-    // sqlserver_backend), not through MARS_Connection=yes: an attribute the
-    // driver rejects then surfaces as a typed connection error naming MARS
-    // instead of a generic failed connection string.
+    // SQL_COPT_SS_MARS_ENABLED is only accepted before the connection is
+    // established; the portable equivalent is the driver's connection keyword.
+    if(options.mars)
+    {
+        output.append(";MARS_Connection=yes");
+    }
+
     return output;
 }
 

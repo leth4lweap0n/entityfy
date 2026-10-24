@@ -267,12 +267,14 @@ returning `false` stops further consumer calls, not the network read.
 - Bulk operations: `query().remove_all()`, `query().assign(...).update_all()`.
 - `db_context_pool`: lease-based context reuse; when the lease is released the change tracker is
   cleared.
-- `save_changes_async()`: returns `entityfy::task<save_result>` and runs the save on a lazily
-  created single-worker executor; retry delays elapse there. A save gate rejects overlapping
-  sync/async saves with `logic_error`, and destroying a context drains an in-flight save. The
-  tracked sets must stay untouched until the task completes; cancelling the task does not stop
-  the save, and `get()` still returns its result. This is a thread offload, not native I/O
-  asynchrony.
+- `save_changes_async()`: returns `entityfy::task<save_result>`. The default `automatic` strategy
+  uses native `BEGIN`/`INSERT`/`UPDATE`/`DELETE`/`COMMIT` through `execute_async` on PostgreSQL
+  when the tracked models have no generated key or concurrency token; otherwise it runs the save
+  on a single-worker executor. `set_async_save_strategy(offload|native)` pins a path, and
+  `save_changes_once_async()` is the native one-shot. The native path does not retry. A save gate
+  rejects overlapping saves with `logic_error`, and destroying a context drains an in-flight
+  save. The tracked sets must stay untouched until the task completes; cancelling the task does
+  not stop the save, and `get()` still returns its result.
 
 ## entityfy-migrate
 
@@ -483,7 +485,7 @@ through `sl3`, and there is no second copy of SQLite.
 
 ## Limitations
 
-- `save_changes_async()` is a thread offload, not I/O asynchrony.
+- The native async save path is limited to models without a generated key or concurrency token; generated-key and token models stay on the offload path.
 - The core does not perform dirty-column updates; partial UPDATE lives in the context layer.
 - TPH inheritance supports single-table hierarchies (`migrate_tph`, discriminator-scoped CRUD,
   `find_all_types`), but no tracked or eager-loaded polymorphic reads, and a hierarchy has one base
@@ -494,7 +496,10 @@ through `sl3`, and there is no second copy of SQLite.
   providers write a SQL dump (`CREATE TABLE` + `INSERT`) instead of a native dump, which can take
   a while on large databases; `[[= entityfy::json]]` maps to `LONGTEXT` on MySQL because MariaDB
   reports its JSON alias that way; the SQL Server migrate provider rebuilds dependent indexes
-  around `ALTER COLUMN` and refuses primary-key/identity changes.
+  around `ALTER COLUMN` and refuses primary-key/identity changes. SQL Server accepts `mssql://`
+  and `sqlserver://`, escapes braced credentials, supports opt-in MARS (`?mars=1`) and the five
+  isolation levels, and maps 1205/Azure-transient native errors to typed retryable errors; its
+  backup remains a portable `.sql` dump because `BACKUP DATABASE` needs a server-side path.
 - Row reading is costly through `vector<vector<sql_value>>`; single-row reads need a separate
   path.
 - No `install()` / `find_package()` export yet: consume the project with `add_subdirectory` or

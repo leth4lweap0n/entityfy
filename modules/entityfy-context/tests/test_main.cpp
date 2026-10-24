@@ -2211,6 +2211,11 @@ status run_postgres_async_checks()
         require(as_integer(ctx.query("SELECT COUNT(*) FROM \"pg_async_tags\"").front().front()) == 2,
                 "pg native async recovered rows persisted");
 
+        ctx.set_async_save_strategy(entityfy::async_save_strategy::offload);
+        tags.add(pg_async_tag{.id = 20, .name = "offload"});
+        require(ctx.save_changes_async().get().inserted == 1, "pg explicit offload strategy still saves");
+        require(!ctx.last_save_used_native_async(), "pg explicit offload strategy does not claim native");
+
         (void)a;
         ctx.execute("DROP TABLE IF EXISTS \"pg_async_tags\" CASCADE");
     }

@@ -272,6 +272,23 @@ Auto detection stays the default; EF Core's `DetectChanges` compares for the sam
 6. There is **no** dirty-column (partial) update in core: core keeps no snapshot, and this is the
    context layer's responsibility. `table_client::update` writes all columns.
 
+## Async save: offload vs native
+
+`run_async_save_bench` in the same harness compares `save_changes_async` strategies on PostgreSQL
+with an explicit-key model (no generated key, no token), 2.000 rows, median of the harness run:
+
+| Workload | offload | native | native/offload |
+|---|---:|---:|---:|
+| bulk insert (one save, 2.000 rows) | 275.991 rows/s | 22.722 rows/s | 0,08x |
+| bulk update (2.000 rows) | 21.456 rows/s | 18.116 rows/s | 0,84x |
+| 200 one-row saves | 3.777 saves/s | 1.177 saves/s | 0,31x |
+
+The native path issues `BEGIN`, one statement per row and `COMMIT` through libpq's nonblocking
+API; the offload path batches inserts inside one synchronous transaction. On a single connection
+the native path is therefore **slower for bulk work**; its benefit is freeing the caller thread
+while the reactor owns the I/O, not raw throughput. A future native batch step
+(`execute_batch_async`) is the obvious optimization; it is not claimed here.
+
 ## Limitations
 
 - SQLite measurements are on `:memory:`; disk I/O and concurrency were not measured.

@@ -147,6 +147,7 @@ entityfy::client db{"sqlite://app.db"};                  // SQLite
 entityfy::client db{"postgres://host=... dbname=app"};  // PostgreSQL
 entityfy::client db{"mysql://user:pass@host:3306/app"}; // MySQL / MariaDB (opt-in at build time)
 entityfy::client db{"sqlserver://sa:pass@host:1433/app"}; // SQL Server via ODBC (opt-in)
+entityfy::client mssql{"mssql://sa:pass@host:1433/app?mars=1"}; // same parser; opt into MARS
 
 db.migrate<user>();          // creates the table + indexes (idempotent)
 db.migrate_force<user>();    // forces past a schema validation error
@@ -283,6 +284,14 @@ db.set_statement_cache_capacity(64);  // default 32, 0 = disabled
 db.statement_cache_size();             // how many statements are cached
 db.clear_statement_cache();
 ```
+
+SQL Server URIs accept both `sqlserver://` and `mssql://`; user, password and database are
+percent-decoded and sent as braced ODBC values, so `;`, `=` and `{`/`}` in a password cannot
+inject another connection keyword. `?mars=1` enables Multiple Active Result Sets; an explicit
+`set_transaction_isolation("serializable")` (or the other four levels) prefixes the outer
+`BEGIN` with `SET TRANSACTION ISOLATION LEVEL ...`. Native 1205 becomes `deadlock_detected`,
+1222 and the Azure transient family become `transient_error`, and 18456/4060 become
+`connection_error`.
 
 SQLite reuses compiled statements, PostgreSQL keeps a bounded cache of named server side
 `PREPARE` plans, MySQL caches `MYSQL_STMT` handles (reset before reuse), and SQL Server caches

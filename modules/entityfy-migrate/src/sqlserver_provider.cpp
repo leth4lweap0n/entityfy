@@ -193,12 +193,6 @@ std::string truncate_identifier(std::string value)
     return output;
 }
 
-// msodbcsql.h is not available on every platform entityfy builds on, so the
-// MARS attribute is restated here with the values the driver SDK defines:
-// SQL_COPT_SS_BASE is 1200 and MARS_ENABLED is BASE+24; YES is 1L.
-constexpr SQLINTEGER sql_copt_ss_mars_enabled = 1224;
-constexpr SQLINTEGER sql_mars_enabled_yes = 1;
-
 [[nodiscard]] bool succeeded(SQLRETURN result)
 {
     return result == SQL_SUCCESS || result == SQL_SUCCESS_WITH_INFO;
@@ -266,26 +260,6 @@ public:
            )))
         {
             throw std::runtime_error{"entityfy/migrate:sqlserver: connection failed: " + diagnostics(SQL_HANDLE_DBC, connection_)};
-        }
-
-        // MARS changes how the driver multiplexes statements on one connection,
-        // so it is opt-in and set as a connection attribute after connecting:
-        // a driver that does not support it then fails with a message naming
-        // MARS instead of an unexplained connection-string error.
-        if(options.mars)
-        {
-            if(!succeeded(SQLSetConnectAttrW(
-                   connection_,
-                   sql_copt_ss_mars_enabled,
-                   reinterpret_cast<SQLPOINTER>(sql_mars_enabled_yes),
-                   SQL_IS_INTEGER
-               )))
-            {
-                throw std::runtime_error{
-                    "entityfy/migrate:sqlserver: connection failed: the driver rejected MARS (Multiple Active Result "
-                    "Sets): " +
-                    diagnostics(SQL_HANDLE_DBC, connection_)};
-            }
         }
 
         exec("SET QUOTED_IDENTIFIER ON");

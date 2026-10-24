@@ -161,6 +161,8 @@ TEST_CASE("sql server URIs parse the query options", "[sqlserver][uri]")
 
     const auto mars = parse_sqlserver_uri("sqlserver://sa:x@db:1433/app?mars=1");
     REQUIRE(mars.mars);
+    REQUIRE(entityfy::detail::sqlserver_connection_string(mars).find("MARS_Connection=yes") !=
+            std::string::npos);
 
     REQUIRE(parse_sqlserver_uri("sqlserver://sa:x@db:1433/app?mars=true").mars);
     REQUIRE_FALSE(parse_sqlserver_uri("sqlserver://sa:x@db:1433/app?mars=0").mars);

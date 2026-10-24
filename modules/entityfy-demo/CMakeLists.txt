@@ -18,9 +18,13 @@ target_compile_options(entityfy_migration_probe
     PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-but-set-variable -Wno-unused-parameter
 )
 
-# PostgreSQL benchmark mode compares the raw driver through libpq.
-find_package(PostgreSQL QUIET)
-if(PostgreSQL_FOUND)
-    target_link_libraries(entityfy_bench PRIVATE PostgreSQL::PostgreSQL)
-    target_compile_definitions(entityfy_bench PRIVATE ENTITYFY_BENCH_POSTGRESQL=1)
+# PostgreSQL benchmark mode compares the raw driver through libpq. Only link it
+# when the PostgreSQL backend is enabled: a system libpq found on a SQLite-only
+# build may be built for a different toolchain and fail at link time.
+if(ENTITYFY_ENABLE_POSTGRESQL)
+    find_package(PostgreSQL QUIET)
+    if(PostgreSQL_FOUND)
+        target_link_libraries(entityfy_bench PRIVATE PostgreSQL::PostgreSQL)
+        target_compile_definitions(entityfy_bench PRIVATE ENTITYFY_BENCH_POSTGRESQL=1)
+    endif()
 endif()
