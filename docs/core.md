@@ -289,7 +289,9 @@ SQL Server URIs accept both `sqlserver://` and `mssql://`; user, password and da
 percent-decoded and sent as braced ODBC values, so `;`, `=` and `{`/`}` in a password cannot
 inject another connection keyword. `?mars=1` enables Multiple Active Result Sets; an explicit
 `set_transaction_isolation("serializable")` (or the other four levels) prefixes the outer
-`BEGIN` with `SET TRANSACTION ISOLATION LEVEL ...`. Native 1205 becomes `deadlock_detected`,
+`BEGIN` with `SET TRANSACTION ISOLATION LEVEL ...`. SQL Server requires a transaction started in
+a MARS batch to finish in that batch, so use MARS for read cursors and keep multi-statement
+transactions on a non-MARS connection. Native 1205 becomes `deadlock_detected`,
 1222 and the Azure transient family become `transient_error`, and 18456/4060 become
 `connection_error`.
 
