@@ -351,7 +351,11 @@ public:
         }
 
         auto wide = utf8_to_utf16(sql);
-        SQLRETURN  result = SQLPrepareW(statement, wide.data(), SQL_NTS);
+
+        // Parameterless statements go through the text protocol: statements
+        // such as RESTORE HEADERONLY are not preparable through SQLPrepare.
+        SQLRETURN result = params.empty() ? SQLExecDirectW(statement, wide.data(), SQL_NTS)
+                                          : SQLPrepareW(statement, wide.data(), SQL_NTS);
 
         if(!succeeded(result))
         {
@@ -391,7 +395,7 @@ public:
             }
         }
 
-        if(!succeeded(SQLExecute(statement)))
+        if(!params.empty() && !succeeded(SQLExecute(statement)))
         {
             const auto message = diagnostics(SQL_HANDLE_STMT, statement);
             SQLFreeHandle(SQL_HANDLE_STMT, statement);
