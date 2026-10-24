@@ -88,6 +88,7 @@ bool is_transient(const std::exception& error)
 db_context::~db_context()
 {
     lazy_link_->alive = false;
+    drain_native_saves();
 }
 
 save_result db_context::save_changes()
@@ -97,9 +98,89 @@ save_result db_context::save_changes()
     return save_changes_with_retry();
 }
 
-entityfy::task<save_result> db_context::save_changes_async()
+void db_context::set_async_save_strategy(async_save_strategy strategy)
+{
+    if(strategy == async_save_strategy::native && !native_async_save_available())
+    {
+        throw std::logic_error{"entityfy: the native asynchronous save path is not available for this "
+                               "database or one of the tracked models"};
+    }
+
+    async_save_strategy_ = strategy;
+}
+
+bool db_context::native_async_save_available() const
+{
+    if(database_.async_mode() != entityfy::async_capability::native)
+    {
+        return false;
+    }
+
+    return std::ranges::all_of(order_, [](const std::shared_ptr<detail::saveable>& state) {
+        return state->supports_native_async_save();
+    });
+}
+
+void db_context::drain_native_saves()
+{
+    std::unique_lock lock{native_save_mutex_};
+    native_save_cv_.wait(lock, [this] { return native_saves_in_flight_ == 0; });
+}
+
+entityfy::task<save_result> db_context::save_changes_once_async()
 {
     save_gate gate{save_in_progress_};
+
+    if(!native_async_save_available())
+    {
+        throw std::logic_error{"entityfy: the native asynchronous save path is not available for this "
+                               "database or one of the tracked models"};
+    }
+
+    {
+        const std::lock_guard lock{native_save_mutex_};
+        ++native_saves_in_flight_;
+    }
+
+    last_save_used_native_async_.store(true, std::memory_order_release);
+
+    try
+    {
+        // The native path releases the gate after its last context access,
+        // just before it completes the returned task.
+        auto pending = save_changes_once_async_native();
+        gate.disarm();
+        return pending;
+    }
+    catch(...)
+    {
+        {
+            const std::lock_guard lock{native_save_mutex_};
+            --native_saves_in_flight_;
+        }
+        native_save_cv_.notify_all();
+        throw;
+    }
+}
+
+entityfy::task<save_result> db_context::save_changes_async()
+{
+    const bool use_native = async_save_strategy_ != async_save_strategy::offload &&
+                            native_async_save_available();
+
+    if(async_save_strategy_ == async_save_strategy::native && !use_native)
+    {
+        throw std::logic_error{"entityfy: the native asynchronous save path is not available for this "
+                               "database or one of the tracked models"};
+    }
+
+    if(use_native)
+    {
+        return save_changes_once_async();
+    }
+
+    save_gate gate{save_in_progress_};
+    last_save_used_native_async_.store(false, std::memory_order_release);
 
     auto pair = entityfy::make_task<save_result>();
     auto completer = std::make_shared<entityfy::task_completer<save_result>>(std::move(pair.completer));
@@ -250,10 +331,8 @@ void db_context::migrate_all()
     }
 }
 
-save_result db_context::save_changes_once()
+std::vector<std::shared_ptr<detail::saveable>> db_context::save_order()
 {
-    save_result total;
-
     std::vector<std::shared_ptr<detail::saveable>> ordered;
     std::set<std::string>                          resolved;
     std::vector<std::shared_ptr<detail::saveable>> remaining = order_;
@@ -308,6 +387,15 @@ save_result db_context::save_changes_once()
         }
     }
 
+    return ordered;
+}
+
+save_result db_context::save_changes_once()
+{
+    save_result total;
+
+    auto ordered = save_order();
+
     for(auto& state: order_)
     {
         state->begin_save();
@@ -343,6 +431,134 @@ save_result db_context::save_changes_once()
     }
 
     return total;
+}
+
+
+void db_context::finish_native_save() noexcept
+{
+    save_in_progress_.store(false, std::memory_order_release);
+
+    {
+        const std::lock_guard lock{native_save_mutex_};
+        --native_saves_in_flight_;
+    }
+
+    native_save_cv_.notify_all();
+}
+
+entityfy::task<save_result> db_context::save_changes_once_async_native()
+{
+    auto ordered = save_order();
+
+    for(auto& state: order_)
+    {
+        state->begin_save();
+    }
+
+    std::vector<detail::async_save_chain::step> steps;
+    steps.reserve(ordered.size() * 2 + 2);
+
+    steps.emplace_back([this] {
+        return database_.execute_async(entityfy::statement{.sql = "BEGIN"}).then([](auto) {
+            return save_result{};
+        });
+    });
+
+    for(auto iterator = ordered.rbegin(); iterator != ordered.rend(); ++iterator)
+    {
+        auto state = *iterator;
+        steps.emplace_back([this, state] { return state->delete_removed_async(*this); });
+    }
+
+    for(auto& state: ordered)
+    {
+        steps.emplace_back([this, state] { return state->save_async(*this); });
+    }
+
+    steps.emplace_back([this] {
+        return database_.execute_async(entityfy::statement{.sql = "COMMIT"}).then([](auto) {
+            return save_result{};
+        });
+    });
+
+    auto pair = entityfy::make_task<save_result>();
+    auto completer = std::make_shared<entityfy::task_completer<save_result>>(std::move(pair.completer));
+
+    try
+    {
+        auto work = std::make_shared<entityfy::task<save_result>>(detail::async_save_chain::run(std::move(steps)));
+
+        work->on_complete([this, work, completer]() noexcept {
+            save_result      total;
+            std::exception_ptr error;
+
+            try
+            {
+                total = work->get();
+            }
+            catch(...)
+            {
+                error = std::current_exception();
+            }
+
+            if(error == nullptr)
+            {
+                for(auto& state: order_)
+                {
+                    state->commit_save();
+                }
+
+                finish_native_save();
+                completer->set_value(std::move(total));
+                return;
+            }
+
+            auto rollback = [this, completer, error] {
+                for(auto& state: order_)
+                {
+                    state->rollback_save();
+                }
+
+                finish_native_save();
+                completer->set_exception(error);
+            };
+
+            try
+            {
+                auto pending_rollback =
+                    std::make_shared<entityfy::task<entityfy::detail::execution_result>>(
+                        database_.execute_async(entityfy::statement{.sql = "ROLLBACK"}));
+
+                pending_rollback->on_complete([pending_rollback, rollback]() noexcept {
+                    try
+                    {
+                        (void)pending_rollback->get();
+                    }
+                    catch(...)
+                    {
+                    }
+
+                    rollback();
+                });
+            }
+            catch(...)
+            {
+                rollback();
+            }
+        });
+    }
+    catch(...)
+    {
+        for(auto& state: order_)
+        {
+            state->rollback_save();
+        }
+
+        finish_native_save();
+        throw;
+    }
+
+    return std::move(pair.value);
 }
 
 } // namespace entityfy

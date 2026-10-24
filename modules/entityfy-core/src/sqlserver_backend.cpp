@@ -1,4 +1,5 @@
 #include <entityfy/detail/backend.hpp>
+#include <entityfy/detail/sqlserver_uri.hpp>
 #include <entityfy/error.hpp>
 #include <entityfy/statement.hpp>
 
@@ -27,66 +28,6 @@ namespace entityfy::detail
 {
 namespace
 {
-
-struct sqlserver_connection_options
-{
-    std::string host = "127.0.0.1";
-    std::string user = "sa";
-    std::string password;
-    std::string database;
-    unsigned    port = 1433;
-};
-
-[[nodiscard]] sqlserver_connection_options parse_sqlserver_uri(std::string_view uri)
-{
-    constexpr std::string_view prefix = "sqlserver://";
-    if(!uri.starts_with(prefix))
-    {
-        throw std::invalid_argument{"SQL Server connection string must start with sqlserver://"};
-    }
-
-    std::string_view             rest = uri.substr(prefix.size());
-    sqlserver_connection_options options;
-
-    if(const auto slash = rest.find('/'); slash != std::string_view::npos)
-    {
-        options.database = std::string{rest.substr(slash + 1)};
-        rest = rest.substr(0, slash);
-    }
-
-    if(const auto at = rest.rfind('@'); at != std::string_view::npos)
-    {
-        const auto credentials = rest.substr(0, at);
-        rest = rest.substr(at + 1);
-
-        if(const auto colon = credentials.find(':'); colon != std::string_view::npos)
-        {
-            options.user = std::string{credentials.substr(0, colon)};
-            options.password = std::string{credentials.substr(colon + 1)};
-        }
-        else
-        {
-            options.user = std::string{credentials};
-        }
-    }
-
-    if(const auto colon = rest.rfind(':'); colon != std::string_view::npos)
-    {
-        options.host = std::string{rest.substr(0, colon)};
-        options.port = static_cast<unsigned>(std::stoul(std::string{rest.substr(colon + 1)}));
-    }
-    else if(!rest.empty())
-    {
-        options.host = std::string{rest};
-    }
-
-    if(options.database.empty())
-    {
-        throw std::invalid_argument{"SQL Server URI must include a database"};
-    }
-
-    return options;
-}
 
 // SQLWCHAR is wchar_t on Windows but unsigned short on Unix; a std::wstring is
 // therefore not portable (wchar_t is 32-bit there). The returned vector carries
@@ -242,9 +183,10 @@ struct environment_handle
 
 struct diagnostics
 {
-    std::string state;
-    std::string message;
-    SQLINTEGER  native = 0;
+    std::string         state;
+    std::string         message;
+    SQLINTEGER          native = 0;
+    sqlserver_error_kind kind = sqlserver_error_kind::none;
 };
 
 [[nodiscard]] diagnostics read_diagnostics(SQLSMALLINT type, SQLHANDLE handle)
@@ -260,38 +202,99 @@ struct diagnostics
         output.message = reinterpret_cast<const char*>(text);
     }
 
+    output.kind = classify_sqlserver_native(output.native);
     return output;
 }
 
-[[nodiscard]] std::string classify_sqlserver_error(SQLSMALLINT type, SQLHANDLE handle)
+// The human-readable cause, prefixed by what the native number means so the
+// message alone is already diagnostic. The `[state native N]` suffix stays so a
+// caller can correlate the failure with the server's own log.
+[[nodiscard]] diagnostics describe_sqlserver_error(SQLSMALLINT type, SQLHANDLE handle)
 {
-    const auto detail = read_diagnostics(type, handle);
-    std::string cause;
+    auto detail = read_diagnostics(type, handle);
 
-    switch(detail.native)
+    switch(detail.kind)
     {
-        case 2601:
-        case 2627:
-            cause = "duplicate key: ";
+        case sqlserver_error_kind::duplicate_key:
+            detail.message.insert(0, "duplicate key: ");
             break;
-        case 547:
-            cause = detail.message.find("FOREIGN KEY") != std::string::npos ? "foreign key constraint: "
-                                                                             : "check constraint: ";
+        case sqlserver_error_kind::foreign_key:
+            // 547 covers both FOREIGN KEY and CHECK conflicts; the message is
+            // the only discriminator the server gives.
+            detail.message.insert(
+                0,
+                detail.message.find("FOREIGN KEY") != std::string::npos ? "foreign key constraint: "
+                                                                        : "check constraint: "
+            );
             break;
-        case 515:
-            cause = "not null: ";
+        case sqlserver_error_kind::not_null:
+            detail.message.insert(0, "not null: ");
             break;
-        default:
+        case sqlserver_error_kind::deadlock:
+            detail.message.insert(0, "deadlock victim: ");
+            break;
+        case sqlserver_error_kind::transient:
+            detail.message.insert(0, "transient: ");
+            break;
+        case sqlserver_error_kind::authentication:
+            detail.message.insert(0, "authentication failed: ");
+            break;
+        case sqlserver_error_kind::connection:
+            detail.message.insert(0, "connection: ");
+            break;
+        case sqlserver_error_kind::check:
+            detail.message.insert(0, "check constraint: ");
+            break;
+        case sqlserver_error_kind::none:
             break;
     }
 
-    cause.append(detail.message);
-    cause.append(" [");
-    cause.append(detail.state);
-    cause.append(" native ");
-    cause.append(std::to_string(detail.native));
-    cause.push_back(']');
-    return cause;
+    detail.message.append(" [");
+    detail.message.append(detail.state);
+    detail.message.append(" native ");
+    detail.message.append(std::to_string(detail.native));
+    detail.message.push_back(']');
+    return detail;
+}
+
+// One place that turns a classified diagnostics record into the entityfy error
+// type: retryable conditions become transient types, credential and connection
+// failures become connection_error, and a constraint conflict keeps its type.
+// Every sql_error subclass carries the SQL text that failed.
+[[noreturn]] void throw_sqlserver_error(std::string_view operation, const std::string& sql, const diagnostics& detail)
+{
+    auto message = sql_context_message("SQL Server", operation, sql, detail.message);
+
+    switch(detail.kind)
+    {
+        case sqlserver_error_kind::duplicate_key:
+            throw unique_violation{std::move(message), sql};
+        case sqlserver_error_kind::foreign_key:
+            if(detail.message.find("FOREIGN KEY") != std::string::npos)
+            {
+                throw foreign_key_violation{std::move(message), sql};
+            }
+
+            throw check_violation{std::move(message), sql};
+        case sqlserver_error_kind::not_null:
+            throw not_null_violation{std::move(message), sql};
+        case sqlserver_error_kind::check:
+            throw check_violation{std::move(message), sql};
+        case sqlserver_error_kind::deadlock:
+            throw deadlock_detected{std::move(message), sql};
+        case sqlserver_error_kind::transient:
+            throw transient_error{std::move(message), sql};
+        case sqlserver_error_kind::authentication:
+            throw connection_error{std::move(message)};
+        case sqlserver_error_kind::connection:
+            throw connection_error{std::move(message)};
+        case sqlserver_error_kind::none:
+            break;
+    }
+
+    // Unmapped numbers keep the message-based classification so a server that
+    // words a constraint failure differently still lands on a typed error.
+    throw_classified_sql_error("SQL Server", operation, sql, detail.message);
 }
 
 [[nodiscard]] bool succeeded(SQLRETURN result)
@@ -535,31 +538,10 @@ public:
 
         if(SQLAllocHandle(SQL_HANDLE_DBC, shared_environment().value, &connection_) != SQL_SUCCESS)
         {
-            throw std::runtime_error{"entityfy SQL Server ODBC connection handle allocation failed"};
+            throw connection_error{"entityfy SQL Server ODBC connection handle allocation failed"};
         }
 
-        const std::string connection_string =
-            "DRIVER={ODBC Driver 18 for SQL Server};SERVER=" + options.host + "," + std::to_string(options.port) +
-            ";UID=" + options.user + ";PWD=" + options.password + ";DATABASE=" + options.database +
-            ";TrustServerCertificate=yes;Encrypt=yes";
-
-        auto wide = utf8_to_utf16(connection_string);
-        SQLWCHAR   output[1024]{};
-        SQLSMALLINT output_length = 0;
-
-        if(!succeeded(SQLDriverConnectW(
-               connection_,
-               nullptr,
-               wide.data(),
-               SQL_NTS,
-               output,
-               static_cast<SQLSMALLINT>(std::size(output)),
-               &output_length,
-               SQL_DRIVER_NOPROMPT
-           )))
-        {
-            throw std::runtime_error{"entityfy SQL Server connection failed: " + classify_sqlserver_error(SQL_HANDLE_DBC, connection_)};
-        }
+        connect(options);
 
         // SET options that affect parsing must reach the server on their own,
         // not through a prepared batch.
@@ -624,13 +606,28 @@ public:
             {
                 std::uint64_t produced = 0;
 
-                while(SQLFetch(statement_handle) == SQL_SUCCESS)
+                // OUTPUT INSERTED returns one row; SQL_SUCCESS_WITH_INFO is a
+                // successful fetch (a truncated warning, for instance), so only
+                // SQL_NO_DATA ends the loop. Every produced row keeps the last
+                // key, which is the same row for a single-statement INSERT.
+                while(true)
                 {
+                    const auto fetched = SQLFetch(statement_handle);
+                    if(fetched == SQL_NO_DATA)
+                    {
+                        break;
+                    }
+
+                    if(!succeeded(fetched))
+                    {
+                        const auto detail = describe_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
+                        throw_sqlserver_error("execute", input.sql, detail);
+                    }
+
                     SQLLEN indicator = 0;
                     SQLBIGINT value = 0;
 
-                    if(SQLGetData(statement_handle, 1, SQL_C_SBIGINT, &value, sizeof(value), &indicator) ==
-                           SQL_SUCCESS &&
+                    if(succeeded(SQLGetData(statement_handle, 1, SQL_C_SBIGINT, &value, sizeof(value), &indicator)) &&
                        indicator != SQL_NULL_DATA)
                     {
                         output.last_insert_id = static_cast<std::int64_t>(value);
@@ -647,6 +644,9 @@ public:
                 SQLRowCount(statement_handle, &affected);
                 output.rows_affected = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
             }
+
+            // A dropped cursor would otherwise stay open on a cached handle.
+            SQLFreeStmt(statement_handle, SQL_CLOSE);
 
             if(!lease)
             {
@@ -728,7 +728,8 @@ public:
 
                 if(!succeeded(fetched))
                 {
-                    throw std::runtime_error{"entityfy SQL Server fetch failed: " + classify_sqlserver_error(SQL_HANDLE_STMT, statement_handle)};
+                    const auto detail = describe_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
+                    throw_sqlserver_error("query", input.sql, detail);
                 }
 
                 current.clear();
@@ -749,6 +750,9 @@ public:
                 }
             }
 
+            // The handle may go back to the statement cache, so an unfinished
+            // cursor must be closed here rather than left for the next user.
+            SQLFreeStmt(statement_handle, SQL_CLOSE);
         }
         catch(const sql_error&)
         {
@@ -963,6 +967,65 @@ public:
     }
 
 private:
+    // msodbcsql.h is not available on Linux, so the MARS attribute is restated
+    // here. The values come from the driver SDK: SQL_COPT_SS_BASE is 1200 and
+    // MARS_ENABLED is BASE+24; SQL_MARS_ENABLED_YES is 1L.
+    static constexpr SQLINTEGER sql_copt_ss_mars_enabled = 1200 + 24;
+    static constexpr SQLINTEGER sql_mars_enabled_yes = 1;
+
+    void connect(const sqlserver_uri_options& options)
+    {
+        const auto connection_string = sqlserver_connection_string(options);
+        auto       wide = utf8_to_utf16(connection_string);
+        SQLWCHAR   output[1024]{};
+        SQLSMALLINT output_length = 0;
+
+        if(!succeeded(SQLDriverConnectW(
+               connection_,
+               nullptr,
+               wide.data(),
+               SQL_NTS,
+               output,
+               static_cast<SQLSMALLINT>(std::size(output)),
+               &output_length,
+               SQL_DRIVER_NOPROMPT
+           )))
+        {
+            const auto detail = describe_sqlserver_error(SQL_HANDLE_DBC, connection_);
+
+            // A failed login or an unreachable server is a connection problem,
+            // never a statement problem, so it has no SQL text to carry.
+            throw connection_error{"entityfy SQL Server connection failed: " + detail.message};
+        }
+
+        enable_mars(options.mars);
+    }
+
+    // MARS is a connection attribute rather than a connection-string keyword so
+    // that a driver without support reports a specific failure naming MARS
+    // instead of an unexplained connect error.
+    void enable_mars(bool enabled)
+    {
+        if(!enabled)
+        {
+            return;
+        }
+
+        if(!succeeded(SQLSetConnectAttrW(
+               connection_,
+               sql_copt_ss_mars_enabled,
+               reinterpret_cast<SQLPOINTER>(sql_mars_enabled_yes),
+               SQL_IS_INTEGER
+           )))
+        {
+            const auto detail = describe_sqlserver_error(SQL_HANDLE_DBC, connection_);
+            throw connection_error{
+                "entityfy SQL Server connection failed: the driver rejected MARS (Multiple Active Result Sets): " +
+                detail.message
+            };
+        }
+    }
+
     void execute_direct(std::string_view sql)
     {
         SQLHSTMT statement_handle = SQL_NULL_HSTMT;
@@ -976,9 +1039,11 @@ private:
 
         if(!succeeded(result))
         {
-            const auto message = classify_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
+            // The diagnostics live on the statement handle, so read them before
+            // it is freed.
+            const auto detail = describe_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
             SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
-            throw std::runtime_error{"entityfy SQL Server `" + std::string{sql} + "` failed: " + message};
+            throw_sqlserver_error("execute", std::string{sql}, detail);
         }
 
         SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
@@ -996,9 +1061,9 @@ private:
 
         if(!succeeded(SQLExecDirectW(statement_handle, wide.data(), SQL_NTS)))
         {
-            const auto message = classify_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
+            const auto detail = describe_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
             SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
-            throw std::runtime_error{"entityfy SQL Server execute failed: " + message};
+            throw_sqlserver_error("execute", input.sql, detail);
         }
 
         return statement_handle;
@@ -1071,9 +1136,9 @@ private:
 
             if(!succeeded(SQLPrepareW(statement_handle, wide.data(), SQL_NTS)))
             {
-                const auto message = classify_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
+                const auto detail = describe_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
                 SQLFreeHandle(SQL_HANDLE_STMT, statement_handle);
-                throw std::runtime_error{"entityfy SQL Server prepare failed: " + message};
+                throw_sqlserver_error("prepare", input.sql, detail);
             }
         }
 
@@ -1095,17 +1160,17 @@ private:
                    &parameters.indicators[index]
                )))
             {
-                const auto message = classify_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
+                const auto detail = describe_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
                 discard_statement_locked(input.sql, statement_handle, reused);
-                throw std::runtime_error{"entityfy SQL Server bind failed: " + message};
+                throw_sqlserver_error("bind", input.sql, detail);
             }
         }
 
         if(!succeeded(SQLExecute(statement_handle)))
         {
-            const auto message = classify_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
+            const auto detail = describe_sqlserver_error(SQL_HANDLE_STMT, statement_handle);
             discard_statement_locked(input.sql, statement_handle, reused);
-            throw std::runtime_error{"entityfy SQL Server execute failed: " + message};
+            throw_sqlserver_error("execute", input.sql, detail);
         }
 
         return acquired_statement{.handle = statement_handle, .reused = reused};

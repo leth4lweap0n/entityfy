@@ -87,9 +87,9 @@ if(ENTITYFY_BUILD_TESTS)
     if(NOT ENTITYFY_ENABLE_MYSQL)
         list(REMOVE_ITEM test_sources "${CMAKE_CURRENT_SOURCE_DIR}/tests/MysqlBackend.test.cpp")
     endif()
-    if(NOT ENTITYFY_ENABLE_SQLSERVER)
-        list(REMOVE_ITEM test_sources "${CMAKE_CURRENT_SOURCE_DIR}/tests/SqlserverBackend.test.cpp")
-    endif()
+    # SqlserverBackend.test.cpp keeps the URI/classifier/statement tests free of
+    # ODBC and skips its live cases when ENTITYFY_SQLSERVER_URI is unset, so it
+    # compiles and runs in every configuration.
 
     if(test_sources)
         add_executable(entityfy_core_tests ${test_sources})

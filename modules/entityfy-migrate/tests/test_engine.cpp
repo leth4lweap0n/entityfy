@@ -6,13 +6,66 @@
 
 #include "models.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <string_view>
+#include <vector>
 
 namespace
 {
+
+// Composite key parent: the referenced pair (tenant_id, code) is the key, so
+// a child only references a real row when both parts match.
+struct [[= entityfy::table{"migrate_ck_parents"}]] migrate_ck_parent
+{
+    [[= entityfy::primary_key]]
+    std::int64_t tenant_id = 0;
+
+    [[= entityfy::primary_key, = entityfy::varchar{16}]]
+    std::string code;
+
+    [[= entityfy::not_null, = entityfy::varchar{80}]]
+    std::string name;
+};
+
+// Both reference columns carry group 1: one table-level composite foreign key.
+struct [[= entityfy::table{"migrate_ck_children"}]] migrate_ck_child
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::not_null, = entityfy::references{"migrate_ck_parents", "tenant_id", "CASCADE", "CASCADE", 1}]]
+    std::int64_t tenant_id = 0;
+
+    [[= entityfy::not_null, = entityfy::varchar{16},
+      = entityfy::references{"migrate_ck_parents", "code", "CASCADE", "CASCADE", 1}]]
+    std::string parent_code;
+
+    [[= entityfy::not_null, = entityfy::varchar{80}]]
+    std::string body;
+};
+
+void apply_plan(entityfy::migrate::provider& backend, const entityfy::migrate::plan& value)
+{
+    backend.start();
+    try
+    {
+        for(const auto& current: value.steps)
+        {
+            backend.execute(current);
+        }
+
+        backend.finish();
+    }
+    catch(...)
+    {
+        backend.abort();
+        throw;
+    }
+}
 
 std::vector<std::string> split_script(std::string_view text)
 {
@@ -584,6 +637,157 @@ entityfy_test::status test_engine()
 
         backend->close();
         std::filesystem::remove(key_path);
+    }
+
+    // One composite group becomes one foreign_key with ordered column lists;
+    // its columns carry no column-level REFERENCES clause.
+    {
+        const auto model = entityfy::migrate::table_from_model<migrate_ck_child>(entityfy::dialect::sqlite);
+        require(model.foreign_keys.size() == 1, "model conversion emits one composite foreign key");
+
+        const auto& key = model.foreign_keys.front();
+        require(key.columns == std::vector<std::string>{"tenant_id", "parent_code"},
+                "composite foreign key local column order");
+        require(key.ref_columns == std::vector<std::string>{"tenant_id", "code"},
+                "composite foreign key referenced column order");
+        require(key.column == "tenant_id" && key.ref_column == "tenant_id",
+                "composite foreign key keeps the first column mirrors");
+        require(key.ref_table == "migrate_ck_parents", "composite foreign key referenced table");
+        require(key.on_delete == "CASCADE" && key.on_update == "CASCADE",
+                "composite foreign key referential actions");
+
+        require(!entityfy::migrate::find_column(model, "tenant_id")->references.has_value() &&
+                    !entityfy::migrate::find_column(model, "parent_code")->references.has_value(),
+                "grouped columns do not emit column-level references");
+    }
+
+    // Composite foreign key create -> introspect -> empty plan -> drop -> re-add
+    // on SQLite, where both directions go through a table rebuild.
+    {
+        const auto path = test_workspace("entityfy_composite_fk_test.db");
+        std::filesystem::remove(path);
+
+        auto backend = entityfy::migrate::open_sqlite_provider(path.string());
+        const auto desired = entityfy::migrate::schema_from_models<migrate_ck_parent, migrate_ck_child>(
+            entityfy::dialect::sqlite);
+
+        const auto creation = backend->make_plan(desired, entityfy::migrate::schema{}, {});
+        require(creation.steps.size() == 2, "composite foreign key creation creates both tables");
+        require(!creation.destructive, "composite foreign key creation is not destructive");
+
+        const auto create_child = std::ranges::find_if(creation.steps, [](const entityfy::migrate::step& value) {
+            return value.sql.find("CREATE TABLE IF NOT EXISTS \"migrate_ck_children\"") != std::string::npos;
+        });
+        require(create_child != creation.steps.end() &&
+                    create_child->sql.find("FOREIGN KEY (\"tenant_id\", \"parent_code\") REFERENCES "
+                                           "\"migrate_ck_parents\" (\"tenant_id\", \"code\") "
+                                           "ON DELETE CASCADE ON UPDATE CASCADE") != std::string::npos,
+                "sqlite create table emits one table-level composite foreign key");
+
+        apply_plan(*backend, creation);
+
+        const auto actual = backend->introspect();
+        const auto* child = entityfy::migrate::find_table(actual, "migrate_ck_children");
+        require(child != nullptr && child->foreign_keys.size() == 1,
+                "sqlite composite foreign key introspected as one constraint");
+        require(child->foreign_keys.front().columns == std::vector<std::string>{"tenant_id", "parent_code"},
+                "sqlite composite foreign key local columns introspected");
+        require(child->foreign_keys.front().ref_columns == std::vector<std::string>{"tenant_id", "code"},
+                "sqlite composite foreign key referenced columns introspected");
+        require(child->foreign_keys.front().on_delete == "CASCADE" &&
+                    child->foreign_keys.front().on_update == "CASCADE",
+                "sqlite composite foreign key actions introspected");
+        require(!entityfy::migrate::find_column(*child, "tenant_id")->references.has_value() &&
+                    !entityfy::migrate::find_column(*child, "parent_code")->references.has_value(),
+                "sqlite composite columns have no column-level reference");
+
+        const auto idempotent = backend->make_plan(desired, actual, {});
+        require(idempotent.steps.empty(), "sqlite composite foreign key apply is idempotent");
+        require(!idempotent.destructive, "sqlite idempotent composite plan is not destructive");
+
+        backend->execute_sql(
+            "INSERT INTO \"migrate_ck_parents\" (\"tenant_id\", \"code\", \"name\") VALUES (1, 'eu', 'EU')");
+        backend->execute_sql(
+            "INSERT INTO \"migrate_ck_parents\" (\"tenant_id\", \"code\", \"name\") VALUES (2, 'us', 'US')");
+        backend->execute_sql(
+            "INSERT INTO \"migrate_ck_children\" (\"id\", \"tenant_id\", \"parent_code\", \"body\") "
+            "VALUES (1, 1, 'eu', 'first')");
+
+        bool mismatch_rejected = false;
+        try
+        {
+            backend->execute_sql(
+                "INSERT INTO \"migrate_ck_children\" (\"id\", \"tenant_id\", \"parent_code\", \"body\") "
+                "VALUES (2, 1, 'us', 'mismatch')");
+        }
+        catch(const std::exception&)
+        {
+            mismatch_rejected = true;
+        }
+
+        require(mismatch_rejected, "sqlite composite foreign key enforces the column pair");
+
+        auto without = desired;
+        entityfy::migrate::find_table(without, "migrate_ck_children")->foreign_keys.clear();
+
+        const auto drop_plan = backend->make_plan(without, backend->introspect(), {});
+        require(drop_plan.steps.size() == 1 &&
+                    drop_plan.steps.front().type == entityfy::migrate::step::kind::sqlite_rebuild,
+                "sqlite composite foreign key drop rebuilds the table");
+        apply_plan(*backend, drop_plan);
+
+        const auto after_drop = backend->introspect();
+        const auto* dropped_child = entityfy::migrate::find_table(after_drop, "migrate_ck_children");
+        require(dropped_child != nullptr && dropped_child->foreign_keys.empty(),
+                "sqlite composite foreign key dropped");
+        require(entityfy::migrate::find_table(after_drop, "migrate_ck_parents") != nullptr,
+                "sqlite parent table survives the child rebuild");
+
+        auto rows = backend->query("SELECT COUNT(*) FROM \"migrate_ck_children\"");
+        require(rows.size() == 1 && rows.front().front() == "1",
+                "sqlite child rows survive dropping the composite foreign key");
+        rows = backend->query("SELECT COUNT(*) FROM \"migrate_ck_parents\"");
+        require(rows.size() == 1 && rows.front().front() == "2",
+                "sqlite parent rows survive the child rebuild");
+
+        const auto readd = backend->make_plan(desired, backend->introspect(), {});
+        require(readd.steps.size() == 1 && readd.steps.front().type == entityfy::migrate::step::kind::sqlite_rebuild,
+                "sqlite composite foreign key re-add rebuilds the table");
+        apply_plan(*backend, readd);
+
+        const auto after_readd = backend->introspect();
+        const auto* readded_child = entityfy::migrate::find_table(after_readd, "migrate_ck_children");
+        require(readded_child != nullptr && readded_child->foreign_keys.size() == 1 &&
+                    readded_child->foreign_keys.front().columns ==
+                        std::vector<std::string>{"tenant_id", "parent_code"} &&
+                    readded_child->foreign_keys.front().ref_columns ==
+                        std::vector<std::string>{"tenant_id", "code"},
+                "sqlite composite foreign key rebuilt with both column lists");
+
+        rows = backend->query("SELECT COUNT(*) FROM \"migrate_ck_children\"");
+        require(rows.size() == 1 && rows.front().front() == "1",
+                "sqlite child rows survive re-adding the composite foreign key");
+
+        bool enforced_again = false;
+        try
+        {
+            backend->execute_sql(
+                "INSERT INTO \"migrate_ck_children\" (\"id\", \"tenant_id\", \"parent_code\", \"body\") "
+                "VALUES (3, 1, 'us', 'mismatch')");
+        }
+        catch(const std::exception&)
+        {
+            enforced_again = true;
+        }
+
+        require(enforced_again, "sqlite rebuilt composite foreign key is enforced");
+
+        const auto after_readd_schema = backend->introspect();
+        const auto stable = backend->make_plan(desired, after_readd_schema, {});
+        require(stable.steps.empty(), "sqlite composite foreign key re-add is idempotent");
+
+        backend->close();
+        std::filesystem::remove(path);
     }
 
     return entityfy_test::status::passed;

@@ -68,6 +68,22 @@ public:
         return backend_->inspect_table(table_name<Model>());
     }
 
+    // Session transaction isolation. The level is validated when it is set, not
+    // when a transaction starts, so a typo fails at the call site. SQL Server
+    // receives `SET TRANSACTION ISOLATION LEVEL <level>` before the outer BEGIN
+    // TRANSACTION; the setting is a session attribute, so savepoints do not
+    // repeat it. Backends without a T-SQL session level keep the default and
+    // the value is only recorded.
+    void set_transaction_isolation(std::string_view level)
+    {
+        transaction_isolation_ = normalize_transaction_isolation(level);
+    }
+
+    [[nodiscard]] const std::string& transaction_isolation() const noexcept
+    {
+        return transaction_isolation_;
+    }
+
     template <typename Function>
     decltype(auto) transaction(Function&& function)
     {
@@ -653,6 +669,41 @@ public:
     }
 
 private:
+    // T-SQL spells the levels with spaces; the caller may type any casing.
+    [[nodiscard]] static std::string normalize_transaction_isolation(std::string_view level)
+    {
+        static constexpr std::string_view allowed[] = {
+            "READ UNCOMMITTED",
+            "READ COMMITTED",
+            "REPEATABLE READ",
+            "SERIALIZABLE",
+            "SNAPSHOT",
+        };
+
+        std::string normalized{level};
+
+        for(char& current: normalized)
+        {
+            if(current >= 'a' && current <= 'z')
+            {
+                current = static_cast<char>(current - 'a' + 'A');
+            }
+        }
+
+        for(const auto candidate: allowed)
+        {
+            if(normalized == candidate)
+            {
+                return normalized;
+            }
+        }
+
+        throw std::invalid_argument{
+            "entityfy transaction isolation level must be READ UNCOMMITTED, READ COMMITTED, REPEATABLE READ, "
+            "SERIALIZABLE or SNAPSHOT"
+        };
+    }
+
     void begin_transaction(bool nested, std::string_view savepoint)
     {
         const bool tsql = backend_->target_dialect() == dialect::sqlserver;
@@ -660,7 +711,10 @@ private:
         statement command;
         if(tsql)
         {
-            command.sql = nested ? "SAVE TRANSACTION " + detail::quote_identifier(savepoint) : "BEGIN TRANSACTION";
+            // The isolation level is a session setting; repeating it on every
+            // savepoint would only add round trips.
+            command.sql = nested ? "SAVE TRANSACTION " + detail::quote_identifier(savepoint)
+                                 : "SET TRANSACTION ISOLATION LEVEL " + transaction_isolation_ + "; BEGIN TRANSACTION";
         }
         else
         {
@@ -744,6 +798,7 @@ private:
 
     std::unique_ptr<detail::backend> backend_;
     std::size_t                      transaction_depth_ = 0;
+    std::string                      transaction_isolation_ = "READ COMMITTED";
 
     // Declared after every member its jobs use: destruction drains the queue,
     // joins the worker and only then releases the backend, so an in-flight

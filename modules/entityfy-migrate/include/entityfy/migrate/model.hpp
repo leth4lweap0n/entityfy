@@ -38,7 +38,7 @@ template <typename Model>
         destination.default_sql = source.default_sql;
         destination.check_sql = source.check_sql;
 
-        if(source.has_reference)
+        if(source.has_reference && source.reference.group == 0)
         {
             destination.references = reference{
                 .table = source.reference.table,
@@ -62,13 +62,21 @@ template <typename Model>
 
     for(const auto& relation: descriptor.relations)
     {
-        output.foreign_keys.push_back(foreign_key{
-            .column = relation.local_column,
-            .ref_table = relation.referenced_table,
-            .ref_column = relation.referenced_column.empty() ? std::string{"id"} : relation.referenced_column,
-            .on_delete = relation.on_delete,
-            .on_update = relation.on_update,
-        });
+        foreign_key key;
+        key.columns = relation.local_columns.empty() ? std::vector<std::string>{relation.local_column}
+                                                     : relation.local_columns;
+        key.ref_columns = relation.referenced_columns.empty()
+                              ? std::vector<std::string>{relation.referenced_column.empty() ? "id"
+                                                                                          : relation.referenced_column}
+                              : relation.referenced_columns;
+
+        key.column = key.columns.front();
+        key.ref_table = relation.referenced_table;
+        key.ref_column = key.ref_columns.front();
+        key.on_delete = relation.on_delete;
+        key.on_update = relation.on_update;
+
+        output.foreign_keys.emplace_back(std::move(key));
     }
 
     return output;

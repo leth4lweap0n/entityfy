@@ -926,6 +926,37 @@ struct set_state final : saveable
     save_result delete_removed(db_context& owner) override;
     save_result save(db_context& owner) override;
 
+    [[nodiscard]] bool supports_native_async_save() const noexcept override;
+    entityfy::task<save_result> delete_removed_async(db_context& owner) override;
+    entityfy::task<save_result> save_async(db_context& owner) override;
+
+    // One single-row UPDATE, built by both the synchronous and the native
+    // asynchronous save so the two can never disagree about the SET list, the
+    // key filter or the token predicate.
+    struct update_command
+    {
+        entityfy::statement command;
+        row_key            key;
+        sql_value          original_token;
+        std::string        token_column;
+        bool               has_token = false;
+        bool               system_token = false;
+    };
+
+    // Fills `output` for the fields the item currently differs in. Returns false
+    // when nothing differs, in which case only the no-op bookkeeping is due.
+    [[nodiscard]] bool build_update_command(const tracked& item, update_command& output) const;
+
+    // Single-row native steps. Each one issues one statement through
+    // db_context::database().execute_async and applies the same bookkeeping the
+    // synchronous save applies after the statement succeeded.
+    entityfy::task<save_result> insert_row_async(db_context& owner, std::size_t index);
+    entityfy::task<save_result> delete_row_async(db_context& owner, std::size_t index);
+    entityfy::task<save_result> save_row_async(db_context& owner, std::size_t index);
+
+    // Tail of a successful save: drop the removed rows, clear the change hints.
+    void finish_save_tail();
+
     template <auto TokenMember>
     void reload_system_token(db_context& owner,
                              T& entity,
@@ -1943,6 +1974,314 @@ save_result set_state<T>::save(db_context& owner)
     modified_indices_.clear();
 
     return result;
+}
+
+template <typename T>
+bool set_state<T>::supports_native_async_save() const noexcept
+{
+    if(generated_key_)
+    {
+        return false;
+    }
+
+    constexpr auto token_member = concurrency_token_member<T>();
+
+    if constexpr(token_member != std::meta::info{})
+    {
+        const std::string token_column{member_column_name<token_member>().view()};
+        if(is_persisted_column(model_, token_column))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+template <typename T>
+bool set_state<T>::build_update_command(const tracked& item, update_command& output) const
+{
+    std::string                    sql;
+    std::vector<entityfy::sql_value> binds;
+    bool                           first = true;
+
+    template for (constexpr auto member: update_members<T>())
+    {
+        const auto& current = item.entity.[:member:];
+        const auto& original = item.original.[:member:];
+
+        if(current == original)
+        {
+            continue;
+        }
+
+        if(first)
+        {
+            sql = "UPDATE " + entityfy::detail::quote_identifier(model_.table_name) + " SET ";
+            first = false;
+        }
+        else
+        {
+            sql += ", ";
+        }
+
+        sql += entityfy::detail::quote_identifier(annotated_column_name<member>().view()) + " = ?";
+        binds.push_back(entityfy::detail::to_sql_value(current));
+    }
+
+    if(first)
+    {
+        return false;
+    }
+
+    const row_key key = key_of(item.entity);
+    const auto    filter = entityfy::detail::primary_key_filter(model_, key);
+    sql += " WHERE " + filter.sql;
+    binds.insert(binds.end(), filter.binds.begin(), filter.binds.end());
+
+    output.command = entityfy::statement{.sql = std::move(sql), .binds = std::move(binds)};
+    output.key = key;
+    return true;
+}
+
+template <typename T>
+entityfy::task<save_result> set_state<T>::delete_row_async(db_context& owner, std::size_t index)
+{
+    auto& item = *items[index];
+
+    if(item.state != entity_state::removed)
+    {
+        return async_save_chain::completed(save_result{});
+    }
+
+    const row_key key = key_of(item.entity);
+    if(key_is_unset(key))
+    {
+        mark_undo(index);
+        item.state = entity_state::detached;
+        needs_compaction_ = true;
+        return async_save_chain::completed(save_result{});
+    }
+
+    auto command = entityfy::delete_by_key_statement(model_, key);
+    owner.log(command.sql);
+
+    return owner.database().execute_async(command).then([this, index, key](auto executed) {
+        if(executed.rows_affected == 0)
+        {
+            throw entityfy::concurrency_error{
+                "entityfy: delete affected zero rows for key " + key.to_string(), {}};
+        }
+
+        auto& removed_item = *items[index];
+        mark_undo(index);
+        removed_item.state = entity_state::detached;
+        needs_compaction_ = true;
+
+        save_result result;
+        result.removed = static_cast<std::size_t>(executed.rows_affected);
+        return result;
+    });
+}
+
+template <typename T>
+entityfy::task<save_result> set_state<T>::insert_row_async(db_context& owner, std::size_t index)
+{
+    auto& item = *items[index];
+
+    if(item.state != entity_state::added)
+    {
+        return async_save_chain::completed(save_result{});
+    }
+
+    if(generated_key_ && !key_is_unset(item.entity))
+    {
+        throw std::runtime_error{"entityfy: explicit primary key is not allowed for an auto-increment model"};
+    }
+
+    mark_undo(index);
+
+    auto command = entityfy::insert_statement(item.entity, model_);
+    owner.log(command.sql);
+
+    return owner.database().execute_async(command).then([this, index](auto inserted) {
+        auto& added_item = *items[index];
+        added_item.original = added_item.entity;
+        added_item.state = entity_state::unchanged;
+
+        const row_key key = key_of(added_item.entity);
+        if(!key_is_unset(key))
+        {
+            identity[key] = index;
+        }
+
+        rebind_after_write(added_item.entity);
+
+        save_result result;
+        result.inserted = static_cast<std::size_t>(inserted.rows_affected);
+        return result;
+    });
+}
+
+template <typename T>
+entityfy::task<save_result> set_state<T>::save_row_async(db_context& owner, std::size_t index)
+{
+    auto& item = *items[index];
+
+    if(item.state == entity_state::detached || item.state == entity_state::removed)
+    {
+        return async_save_chain::completed(save_result{});
+    }
+
+    if(item.state == entity_state::added)
+    {
+        return insert_row_async(owner, index);
+    }
+
+    if(!owner.auto_detect() && !item.marked_modified)
+    {
+        return async_save_chain::completed(save_result{});
+    }
+
+    update_command command;
+    if(!build_update_command(item, command))
+    {
+        mark_undo(index);
+        item.original = item.entity;
+        item.marked_modified = false;
+        return async_save_chain::completed(save_result{});
+    }
+
+    mark_undo(index);
+    owner.log(command.command.sql);
+
+    return owner.database().execute_async(command.command).then([this, index, key = command.key](auto updated) {
+        if(updated.rows_affected == 0)
+        {
+            throw entityfy::concurrency_error{
+                "entityfy: update affected zero rows for key " + key.to_string(), {}};
+        }
+
+        auto& updated_item = *items[index];
+        updated_item.original = updated_item.entity;
+        updated_item.marked_modified = false;
+        rebind_after_write(updated_item.entity);
+
+        save_result result;
+        result.updated = static_cast<std::size_t>(updated.rows_affected);
+        return result;
+    });
+}
+
+template <typename T>
+entityfy::task<save_result> set_state<T>::delete_removed_async(db_context& owner)
+{
+    std::vector<async_save_chain::step> steps;
+    steps.reserve(removed_indices_.size());
+
+    for(const std::size_t index: removed_indices_)
+    {
+        steps.push_back([this, owner_ptr = &owner, index] { return delete_row_async(*owner_ptr, index); });
+    }
+
+    return async_save_chain::run(std::move(steps));
+}
+
+template <typename T>
+entityfy::task<save_result> set_state<T>::save_async(db_context& owner)
+{
+    std::vector<std::size_t> added_indices;
+    added_indices.reserve(added_indices_.size());
+
+    for(const std::size_t index: added_indices_)
+    {
+        if(items[index]->state == entity_state::added)
+        {
+            added_indices.push_back(index);
+        }
+    }
+
+    std::vector<std::size_t> pending;
+
+    if(owner.auto_detect())
+    {
+        pending.resize(items.size());
+        for(std::size_t index = 0; index < items.size(); ++index)
+        {
+            pending[index] = index;
+        }
+    }
+    else
+    {
+        pending.reserve(added_indices.size() + modified_indices_.size());
+
+        for(const std::size_t index: added_indices)
+        {
+            if(items[index]->state == entity_state::added)
+            {
+                pending.push_back(index);
+            }
+        }
+
+        for(const std::size_t index: modified_indices_)
+        {
+            if(items[index]->state == entity_state::unchanged && items[index]->marked_modified)
+            {
+                pending.push_back(index);
+            }
+        }
+    }
+
+    std::vector<async_save_chain::step> steps;
+    steps.reserve(added_indices.size() + pending.size());
+
+    for(const std::size_t index: added_indices)
+    {
+        steps.push_back([this, owner_ptr = &owner, index] { return insert_row_async(*owner_ptr, index); });
+    }
+
+    for(const std::size_t index: pending)
+    {
+        steps.push_back([this, owner_ptr = &owner, index] { return save_row_async(*owner_ptr, index); });
+    }
+
+    return async_save_chain::run(std::move(steps)).then([this](save_result result) {
+        finish_save_tail();
+        return result;
+    });
+}
+
+template <typename T>
+void set_state<T>::finish_save_tail()
+{
+    if(needs_compaction_)
+    {
+        std::deque<std::unique_ptr<tracked>> kept;
+
+        for(auto& holder: items)
+        {
+            if(holder->state != entity_state::removed && holder->state != entity_state::detached)
+            {
+                kept.push_back(std::move(holder));
+            }
+        }
+
+        items.swap(kept);
+        needs_compaction_ = false;
+        rebuild_identity();
+    }
+
+    for(const std::size_t index: modified_indices_)
+    {
+        if(index < items.size())
+        {
+            items[index]->marked_modified = false;
+        }
+    }
+
+    added_indices_.clear();
+    removed_indices_.clear();
+    modified_indices_.clear();
 }
 
 } // namespace detail

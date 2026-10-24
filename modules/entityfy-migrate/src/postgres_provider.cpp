@@ -148,6 +148,72 @@ std::string column_definition(const column& value, bool composite_key)
     return output;
 }
 
+std::string foreign_key_name(const std::string& table, const std::vector<std::string>& columns)
+{
+    std::string output = "fk_" + table;
+    for(const auto& column: columns)
+    {
+        output += "_" + column;
+    }
+
+    return truncate_identifier(std::move(output));
+}
+
+std::string foreign_key_sql(const table& value, const foreign_key& key, bool with_constraint_name)
+{
+    const auto columns = foreign_key_columns(key);
+    const auto referenced = foreign_key_ref_columns(key);
+
+    if(columns.empty() || columns.size() != referenced.size())
+    {
+        throw std::logic_error{"entityfy/migrate:postgres: foreign key on `" + value.name + "` has " +
+                               std::to_string(columns.size()) + " local columns but " +
+                               std::to_string(referenced.size()) + " referenced columns"};
+    }
+
+    std::string output;
+    if(with_constraint_name)
+    {
+        output = "CONSTRAINT " + quote_ident(foreign_key_name(value.name, columns)) + " ";
+    }
+
+    output += "FOREIGN KEY (";
+    for(std::size_t index = 0; index < columns.size(); ++index)
+    {
+        if(index != 0)
+        {
+            output += ", ";
+        }
+
+        output += quote_ident(columns[index]);
+    }
+
+    output += ") REFERENCES " + quote_ident(key.ref_table) + " (";
+    for(std::size_t index = 0; index < referenced.size(); ++index)
+    {
+        if(index != 0)
+        {
+            output += ", ";
+        }
+
+        output += quote_ident(referenced[index]);
+    }
+
+    output += ")";
+
+    if(!key.on_delete.empty())
+    {
+        output += " ON DELETE " + key.on_delete;
+    }
+
+    if(!key.on_update.empty())
+    {
+        output += " ON UPDATE " + key.on_update;
+    }
+
+    return output;
+}
+
 std::string create_table_sql(const table& value, bool if_not_exists)
 {
     const std::vector<std::string> key_columns = primary_key_columns(value);
@@ -185,6 +251,16 @@ std::string create_table_sql(const table& value, bool if_not_exists)
         }
 
         output += ")";
+    }
+
+    for(const auto& key: value.foreign_keys)
+    {
+        if(foreign_key_columns(key).size() < 2)
+        {
+            continue;
+        }
+
+        output += ", " + foreign_key_sql(value, key, true);
     }
 
     output += ")";
@@ -244,6 +320,59 @@ struct key_change
     std::vector<std::string> before;
     std::vector<std::string> after;
 };
+
+struct catalog_foreign_key
+{
+    std::string              name;
+    std::string              ref_table;
+    std::vector<std::string> columns;
+    std::vector<std::string> ref_columns;
+};
+
+std::vector<catalog_foreign_key> read_foreign_key_constraints(pq::database& database, const std::string& table)
+{
+    const auto rows = database.query_params(
+        "SELECT con.conname, a.attname, rt.relname, ra.attname "
+        "FROM pg_constraint con "
+        "JOIN pg_class t ON t.oid = con.conrelid "
+        "JOIN pg_namespace n ON n.oid = t.relnamespace "
+        "JOIN pg_class rt ON rt.oid = con.confrelid "
+        "JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON true "
+        "JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum "
+        "JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS r(attnum, ord) ON r.ord = k.ord "
+        "JOIN pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = r.attnum "
+        "WHERE con.contype = 'f' AND n.nspname = current_schema() AND t.relname = $1 "
+        "ORDER BY con.conname, k.ord",
+        {table});
+
+    std::vector<catalog_foreign_key> output;
+    std::vector<std::pair<std::string, std::size_t>> indices;
+
+    for(const auto& row: rows)
+    {
+        if(row.size() < 4)
+        {
+            continue;
+        }
+
+        const std::string& name = row[0];
+        auto known = std::ranges::find_if(
+            indices, [&](const std::pair<std::string, std::size_t>& entry) { return entry.first == name; });
+
+        if(known == indices.end())
+        {
+            indices.emplace_back(name, output.size());
+            output.push_back(catalog_foreign_key{.name = name, .ref_table = row[2]});
+            known = indices.end() - 1;
+        }
+
+        auto& current = output[known->second];
+        current.columns.push_back(row[1]);
+        current.ref_columns.push_back(row[3]);
+    }
+
+    return output;
+}
 
 const std::vector<operation> empty_operations;
 
@@ -384,18 +513,44 @@ public:
             }
 
             const auto foreign_keys = database_->query_params(
-                "SELECT kcu.column_name, ccu.table_name, ccu.column_name, rc.delete_rule, rc.update_rule, "
-                "tc.constraint_name "
-                "FROM information_schema.table_constraints tc "
-                "JOIN information_schema.key_column_usage kcu "
-                "  ON kcu.constraint_name = tc.constraint_name AND kcu.constraint_schema = tc.constraint_schema "
-                "JOIN information_schema.constraint_column_usage ccu "
-                "  ON ccu.constraint_name = tc.constraint_name AND ccu.constraint_schema = tc.constraint_schema "
-                "JOIN information_schema.referential_constraints rc "
-                "  ON rc.constraint_name = tc.constraint_name AND rc.constraint_schema = tc.constraint_schema "
-                "WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = current_schema() "
-                "AND tc.table_name = $1 ORDER BY kcu.ordinal_position",
+                "SELECT con.conname, a.attname, rt.relname, ra.attname, con.confupdtype, con.confdeltype "
+                "FROM pg_constraint con "
+                "JOIN pg_class t ON t.oid = con.conrelid "
+                "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                "JOIN pg_class rt ON rt.oid = con.confrelid "
+                "JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON true "
+                "JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum "
+                "JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS r(attnum, ord) ON r.ord = k.ord "
+                "JOIN pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = r.attnum "
+                "WHERE con.contype = 'f' AND n.nspname = current_schema() AND t.relname = $1 "
+                "ORDER BY con.conname, k.ord",
                 {current.name});
+
+            const auto action = [](const std::string& code) -> std::string {
+                if(code == "c")
+                {
+                    return "CASCADE";
+                }
+
+                if(code == "n")
+                {
+                    return "SET NULL";
+                }
+
+                if(code == "d")
+                {
+                    return "SET DEFAULT";
+                }
+
+                if(code == "r")
+                {
+                    return "RESTRICT";
+                }
+
+                return {};
+            };
+
+            std::vector<std::pair<std::string, std::size_t>> key_indices;
 
             for(const auto& key_row: foreign_keys)
             {
@@ -404,23 +559,48 @@ public:
                     continue;
                 }
 
-                foreign_key entry;
-                entry.column = key_row[0];
-                entry.ref_table = key_row[1];
-                entry.ref_column = key_row[2];
-                entry.on_delete = key_row[3] == "NO ACTION" ? std::string{} : key_row[3];
-                entry.on_update = key_row[4] == "NO ACTION" ? std::string{} : key_row[4];
+                const std::string& name = key_row[0];
+                auto known = std::ranges::find_if(
+                    key_indices, [&](const std::pair<std::string, std::size_t>& entry) { return entry.first == name; });
 
-                current.foreign_keys.emplace_back(entry);
-
-                if(column* target = find_column(current, entry.column))
+                if(known == key_indices.end())
                 {
-                    target->references = reference{
-                        .table = entry.ref_table,
-                        .column = entry.ref_column,
-                        .on_delete = entry.on_delete,
-                        .on_update = entry.on_update,
-                    };
+                    key_indices.emplace_back(name, current.foreign_keys.size());
+
+                    foreign_key entry;
+                    entry.ref_table = key_row[2];
+                    entry.on_update = action(key_row[4]);
+                    entry.on_delete = action(key_row[5]);
+                    current.foreign_keys.emplace_back(std::move(entry));
+                    known = key_indices.end() - 1;
+                }
+
+                foreign_key& entry = current.foreign_keys[known->second];
+                entry.columns.push_back(key_row[1]);
+                entry.ref_columns.push_back(key_row[3]);
+            }
+
+            for(auto& entry: current.foreign_keys)
+            {
+                if(entry.columns.empty())
+                {
+                    continue;
+                }
+
+                entry.column = entry.columns.front();
+                entry.ref_column = entry.ref_columns.front();
+
+                if(entry.columns.size() == 1)
+                {
+                    if(column* target = find_column(current, entry.column))
+                    {
+                        target->references = reference{
+                            .table = entry.ref_table,
+                            .column = entry.ref_column,
+                            .on_delete = entry.on_delete,
+                            .on_update = entry.on_update,
+                        };
+                    }
                 }
             }
 
@@ -645,48 +825,49 @@ public:
                 }
                 case op_kind::add_foreign_key:
                 {
-                    const std::string name = truncate_identifier(
-                        "fk_" + desired_table.name + "_" + value.fk_spec.column);
-                    std::string sql = "ALTER TABLE " + quote_ident(desired_table.name) + " ADD CONSTRAINT " +
-                                      quote_ident(name) + " FOREIGN KEY (" + quote_ident(value.fk_spec.column) +
-                                      ") REFERENCES " + quote_ident(value.fk_spec.ref_table) + " (" +
-                                      quote_ident(value.fk_spec.ref_column) + ")";
-
-                    if(!value.fk_spec.on_delete.empty())
-                    {
-                        sql += " ON DELETE " + value.fk_spec.on_delete;
-                    }
-
-                    if(!value.fk_spec.on_update.empty())
-                    {
-                        sql += " ON UPDATE " + value.fk_spec.on_update;
-                    }
-
                     step add;
-                    add.sql = std::move(sql);
+                    add.sql = "ALTER TABLE " + quote_ident(desired_table.name) + " ADD " +
+                              foreign_key_sql(desired_table, value.fk_spec, true);
                     output.steps.emplace_back(std::move(add));
                     break;
                 }
                 case op_kind::drop_foreign_key:
                 {
-                    const auto rows = database_->query_params(
-                        "SELECT tc.constraint_name FROM information_schema.table_constraints tc "
-                        "JOIN information_schema.key_column_usage kcu "
-                        " ON kcu.constraint_name = tc.constraint_name AND kcu.constraint_schema = tc.constraint_schema "
-                        "WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = current_schema() "
-                        "AND tc.table_name = $1 AND kcu.column_name = $2 LIMIT 1",
-                        {desired_table.name, value.fk_spec.column});
+                    const auto desired_columns = foreign_key_columns(value.fk_spec);
+                    const auto desired_referenced = foreign_key_ref_columns(value.fk_spec);
 
-                    if(rows.empty() || rows.front().empty())
+                    std::string constraint;
+                    for(const auto& candidate: read_foreign_key_constraints(*database_, desired_table.name))
                     {
+                        if(candidate.columns == desired_columns && candidate.ref_table == value.fk_spec.ref_table &&
+                           candidate.ref_columns == desired_referenced)
+                        {
+                            constraint = candidate.name;
+                            break;
+                        }
+                    }
+
+                    if(constraint.empty())
+                    {
+                        std::string listed;
+                        for(const auto& name: desired_columns)
+                        {
+                            if(!listed.empty())
+                            {
+                                listed += ", ";
+                            }
+
+                            listed += name;
+                        }
+
                         output.warnings.push_back("foreign key constraint not found for " + desired_table.name +
-                                                  "." + value.fk_spec.column);
+                                                  " (" + listed + ")");
                         break;
                     }
 
                     step drop;
                     drop.sql = "ALTER TABLE " + quote_ident(desired_table.name) + " DROP CONSTRAINT " +
-                               quote_ident(rows.front().front());
+                               quote_ident(constraint);
                     output.steps.emplace_back(std::move(drop));
                     break;
                 }

@@ -447,12 +447,35 @@ public:
         return table_client<Related>{*backend_}.find_many(where(foreign_key).eq(key));
     }
 
+    // Composite key: key part i binds to foreign_keys...[i] in declaration
+    // order, so the caller names the columns once and both key parts are
+    // required to match.
+    template <typename Related, typename... ForeignKeys>
+        requires(sizeof...(ForeignKeys) > 1)
+    [[nodiscard]] std::vector<Related> has_many(const Model& parent, ForeignKeys Related::*... foreign_keys)
+    {
+        require_composite_key_count("has_many", primary_key_columns(model_).size(), sizeof...(ForeignKeys));
+        return table_client<Related>{*backend_}.find_many(
+            composite_key_filter(detail::primary_key_of(parent, model_), foreign_keys...)
+        );
+    }
+
     template <typename Related, typename ForeignKey>
     [[nodiscard]] std::optional<Related> has_one(const Model& parent, ForeignKey Related::* foreign_key)
     {
         require_single_column_key("has_one");
         const auto key = detail::primary_key_value(parent, model_);
         return table_client<Related>{*backend_}.find_one(where(foreign_key).eq(key));
+    }
+
+    template <typename Related, typename... ForeignKeys>
+        requires(sizeof...(ForeignKeys) > 1)
+    [[nodiscard]] std::optional<Related> has_one(const Model& parent, ForeignKeys Related::*... foreign_keys)
+    {
+        require_composite_key_count("has_one", primary_key_columns(model_).size(), sizeof...(ForeignKeys));
+        return table_client<Related>{*backend_}.find_one(
+            composite_key_filter(detail::primary_key_of(parent, model_), foreign_keys...)
+        );
     }
 
     template <typename Parent, typename ForeignKey>
@@ -471,9 +494,29 @@ public:
         return parents.find(child.*foreign_key);
     }
 
+    template <typename Parent, typename... ForeignKeys>
+        requires(sizeof...(ForeignKeys) > 1)
+    [[nodiscard]] std::optional<Parent> belongs_to(const Model& child, ForeignKeys Model::*... foreign_keys)
+    {
+        table_client<Parent> parents{*backend_};
+        const auto           key_columns = primary_key_columns(parents.descriptor());
+        require_composite_key_count("belongs_to", key_columns.size(), sizeof...(ForeignKeys));
+
+        condition   filter;
+        std::size_t index = 0;
+        auto        append_part = [&](sql_value value) {
+            filter = std::move(filter) &&
+                     detail::binary_condition(key_columns[index++].name, "=", std::move(value));
+        };
+
+        (append_part(detail::to_sql_value(child.*foreign_keys)), ...);
+
+        return parents.find_one(std::move(filter));
+    }
+
 private:
-    // Composite foreign keys are phase P1.5; until they land the navigation
-    // helpers reject a composite parent key instead of guessing a column.
+    // The single-pointer overloads above still map exactly one key part to one
+    // column; composite keys go through the variadic overloads instead.
     void require_single_column_key(std::string_view operation) const
     {
         if(primary_key_columns(model_).size() != 1)
@@ -483,6 +526,41 @@ private:
                 " requires a single-column primary key; composite foreign keys are not supported yet"
             };
         }
+    }
+
+    // Every composite overload maps key part i to foreign key column i, so a
+    // different pointer count would silently compare the wrong columns.
+    static void require_composite_key_count(
+        std::string_view operation,
+        std::size_t      key_column_count,
+        std::size_t      foreign_key_count
+    )
+    {
+        if(key_column_count != foreign_key_count)
+        {
+            throw std::logic_error{
+                "entityfy ORM " + std::string{operation} + " expects " + std::to_string(key_column_count) +
+                " foreign key columns to match the composite primary key; received " +
+                std::to_string(foreign_key_count)
+            };
+        }
+    }
+
+    // Builds one AND condition over the parent key parts: key part i binds to
+    // foreign_keys...[i] in declaration order. column_name() rejects pointers
+    // that do not name a persisted column.
+    template <typename Related, typename... ForeignKeys>
+    [[nodiscard]] static condition composite_key_filter(const row_key& key, ForeignKeys Related::*... foreign_keys)
+    {
+        condition   filter;
+        std::size_t index = 0;
+        auto        append_part = [&](std::string column) {
+            filter = std::move(filter) &&
+                     detail::binary_condition(std::move(column), "=", key.part(index++));
+        };
+
+        (append_part(column_name(foreign_keys)), ...);
+        return filter;
     }
 
     void apply_schema_statements(const std::vector<statement>& statements)

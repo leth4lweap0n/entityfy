@@ -481,6 +481,214 @@ entityfy_test::status test_postgres()
                 "pg key test table dropped");
     }
 
+    // Composite foreign keys are one table-level constraint: create, read it
+    // back as one entry with ordered lists, drop by catalog name, re-add, and
+    // prove both the pairing and the cascade survive.
+    {
+        backend->execute_sql("DROP TABLE IF EXISTS \"pg_migrate_fk_children\" CASCADE");
+        backend->execute_sql("DROP TABLE IF EXISTS \"pg_migrate_fk_parents\" CASCADE");
+
+        entityfy::migrate::schema composite;
+
+        entityfy::migrate::table parents;
+        parents.name = "pg_migrate_fk_parents";
+        parents.primary_key = {"tenant_id", "code"};
+        parents.columns.push_back(entityfy::migrate::column{.name = "tenant_id", .type = "INTEGER", .not_null = true,
+                                                            .primary_key = true});
+        parents.columns.push_back(entityfy::migrate::column{.name = "code", .type = "VARCHAR(16)", .not_null = true,
+                                                            .primary_key = true});
+        parents.columns.push_back(entityfy::migrate::column{.name = "name", .type = "VARCHAR(80)", .not_null = true});
+        composite.tables.push_back(parents);
+
+        entityfy::migrate::table children;
+        children.name = "pg_migrate_fk_children";
+        children.primary_key = {"id"};
+        children.columns.push_back(entityfy::migrate::column{.name = "id", .type = "INTEGER", .not_null = true,
+                                                             .primary_key = true, .auto_increment = true});
+        children.columns.push_back(entityfy::migrate::column{.name = "tenant_id", .type = "INTEGER", .not_null = true});
+        children.columns.push_back(entityfy::migrate::column{.name = "parent_code", .type = "VARCHAR(16)", .not_null = true});
+        children.columns.push_back(entityfy::migrate::column{.name = "body", .type = "VARCHAR(80)", .not_null = true});
+        children.foreign_keys.push_back(entityfy::migrate::foreign_key{
+            .column = "tenant_id",
+            .ref_table = "pg_migrate_fk_parents",
+            .ref_column = "tenant_id",
+            .on_delete = "CASCADE",
+            .on_update = "CASCADE",
+            .columns = {"tenant_id", "parent_code"},
+            .ref_columns = {"tenant_id", "code"},
+        });
+        composite.tables.push_back(children);
+
+        const auto creation = backend->make_plan(composite, entityfy::migrate::schema{}, {});
+        require(creation.steps.size() == 2, "pg composite fk creation creates both tables");
+        require(!creation.destructive, "pg composite fk creation is not destructive");
+
+        const auto create_child = std::ranges::find_if(creation.steps, [](const entityfy::migrate::step& value) {
+            return value.sql.starts_with("CREATE TABLE") &&
+                   value.sql.find("\"pg_migrate_fk_children\"") != std::string::npos;
+        });
+        require(create_child != creation.steps.end() &&
+                    create_child->sql.find(
+                        "CONSTRAINT \"fk_pg_migrate_fk_children_tenant_id_parent_code\" "
+                        "FOREIGN KEY (\"tenant_id\", \"parent_code\") REFERENCES \"pg_migrate_fk_parents\" "
+                        "(\"tenant_id\", \"code\") ON DELETE CASCADE ON UPDATE CASCADE") != std::string::npos,
+                "pg create table emits one named composite foreign key");
+
+        apply_plan(*backend, creation);
+
+        const auto subset_of = [](const entityfy::migrate::schema& source,
+                                  std::initializer_list<std::string_view> names) {
+            entityfy::migrate::schema output;
+            for(const auto name: names)
+            {
+                if(const auto* found = entityfy::migrate::find_table(source, name))
+                {
+                    output.tables.push_back(*found);
+                }
+            }
+            return output;
+        };
+
+        const auto actual = subset_of(backend->introspect(),
+                                      {"pg_migrate_fk_parents", "pg_migrate_fk_children"});
+        require(actual.tables.size() == 2, "pg composite fk tables introspected");
+
+        const auto* child = entityfy::migrate::find_table(actual, "pg_migrate_fk_children");
+        require(child != nullptr && child->foreign_keys.size() == 1,
+                "pg composite foreign key introspected as one constraint");
+        require(child->foreign_keys.front().columns == std::vector<std::string>{"tenant_id", "parent_code"},
+                "pg composite foreign key local columns introspected");
+        require(child->foreign_keys.front().ref_columns == std::vector<std::string>{"tenant_id", "code"},
+                "pg composite foreign key referenced columns introspected");
+        require(child->foreign_keys.front().on_delete == "CASCADE" &&
+                    child->foreign_keys.front().on_update == "CASCADE",
+                "pg composite foreign key actions introspected");
+        require(!entityfy::migrate::find_column(*child, "tenant_id")->references.has_value() &&
+                    !entityfy::migrate::find_column(*child, "parent_code")->references.has_value(),
+                "pg composite columns have no column-level reference");
+
+        const auto* parent = entityfy::migrate::find_table(actual, "pg_migrate_fk_parents");
+        require(parent != nullptr && parent->foreign_keys.empty(), "pg parent has no foreign keys");
+        require(entityfy::migrate::same_schema(composite, actual), "pg composite fk create roundtrip");
+
+        const auto idempotent = backend->make_plan(composite, actual, {});
+        require(idempotent.steps.empty(), "pg composite foreign key apply is idempotent");
+
+        backend->execute_sql(
+            "INSERT INTO \"pg_migrate_fk_parents\" (\"tenant_id\", \"code\", \"name\") VALUES (1, 'eu', 'EU')");
+        backend->execute_sql(
+            "INSERT INTO \"pg_migrate_fk_parents\" (\"tenant_id\", \"code\", \"name\") VALUES (1, 'us', 'US')");
+        backend->execute_sql(
+            "INSERT INTO \"pg_migrate_fk_parents\" (\"tenant_id\", \"code\", \"name\") VALUES (2, 'eu', 'DE')");
+        backend->execute_sql(
+            "INSERT INTO \"pg_migrate_fk_children\" (\"id\", \"tenant_id\", \"parent_code\", \"body\") "
+            "VALUES (1, 1, 'eu', 'first')");
+        backend->execute_sql(
+            "INSERT INTO \"pg_migrate_fk_children\" (\"id\", \"tenant_id\", \"parent_code\", \"body\") "
+            "VALUES (2, 1, 'us', 'second')");
+        backend->execute_sql(
+            "INSERT INTO \"pg_migrate_fk_children\" (\"id\", \"tenant_id\", \"parent_code\", \"body\") "
+            "VALUES (3, 2, 'eu', 'third')");
+
+        bool mismatch_rejected = false;
+        try
+        {
+            backend->execute_sql(
+                "INSERT INTO \"pg_migrate_fk_children\" (\"id\", \"tenant_id\", \"parent_code\", \"body\") "
+                "VALUES (4, 1, 'zz', 'mismatch')");
+        }
+        catch(const std::exception&)
+        {
+            mismatch_rejected = true;
+        }
+
+        require(mismatch_rejected, "pg composite foreign key enforces the column pair");
+
+        backend->execute_sql(
+            "DELETE FROM \"pg_migrate_fk_parents\" WHERE \"tenant_id\" = 1 AND \"code\" = 'eu'");
+        auto counted = backend->query("SELECT COUNT(*) FROM \"pg_migrate_fk_children\"");
+        require(counted.size() == 1 && counted.front().front() == "2", "pg composite foreign key cascades");
+
+        auto without = composite;
+        entityfy::migrate::find_table(without, "pg_migrate_fk_children")->foreign_keys.clear();
+
+        const auto drop_plan = backend->make_plan(without, actual, {});
+        require(!drop_plan.destructive, "pg composite foreign key drop is not destructive");
+        require(drop_plan.steps.size() == 1 &&
+                    drop_plan.steps.front().sql ==
+                        "ALTER TABLE \"pg_migrate_fk_children\" DROP CONSTRAINT "
+                        "\"fk_pg_migrate_fk_children_tenant_id_parent_code\"",
+                "pg composite foreign key dropped by its catalog name");
+        apply_plan(*backend, drop_plan);
+
+        const auto after_drop = subset_of(backend->introspect(),
+                                          {"pg_migrate_fk_parents", "pg_migrate_fk_children"});
+        const auto* dropped_child = entityfy::migrate::find_table(after_drop, "pg_migrate_fk_children");
+        require(dropped_child != nullptr && dropped_child->foreign_keys.empty(),
+                "pg composite foreign key dropped");
+        require(entityfy::migrate::same_schema(without, after_drop),
+                "pg composite foreign key drop matches the model");
+
+        counted = backend->query("SELECT COUNT(*) FROM \"pg_migrate_fk_children\"");
+        require(counted.size() == 1 && counted.front().front() == "2",
+                "pg child rows survive dropping the composite foreign key");
+        counted = backend->query("SELECT COUNT(*) FROM \"pg_migrate_fk_parents\"");
+        require(counted.size() == 1 && counted.front().front() == "2",
+                "pg parent rows survive dropping the child constraint");
+
+        const auto readd = backend->make_plan(composite, after_drop, {});
+        require(readd.steps.size() == 1 &&
+                    readd.steps.front().sql ==
+                        "ALTER TABLE \"pg_migrate_fk_children\" ADD CONSTRAINT "
+                        "\"fk_pg_migrate_fk_children_tenant_id_parent_code\" "
+                        "FOREIGN KEY (\"tenant_id\", \"parent_code\") REFERENCES \"pg_migrate_fk_parents\" "
+                        "(\"tenant_id\", \"code\") ON DELETE CASCADE ON UPDATE CASCADE",
+                "pg composite foreign key re-added as one constraint");
+        apply_plan(*backend, readd);
+
+        const auto after_readd = subset_of(backend->introspect(),
+                                           {"pg_migrate_fk_parents", "pg_migrate_fk_children"});
+        const auto* readded_child = entityfy::migrate::find_table(after_readd, "pg_migrate_fk_children");
+        require(readded_child != nullptr && readded_child->foreign_keys.size() == 1 &&
+                    readded_child->foreign_keys.front().columns ==
+                        std::vector<std::string>{"tenant_id", "parent_code"} &&
+                    readded_child->foreign_keys.front().ref_columns ==
+                        std::vector<std::string>{"tenant_id", "code"},
+                "pg composite foreign key re-added with both column lists");
+
+        counted = backend->query("SELECT COUNT(*) FROM \"pg_migrate_fk_children\"");
+        require(counted.size() == 1 && counted.front().front() == "2",
+                "pg child rows survive re-adding the composite foreign key");
+
+        bool enforced_again = false;
+        try
+        {
+            backend->execute_sql(
+                "INSERT INTO \"pg_migrate_fk_children\" (\"id\", \"tenant_id\", \"parent_code\", \"body\") "
+                "VALUES (5, 2, 'zz', 'mismatch')");
+        }
+        catch(const std::exception&)
+        {
+            enforced_again = true;
+        }
+
+        require(enforced_again, "pg re-added composite foreign key is enforced");
+
+        backend->execute_sql("DELETE FROM \"pg_migrate_fk_parents\" WHERE \"tenant_id\" = 2");
+        counted = backend->query("SELECT COUNT(*) FROM \"pg_migrate_fk_children\"");
+        require(counted.size() == 1 && counted.front().front() == "1",
+                "pg re-added composite foreign key cascades");
+
+        const auto stable = backend->make_plan(composite, after_readd, {});
+        require(stable.steps.empty(), "pg composite foreign key re-add is idempotent");
+
+        backend->execute_sql("DROP TABLE IF EXISTS \"pg_migrate_fk_children\" CASCADE");
+        backend->execute_sql("DROP TABLE IF EXISTS \"pg_migrate_fk_parents\" CASCADE");
+        require(entityfy::migrate::find_table(backend->introspect(), "pg_migrate_fk_children") == nullptr &&
+                    entityfy::migrate::find_table(backend->introspect(), "pg_migrate_fk_parents") == nullptr,
+                "pg composite fk tables dropped");
+    }
+
     cleanup(*backend);
 
     return entityfy_test::status::passed;

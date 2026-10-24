@@ -104,6 +104,15 @@ struct [[= entityfy::table{"rc_tags"}]] rc_tag
     std::string payload = "{}";
 };
 
+struct [[= entityfy::table{"pg_async_tags"}]] pg_async_tag
+{
+    [[= entityfy::primary_key]]
+    std::int64_t id = 0;
+
+    [[= entityfy::not_null, = entityfy::varchar{50}]]
+    std::string name;
+};
+
 struct [[= entityfy::table{"rc_parents"}]] rc_parent
 {
     [[= entityfy::primary_key]]
@@ -1806,6 +1815,18 @@ status run_async_checks()
 
     require(result.inserted == 1, "async save inserts the pending row");
     require(ctx.database().table<rc_tag>().count() == 1, "async save persists the row");
+    require(!ctx.last_save_used_native_async(), "sqlite automatic async save falls back to the offload path");
+
+    bool native_refused = false;
+    try
+    {
+        ctx.set_async_save_strategy(entityfy::async_save_strategy::native);
+    }
+    catch(const std::logic_error&)
+    {
+        native_refused = true;
+    }
+    require(native_refused, "sqlite rejects an explicit native async strategy");
 
     tags.add(rc_tag{.id = 2, .name = "second"});
     const auto second = ctx.save_changes_async().get();
@@ -2120,6 +2141,130 @@ status run_composite_key_checks()
     // The contexts above still hold the file, so it is removed once they are
     // destroyed.
     std::filesystem::remove(path);
+
+    return status::passed;
+}
+
+status run_postgres_async_checks()
+{
+    const char* uri = std::getenv("ENTITYFY_PG_URI");
+    if(uri == nullptr || std::string{uri}.empty())
+    {
+        if(postgres_required())
+        {
+            throw std::runtime_error{"ENTITYFY_REQUIRE_PG=1 but ENTITYFY_PG_URI is not set"};
+        }
+
+        std::cout << "postgres_async skipped: ENTITYFY_PG_URI is not set\n";
+        return status::skipped;
+    }
+
+    {
+        entityfy::db_context ctx{uri};
+        ctx.execute("SET client_min_messages TO WARNING");
+        ctx.execute("DROP TABLE IF EXISTS \"pg_async_tags\" CASCADE");
+        ctx.migrate<pg_async_tag>();
+
+        auto tags = ctx.set<pg_async_tag>();
+        auto& first = tags.add(pg_async_tag{.id = 1, .name = "one"});
+        require(ctx.native_async_save_available(), "pg native async save is available for a keyed model");
+
+        ctx.set_async_save_strategy(entityfy::async_save_strategy::native);
+        auto inserted = ctx.save_changes_once_async().get();
+        require(ctx.last_save_used_native_async(), "pg native async insert used the native path");
+        require(inserted.inserted == 1, "pg native async insert count");
+
+        first.name = "two";
+        auto updated = ctx.save_changes_async().get();
+        require(updated.updated == 1, "pg native async update count");
+        require(std::get<std::string>(ctx.query("SELECT \"name\" FROM \"pg_async_tags\" WHERE \"id\" = 1").front().front()) == "two",
+                "pg native async update persisted");
+
+        ctx.remove(first);
+        auto removed = ctx.save_changes_async().get();
+        require(removed.removed == 1, "pg native async delete count");
+        require(as_integer(ctx.query("SELECT COUNT(*) FROM \"pg_async_tags\"").front().front()) == 0,
+                "pg native async delete persisted");
+
+        auto& a = tags.add(pg_async_tag{.id = 10, .name = "a"});
+        auto& b = tags.add(pg_async_tag{.id = 11, .name = "b"});
+        b.id = 10;
+
+        bool failed = false;
+        try
+        {
+            (void)ctx.save_changes_async().get();
+        }
+        catch(const std::exception&)
+        {
+            failed = true;
+        }
+
+        require(failed, "pg native async duplicate reports the failure");
+        require(as_integer(ctx.query("SELECT COUNT(*) FROM \"pg_async_tags\"").front().front()) == 0,
+                "pg native async duplicate rolls the transaction back");
+        require(ctx.native_async_save_available(), "pg native async remains available after rollback");
+
+        b.id = 12;
+        auto recovered = ctx.save_changes_async().get();
+        require(recovered.inserted == 2, "pg native async save recovers after rollback");
+        require(as_integer(ctx.query("SELECT COUNT(*) FROM \"pg_async_tags\"").front().front()) == 2,
+                "pg native async recovered rows persisted");
+
+        (void)a;
+        ctx.execute("DROP TABLE IF EXISTS \"pg_async_tags\" CASCADE");
+    }
+
+    {
+        entityfy::db_context generated{uri};
+        generated.execute("SET client_min_messages TO WARNING");
+        generated.execute("DROP TABLE IF EXISTS \"rc_users\" CASCADE");
+        generated.migrate<rc_user>();
+        auto users = generated.set<rc_user>();
+        users.add(rc_user{.email = "async-native-fallback@example.com", .name = "fallback"});
+
+        bool native_unsupported = false;
+        try
+        {
+            generated.set_async_save_strategy(entityfy::async_save_strategy::native);
+        }
+        catch(const std::logic_error&)
+        {
+            native_unsupported = true;
+        }
+        require(native_unsupported, "pg native async strategy rejects a generated-key model");
+
+        require(generated.save_changes_async().get().inserted == 1,
+                "pg automatic async save falls back to offload for a generated-key model");
+        require(!generated.last_save_used_native_async(),
+                "pg generated-key fallback did not claim the native path");
+        generated.execute("DROP TABLE IF EXISTS \"rc_users\" CASCADE");
+    }
+
+    {
+        auto owned = std::make_unique<entityfy::db_context>(uri);
+        owned->execute("SET client_min_messages TO WARNING");
+        owned->execute("DROP TABLE IF EXISTS \"pg_async_tags\" CASCADE");
+        owned->migrate<pg_async_tag>();
+        auto tags = owned->set<pg_async_tag>();
+
+        for(std::int64_t id = 1000; id < 1200; ++id)
+        {
+            tags.add(pg_async_tag{.id = id, .name = "drain"});
+        }
+
+        owned->set_async_save_strategy(entityfy::async_save_strategy::native);
+        auto pending = owned->save_changes_async();
+        owned.reset();
+        const auto drained = pending.get();
+        require(drained.inserted == 200, "pg native async drain task completes");
+
+        entityfy::db_context verify{uri};
+        verify.execute("SET client_min_messages TO WARNING");
+        require(as_integer(verify.query("SELECT COUNT(*) FROM \"pg_async_tags\"").front().front()) == 200,
+                "pg native async drain committed every row");
+        verify.execute("DROP TABLE IF EXISTS \"pg_async_tags\" CASCADE");
+    }
 
     return status::passed;
 }
@@ -3290,6 +3435,7 @@ int main()
         {"async", run_async_checks},
         {"async_drain", run_async_drain_checks},
         {"postgres", run_postgres_checks},
+        {"postgres_async", run_postgres_async_checks},
         {"mysql", run_mysql_checks},
         {"sqlserver", run_sqlserver_checks},
     };

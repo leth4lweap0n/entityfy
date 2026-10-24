@@ -45,6 +45,15 @@ struct [[= entityfy::table{"bench_users"}]] bench_user
     std::string name;
 };
 
+struct [[= entityfy::table{"bench_async_rows"}]] bench_async_row
+{
+    [[= entityfy::primary_key]]
+    std::int64_t id = 0;
+
+    [[= entityfy::not_null, = entityfy::varchar{120}]]
+    std::string name;
+};
+
 struct [[= entityfy::table{"bench_users_explicit"}]] bench_user_explicit
 {
     [[= entityfy::primary_key]]
@@ -1057,6 +1066,84 @@ void run_postgres_bench(const std::string& uri, std::size_t rows, std::size_t re
     std::cout << "\nNote: PostgreSQL timings include network latency; the server runs on the same machine.\n";
 }
 
+void run_async_save_bench(const std::string& uri, std::size_t requested_rows)
+{
+    const std::size_t rows = std::min<std::size_t>(requested_rows, 2000);
+
+    std::cout << "\nASYNC SAVE: offload vs native (single save, explicit key, rows=" << rows << ")\n";
+
+    for(const auto strategy: {entityfy::async_save_strategy::offload, entityfy::async_save_strategy::native})
+    {
+        entityfy::db_context ctx{uri};
+        ctx.execute("SET client_min_messages TO WARNING");
+        ctx.execute("DROP TABLE IF EXISTS \"bench_async_rows\"");
+        ctx.migrate<bench_async_row>();
+
+        auto rows_set = ctx.set<bench_async_row>();
+        ctx.set_async_save_strategy(strategy);
+
+        for(std::size_t index = 0; index < rows; ++index)
+        {
+            rows_set.add(bench_async_row{.id = static_cast<std::int64_t>(index), .name = "row " + std::to_string(index)});
+        }
+
+        const auto started = clock_type::now();
+        const auto inserted = ctx.save_changes_async().get();
+        const auto finished = clock_type::now();
+        const double seconds = std::chrono::duration<double>(finished - started).count();
+
+        std::cout << std::format("{:<26}{:>16.0f} rows/s ({:.3f}s, inserted={}, native={})\n",
+                                 strategy == entityfy::async_save_strategy::offload ? "offload insert" : "native insert",
+                                 seconds > 0.0 ? static_cast<double>(rows) / seconds : 0.0,
+                                 seconds,
+                                 inserted.inserted,
+                                 ctx.last_save_used_native_async() ? "yes" : "no");
+
+        for(std::size_t index = 0; index < rows; ++index)
+        {
+            rows_set.find(static_cast<std::int64_t>(index))->name = "updated " + std::to_string(index);
+        }
+
+        const auto update_started = clock_type::now();
+        const auto updated = ctx.save_changes_async().get();
+        const auto update_finished = clock_type::now();
+        const double update_seconds = std::chrono::duration<double>(update_finished - update_started).count();
+
+        std::cout << std::format("{:<26}{:>16.0f} rows/s ({:.3f}s, updated={})\n",
+                                 strategy == entityfy::async_save_strategy::offload ? "offload update" : "native update",
+                                 update_seconds > 0.0 ? static_cast<double>(rows) / update_seconds : 0.0,
+                                 update_seconds,
+                                 updated.updated);
+
+        // One-row saves show the per-save overhead instead of the bulk path:
+        // offload pays a worker round trip, native pays BEGIN/INSERT/COMMIT on
+        // the reactor.
+        constexpr std::size_t single_row_saves = 200;
+        const auto single_started = clock_type::now();
+
+        for(std::size_t index = 0; index < single_row_saves; ++index)
+        {
+            rows_set.add(bench_async_row{
+                .id = static_cast<std::int64_t>(100000 + index),
+                .name = "single " + std::to_string(index),
+            });
+            (void)ctx.save_changes_async().get();
+        }
+
+        const auto single_finished = clock_type::now();
+        const double single_seconds = std::chrono::duration<double>(single_finished - single_started).count();
+
+        std::cout << std::format("{:<26}{:>16.0f} saves/s ({:.3f}s, {})\n",
+                                 strategy == entityfy::async_save_strategy::offload ? "offload 1-row saves"
+                                                                                    : "native 1-row saves",
+                                 single_seconds > 0.0 ? static_cast<double>(single_row_saves) / single_seconds : 0.0,
+                                 single_seconds,
+                                 single_row_saves);
+
+        ctx.execute("DROP TABLE IF EXISTS \"bench_async_rows\"");
+    }
+}
+
 } // namespace
 
 #endif
@@ -1101,6 +1188,7 @@ int main(int argc, char** argv)
     if(const char* pg_uri = std::getenv("ENTITYFY_PG_URI"); pg_uri != nullptr && *pg_uri != '\0')
     {
         run_postgres_bench(pg_uri, rows, repetitions);
+        run_async_save_bench(pg_uri, rows);
     }
 #endif
 

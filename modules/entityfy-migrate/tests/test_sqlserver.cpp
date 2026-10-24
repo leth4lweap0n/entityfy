@@ -1,5 +1,6 @@
 #include "harness.hpp"
 
+#include <entityfy/detail/sqlserver_uri.hpp>
 #include <entityfy/migrate/engine.hpp>
 #include <entityfy/migrate/provider.hpp>
 
@@ -10,9 +11,100 @@
 #include <filesystem>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace
 {
+
+// These run without a server: they pin the wiring this provider depends on,
+// namely that the migrate provider consumes the core URI grammar (so mssql://
+// and percent-decoding behave like the runtime client) and that a semicolon in
+// a password stays inside one braced ODBC value instead of adding a keyword.
+void require_uri_wiring()
+{
+    using entityfy::detail::parse_sqlserver_uri;
+    using entityfy::detail::sqlserver_connection_string;
+
+    // An mssql:// URI with a percent-encoded semicolon in the password: the
+    // alias must resolve and the decoded ';' must reach ODBC as one value.
+    const auto options = parse_sqlserver_uri("mssql://sa:p%3Bword@db.local:1444/app");
+    require(options.host == "db.local", "sqlserver migrate accepts the mssql:// alias host");
+    require(options.port == 1444, "sqlserver migrate accepts the mssql:// alias port");
+    require(options.database == "app", "sqlserver migrate accepts the mssql:// alias database");
+    require(options.password == "p;word", "sqlserver migrate percent-decodes the password");
+    require(!options.mars, "sqlserver migrate leaves MARS off unless the URI asks for it");
+    require(options.encrypt && options.trust_server_certificate, "sqlserver migrate keeps the core encryption defaults");
+
+    const auto text = sqlserver_connection_string(options);
+    const auto password_begin = text.find("PWD=");
+    const auto password_end = text.find(";DATABASE=", password_begin);
+    require(password_begin != std::string::npos && password_end != std::string::npos,
+            "sqlserver migrate writes PWD and DATABASE keywords");
+    require(text.substr(password_begin, password_end - password_begin) == "PWD={p;word}",
+            "sqlserver migrate keeps a ';' password inside one braced ODBC value");
+
+    // '}' closes a braced value early unless it is doubled.
+    auto closing_brace = options;
+    closing_brace.password = "a}b";
+    const auto braced = sqlserver_connection_string(closing_brace);
+    require(braced.find("PWD={a}}b};") != std::string::npos, "sqlserver migrate doubles '}' in the password");
+
+    // The options the provider hands to the driver are the core ones, so the
+    // query string is honoured rather than ignored.
+    const auto tuned = parse_sqlserver_uri("mssql://sa:x@db:1433/app?mars=1&encrypt=0&trust_server_certificate=0");
+    require(tuned.mars, "sqlserver migrate takes MARS from ?mars=1");
+    const auto tuned_text = sqlserver_connection_string(tuned);
+    require(tuned_text.find("Encrypt=no") != std::string::npos, "sqlserver migrate applies ?encrypt=0");
+    require(tuned_text.find("TrustServerCertificate=no") != std::string::npos,
+            "sqlserver migrate applies ?trust_server_certificate=0");
+    require(tuned_text.find("MARS_Connection") == std::string::npos,
+            "sqlserver migrate enables MARS as a connection attribute, not a connection-string keyword");
+
+    // A database is never defaulted and a non-sqlserver scheme is rejected, so
+    // a typo surfaces as a parse error rather than aimless connection failure.
+    bool rejected_missing_database = false;
+    try
+    {
+        (void)parse_sqlserver_uri("mssql://sa:x@db:1433");
+    }
+    catch(const std::invalid_argument&)
+    {
+        rejected_missing_database = true;
+    }
+
+    require(rejected_missing_database, "sqlserver migrate rejects a URI without a database");
+
+    bool rejected_scheme = false;
+    try
+    {
+        (void)parse_sqlserver_uri("postgres://sa:x@db:5432/app");
+    }
+    catch(const std::invalid_argument&)
+    {
+        rejected_scheme = true;
+    }
+
+    require(rejected_scheme, "sqlserver migrate rejects a non-sqlserver scheme");
+}
+
+// Rewrites the configured URI onto the mssql:// alias. Returns an empty string
+// when the URI is already an alias, so the live alias probe only runs when it
+// actually tests the alias.
+[[nodiscard]] std::string alias_uri(std::string_view uri)
+{
+    constexpr std::string_view prefix = "sqlserver://";
+
+    if(!uri.starts_with(prefix))
+    {
+        return {};
+    }
+
+    std::string alias{"mssql://"};
+    alias.append(uri.substr(prefix.size()));
+    return alias;
+}
 
 void cleanup(entityfy::migrate::provider& backend)
 {
@@ -42,6 +134,30 @@ void cleanup(entityfy::migrate::provider& backend)
 
 entityfy_test::status test_sqlserver()
 {
+    // Pure checks first: they need no server and must hold even when the live
+    // section below is skipped.
+    require_uri_wiring();
+    std::cout << "sqlserver uri wiring passed (serverless: mssql:// alias, percent-decoded braced password)\n";
+
+    // The live alias probe is independent of the migration scenarios: it opens
+    // the configured account through the mssql:// alias and asks for one
+    // introspection result. A successful login proves the braced UID/PWD the
+    // provider now sends is accepted by the driver end to end; the ';' handling
+    // itself is pinned by require_uri_wiring above, which needs no server.
+    const auto check_alias = [](std::string_view uri) {
+        const auto alias = alias_uri(uri);
+
+        if(alias.empty())
+        {
+            std::cout << "sqlserver alias probe skipped: ENTITYFY_SQLSERVER_URI is not a sqlserver:// URI\n";
+            return;
+        }
+
+        auto backend = entityfy::migrate::open_sqlserver_provider(alias);
+        auto tables = backend->query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES");
+        require(!tables.empty() && !tables.front().empty(), "sqlserver mssql:// alias introspection returns a row");
+    };
+
     const char* uri = std::getenv("ENTITYFY_SQLSERVER_URI");
     if(uri == nullptr || std::string{uri}.empty())
     {
@@ -56,6 +172,8 @@ entityfy_test::status test_sqlserver()
         std::cout << "sqlserver skipped: ENTITYFY_SQLSERVER_URI is not set\n";
         return entityfy_test::status::skipped;
     }
+
+    check_alias(uri);
 
     auto backend = entityfy::migrate::open_sqlserver_provider(uri);
     cleanup(*backend);

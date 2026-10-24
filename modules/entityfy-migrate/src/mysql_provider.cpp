@@ -768,6 +768,8 @@ public:
                 "ORDER BY k.constraint_name, k.ordinal_position",
                 {current.name});
 
+            std::vector<std::pair<std::string, std::size_t>> key_indices;
+
             for(const auto& key_row: foreign_keys)
             {
                 if(key_row.size() < 6)
@@ -780,23 +782,48 @@ public:
                     return value == "NO ACTION" || value == "RESTRICT" ? std::string{} : value;
                 };
 
-                foreign_key entry;
-                entry.column = key_row[0];
-                entry.ref_table = key_row[1];
-                entry.ref_column = key_row[2];
-                entry.on_update = action(key_row[3]);
-                entry.on_delete = action(key_row[4]);
+                const std::string& name = key_row[5];
+                auto known = std::ranges::find_if(
+                    key_indices, [&](const std::pair<std::string, std::size_t>& entry) { return entry.first == name; });
 
-                current.foreign_keys.emplace_back(entry);
-
-                if(column* target = find_column(current, entry.column))
+                if(known == key_indices.end())
                 {
-                    target->references = reference{
-                        .table = entry.ref_table,
-                        .column = entry.ref_column,
-                        .on_delete = entry.on_delete,
-                        .on_update = entry.on_update,
-                    };
+                    key_indices.emplace_back(name, current.foreign_keys.size());
+
+                    foreign_key entry;
+                    entry.ref_table = key_row[1];
+                    entry.on_update = action(key_row[3]);
+                    entry.on_delete = action(key_row[4]);
+                    current.foreign_keys.emplace_back(std::move(entry));
+                    known = key_indices.end() - 1;
+                }
+
+                foreign_key& entry = current.foreign_keys[known->second];
+                entry.columns.push_back(key_row[0]);
+                entry.ref_columns.push_back(key_row[2]);
+            }
+
+            for(auto& entry: current.foreign_keys)
+            {
+                if(entry.columns.empty())
+                {
+                    continue;
+                }
+
+                entry.column = entry.columns.front();
+                entry.ref_column = entry.ref_columns.front();
+
+                if(entry.columns.size() == 1)
+                {
+                    if(column* target = find_column(current, entry.column))
+                    {
+                        target->references = reference{
+                            .table = entry.ref_table,
+                            .column = entry.ref_column,
+                            .on_delete = entry.on_delete,
+                            .on_update = entry.on_update,
+                        };
+                    }
                 }
             }
 
@@ -812,6 +839,9 @@ public:
         const schema& actual,
         const diff_options& options) override
     {
+        require_single_column_foreign_keys(desired, "mysql");
+        require_single_column_foreign_keys(actual, "mysql");
+
         diff_options effective = options;
         effective.ignore_checks = true;
 

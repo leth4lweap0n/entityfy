@@ -1,5 +1,10 @@
 #include <entityfy/migrate/provider.hpp>
 
+// The URI grammar and the ODBC connection string live in core: the migrate
+// provider and the runtime client must accept exactly the same URIs, so the
+// parser is included rather than copied.
+#include <entityfy/detail/sqlserver_uri.hpp>
+
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -188,65 +193,11 @@ std::string truncate_identifier(std::string value)
     return output;
 }
 
-struct sqlserver_connection_options
-{
-    std::string host = "127.0.0.1";
-    std::string user = "sa";
-    std::string password;
-    std::string database;
-    unsigned    port = 1433;
-};
-
-[[nodiscard]] sqlserver_connection_options parse_uri(std::string_view uri)
-{
-    constexpr std::string_view prefix = "sqlserver://";
-    if(!uri.starts_with(prefix))
-    {
-        throw std::invalid_argument{"entityfy/migrate:sqlserver: connection string must start with sqlserver://"};
-    }
-
-    std::string_view             rest = uri.substr(prefix.size());
-    sqlserver_connection_options options;
-
-    if(const auto slash = rest.find('/'); slash != std::string_view::npos)
-    {
-        options.database = std::string{rest.substr(slash + 1)};
-        rest = rest.substr(0, slash);
-    }
-
-    if(const auto at = rest.rfind('@'); at != std::string_view::npos)
-    {
-        const auto credentials = rest.substr(0, at);
-        rest = rest.substr(at + 1);
-
-        if(const auto colon = credentials.find(':'); colon != std::string_view::npos)
-        {
-            options.user = std::string{credentials.substr(0, colon)};
-            options.password = std::string{credentials.substr(colon + 1)};
-        }
-        else
-        {
-            options.user = std::string{credentials};
-        }
-    }
-
-    if(const auto colon = rest.rfind(':'); colon != std::string_view::npos)
-    {
-        options.host = std::string{rest.substr(0, colon)};
-        options.port = static_cast<unsigned>(std::stoul(std::string{rest.substr(colon + 1)}));
-    }
-    else if(!rest.empty())
-    {
-        options.host = std::string{rest};
-    }
-
-    if(options.database.empty())
-    {
-        throw std::invalid_argument{"entityfy/migrate:sqlserver: URI must include a database"};
-    }
-
-    return options;
-}
+// msodbcsql.h is not available on every platform entityfy builds on, so the
+// MARS attribute is restated here with the values the driver SDK defines:
+// SQL_COPT_SS_BASE is 1200 and MARS_ENABLED is BASE+24; YES is 1L.
+constexpr SQLINTEGER sql_copt_ss_mars_enabled = 1224;
+constexpr SQLINTEGER sql_mars_enabled_yes = 1;
 
 [[nodiscard]] bool succeeded(SQLRETURN result)
 {
@@ -285,7 +236,7 @@ class sqlserver_connection
 public:
     explicit sqlserver_connection(std::string_view uri)
     {
-        const auto options = parse_uri(uri);
+        const auto options = entityfy::detail::parse_sqlserver_uri(uri);
 
         if(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &environment_) != SQL_SUCCESS)
         {
@@ -299,12 +250,7 @@ public:
             throw std::runtime_error{"entityfy/migrate:sqlserver: ODBC connection allocation failed"};
         }
 
-        const std::string connection_string =
-            "DRIVER={ODBC Driver 18 for SQL Server};SERVER=" + options.host + "," + std::to_string(options.port) +
-            ";UID=" + options.user + ";PWD=" + options.password + ";DATABASE=" + options.database +
-            ";TrustServerCertificate=yes;Encrypt=yes";
-
-        auto wide = utf8_to_utf16(connection_string);
+        auto wide = utf8_to_utf16(entityfy::detail::sqlserver_connection_string(options));
         SQLWCHAR   output[1024]{};
         SQLSMALLINT output_length = 0;
 
@@ -320,6 +266,26 @@ public:
            )))
         {
             throw std::runtime_error{"entityfy/migrate:sqlserver: connection failed: " + diagnostics(SQL_HANDLE_DBC, connection_)};
+        }
+
+        // MARS changes how the driver multiplexes statements on one connection,
+        // so it is opt-in and set as a connection attribute after connecting:
+        // a driver that does not support it then fails with a message naming
+        // MARS instead of an unexplained connection-string error.
+        if(options.mars)
+        {
+            if(!succeeded(SQLSetConnectAttrW(
+                   connection_,
+                   sql_copt_ss_mars_enabled,
+                   reinterpret_cast<SQLPOINTER>(sql_mars_enabled_yes),
+                   SQL_IS_INTEGER
+               )))
+            {
+                throw std::runtime_error{
+                    "entityfy/migrate:sqlserver: connection failed: the driver rejected MARS (Multiple Active Result "
+                    "Sets): " +
+                    diagnostics(SQL_HANDLE_DBC, connection_)};
+            }
         }
 
         exec("SET QUOTED_IDENTIFIER ON");
@@ -952,13 +918,20 @@ public:
             }
 
             const auto foreign_keys = connection_.query_params(
-                "SELECT k.COLUMN_NAME, ccu.TABLE_NAME, ccu.COLUMN_NAME, rc.UPDATE_RULE, rc.DELETE_RULE, k.CONSTRAINT_NAME "
+                "SELECT k.CONSTRAINT_NAME, k.COLUMN_NAME, rk.TABLE_NAME, rk.COLUMN_NAME, "
+                "rc.UPDATE_RULE, rc.DELETE_RULE "
                 "FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE k "
-                "JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc ON rc.CONSTRAINT_NAME = k.CONSTRAINT_NAME "
-                "JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu "
-                "ON ccu.CONSTRAINT_NAME = rc.UNIQUE_CONSTRAINT_NAME "
-                "WHERE k.TABLE_NAME = ? AND k.TABLE_SCHEMA = SCHEMA_NAME()",
+                "JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc "
+                "ON rc.CONSTRAINT_NAME = k.CONSTRAINT_NAME AND rc.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA "
+                "JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE rk "
+                "ON rk.CONSTRAINT_NAME = rc.UNIQUE_CONSTRAINT_NAME "
+                "AND rk.CONSTRAINT_SCHEMA = rc.UNIQUE_CONSTRAINT_SCHEMA "
+                "AND rk.ORDINAL_POSITION = k.POSITION_IN_UNIQUE_CONSTRAINT "
+                "WHERE k.TABLE_NAME = ? AND k.TABLE_SCHEMA = SCHEMA_NAME() "
+                "ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
                 {current.name});
+
+            std::vector<std::pair<std::string, std::size_t>> key_indices;
 
             for(const auto& key_row: foreign_keys)
             {
@@ -971,23 +944,48 @@ public:
                     return value == "NO ACTION" || value == "RESTRICT" ? std::string{} : value;
                 };
 
-                foreign_key entry;
-                entry.column = key_row[0];
-                entry.ref_table = key_row[1];
-                entry.ref_column = key_row[2];
-                entry.on_update = action(key_row[3]);
-                entry.on_delete = action(key_row[4]);
+                const std::string& name = key_row[0];
+                auto known = std::ranges::find_if(
+                    key_indices, [&](const std::pair<std::string, std::size_t>& entry) { return entry.first == name; });
 
-                current.foreign_keys.emplace_back(entry);
-
-                if(column* target = find_column(current, entry.column))
+                if(known == key_indices.end())
                 {
-                    target->references = reference{
-                        .table = entry.ref_table,
-                        .column = entry.ref_column,
-                        .on_delete = entry.on_delete,
-                        .on_update = entry.on_update,
-                    };
+                    key_indices.emplace_back(name, current.foreign_keys.size());
+
+                    foreign_key entry;
+                    entry.ref_table = key_row[2];
+                    entry.on_update = action(key_row[4]);
+                    entry.on_delete = action(key_row[5]);
+                    current.foreign_keys.emplace_back(std::move(entry));
+                    known = key_indices.end() - 1;
+                }
+
+                foreign_key& entry = current.foreign_keys[known->second];
+                entry.columns.push_back(key_row[1]);
+                entry.ref_columns.push_back(key_row[3]);
+            }
+
+            for(auto& entry: current.foreign_keys)
+            {
+                if(entry.columns.empty())
+                {
+                    continue;
+                }
+
+                entry.column = entry.columns.front();
+                entry.ref_column = entry.ref_columns.front();
+
+                if(entry.columns.size() == 1)
+                {
+                    if(column* target = find_column(current, entry.column))
+                    {
+                        target->references = reference{
+                            .table = entry.ref_table,
+                            .column = entry.ref_column,
+                            .on_delete = entry.on_delete,
+                            .on_update = entry.on_update,
+                        };
+                    }
                 }
             }
 
@@ -1003,6 +1001,9 @@ public:
         const schema& actual,
         const diff_options& options) override
     {
+        require_single_column_foreign_keys(desired, "sqlserver");
+        require_single_column_foreign_keys(actual, "sqlserver");
+
         diff_options effective = options;
         effective.ignore_checks = true;
 
@@ -1267,6 +1268,11 @@ public:
 
     void start() override
     {
+        // The isolation level is deliberately left at the server default: the
+        // migrate provider exposes no isolation option, and the runtime client
+        // (entityfy::client) is the component that owns isolation selection.
+        // Setting a level here would make a migration run under a different
+        // contract than the application that follows it.
         connection_.exec("BEGIN TRANSACTION");
     }
 
@@ -1325,6 +1331,13 @@ public:
 
     void backup(std::string_view path) override
     {
+        // This is a portable logical dump, not `BACKUP DATABASE ... TO DISK`.
+        // A native backup writes a server-side file: the path is resolved on
+        // the database host, not on the machine running the migration, and it
+        // needs bulk-admin/file permissions the migration login usually does
+        // not have. A .sql dump can be read, diffed and replayed through any
+        // provider, which is what rollback and restore_dump rely on, so the
+        // native statement stays out of this provider on purpose.
         const auto schema = introspect();
 
         std::vector<const table*> tables;

@@ -153,6 +153,55 @@ std::string column_definition(const column& value, bool composite_key)
     return output;
 }
 
+std::string composite_foreign_key_sql(const table& value, const foreign_key& key)
+{
+    const auto columns = foreign_key_columns(key);
+    const auto referenced = foreign_key_ref_columns(key);
+
+    if(columns.size() < 2 || columns.size() != referenced.size())
+    {
+        throw std::logic_error{"entityfy/migrate:sqlite: foreign key on `" + value.name + "` has " +
+                               std::to_string(columns.size()) + " local columns but " +
+                               std::to_string(referenced.size()) + " referenced columns"};
+    }
+
+    std::string output = "FOREIGN KEY (";
+    for(std::size_t index = 0; index < columns.size(); ++index)
+    {
+        if(index != 0)
+        {
+            output += ", ";
+        }
+
+        output += quote_ident(columns[index]);
+    }
+
+    output += ") REFERENCES " + quote_ident(key.ref_table) + " (";
+    for(std::size_t index = 0; index < referenced.size(); ++index)
+    {
+        if(index != 0)
+        {
+            output += ", ";
+        }
+
+        output += quote_ident(referenced[index]);
+    }
+
+    output += ")";
+
+    if(!key.on_delete.empty())
+    {
+        output += " ON DELETE " + key.on_delete;
+    }
+
+    if(!key.on_update.empty())
+    {
+        output += " ON UPDATE " + key.on_update;
+    }
+
+    return output;
+}
+
 std::string create_table_sql(const table& value, std::string_view table_name, bool if_not_exists)
 {
     const std::vector<std::string> key_columns = primary_key_columns(value);
@@ -191,6 +240,16 @@ std::string create_table_sql(const table& value, std::string_view table_name, bo
         }
 
         output += ")";
+    }
+
+    for(const auto& key: value.foreign_keys)
+    {
+        if(foreign_key_columns(key).size() < 2)
+        {
+            continue;
+        }
+
+        output += ", " + composite_foreign_key_sql(value, key);
     }
 
     output += ")";
@@ -339,30 +398,58 @@ public:
             }
 
             const auto foreign_keys = run_query(database_, "PRAGMA foreign_key_list(" + quote_ident(current.name) + ")");
+            std::vector<std::pair<int, std::size_t>> key_indices;
+
             for(const auto& key_row: foreign_keys)
             {
-                if(key_row.size() < 8 || key_row[1] != "0")
+                if(key_row.size() < 8)
                 {
                     continue;
                 }
 
-                foreign_key entry;
-                entry.column = key_row[3];
-                entry.ref_table = key_row[2];
-                entry.ref_column = key_row[4].empty() ? "id" : key_row[4];
-                entry.on_update = key_row[5] == "NO ACTION" ? std::string{} : key_row[5];
-                entry.on_delete = key_row[6] == "NO ACTION" ? std::string{} : key_row[6];
+                const int id = std::stoi(key_row[0]);
+                auto known = std::ranges::find_if(key_indices, [id](const std::pair<int, std::size_t>& entry) {
+                    return entry.first == id;
+                });
 
-                current.foreign_keys.emplace_back(entry);
-
-                if(column* target = find_column(current, entry.column))
+                if(known == key_indices.end())
                 {
-                    target->references = reference{
-                        .table = entry.ref_table,
-                        .column = entry.ref_column,
-                        .on_delete = entry.on_delete,
-                        .on_update = entry.on_update,
-                    };
+                    key_indices.emplace_back(id, current.foreign_keys.size());
+
+                    foreign_key entry;
+                    entry.ref_table = key_row[2];
+                    entry.on_update = key_row[5] == "NO ACTION" ? std::string{} : key_row[5];
+                    entry.on_delete = key_row[6] == "NO ACTION" ? std::string{} : key_row[6];
+                    current.foreign_keys.emplace_back(std::move(entry));
+                    known = key_indices.end() - 1;
+                }
+
+                foreign_key& entry = current.foreign_keys[known->second];
+                entry.columns.push_back(key_row[3]);
+                entry.ref_columns.push_back(key_row[4].empty() ? std::string{"id"} : key_row[4]);
+            }
+
+            for(auto& entry: current.foreign_keys)
+            {
+                if(entry.columns.empty())
+                {
+                    continue;
+                }
+
+                entry.column = entry.columns.front();
+                entry.ref_column = entry.ref_columns.front();
+
+                if(entry.columns.size() == 1)
+                {
+                    if(column* target = find_column(current, entry.column))
+                    {
+                        target->references = reference{
+                            .table = entry.ref_table,
+                            .column = entry.ref_column,
+                            .on_delete = entry.on_delete,
+                            .on_update = entry.on_update,
+                        };
+                    }
                 }
             }
 

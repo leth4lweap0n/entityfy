@@ -175,6 +175,99 @@ void drop_composite_reference_tables(entityfy::client& db)
     (void)db.execute(entityfy::statement{.sql = "DROP TABLE IF EXISTS \"cr_parents\""});
 }
 
+// Exercises composite navigation on a migrated and empty parent/child pair.
+// The fixture repeats one code in two tenants and uses two codes in one tenant,
+// so a helper that only matched one key part would return the wrong rows.
+void require_composite_relationship_navigation(entityfy::client& db)
+{
+    REQUIRE(db.insert(cr_parent{.tenant_id = 1, .code = "eu", .name = "europe"}).rows_affected == 1);
+    REQUIRE(db.insert(cr_parent{.tenant_id = 1, .code = "us", .name = "americas"}).rows_affected == 1);
+    REQUIRE(db.insert(cr_parent{.tenant_id = 2, .code = "eu", .name = "eu-west"}).rows_affected == 1);
+    REQUIRE(db.insert(cr_parent{.tenant_id = 2, .code = "us", .name = "us-west"}).rows_affected == 1);
+
+    REQUIRE(db.insert(cr_child{.id = 10, .tenant_id = 1, .parent_code = "eu", .name = "first"}).rows_affected == 1);
+    REQUIRE(db.insert(cr_child{.id = 11, .tenant_id = 1, .parent_code = "us", .name = "second"}).rows_affected == 1);
+    REQUIRE(db.insert(cr_child{.id = 12, .tenant_id = 2, .parent_code = "eu", .name = "third"}).rows_affected == 1);
+
+    // A child with only one matching key part does not exist: the whole
+    // composite foreign key is enforced by the backend.
+    REQUIRE_THROWS_AS(
+        db.insert(cr_child{.id = 13, .tenant_id = 1, .parent_code = "apac", .name = "orphan"}),
+        entityfy::foreign_key_violation
+    );
+    REQUIRE_THROWS_AS(
+        db.insert(cr_child{.id = 14, .tenant_id = 3, .parent_code = "eu", .name = "orphan"}),
+        entityfy::foreign_key_violation
+    );
+
+    const cr_parent eu_one{.tenant_id = 1, .code = "eu", .name = "europe"};
+    const cr_parent us_one{.tenant_id = 1, .code = "us", .name = "americas"};
+    const cr_parent eu_two{.tenant_id = 2, .code = "eu", .name = "eu-west"};
+    const cr_parent empty{.tenant_id = 2, .code = "us", .name = "us-west"};
+
+    auto parents  = db.table<cr_parent>();
+    auto children = db.table<cr_child>();
+
+    const auto eu_one_children = parents.has_many<cr_child>(eu_one, &cr_child::tenant_id, &cr_child::parent_code);
+    REQUIRE(eu_one_children.size() == 1);
+    REQUIRE(eu_one_children.front().id == 10);
+
+    const auto us_one_children = parents.has_many<cr_child>(us_one, &cr_child::tenant_id, &cr_child::parent_code);
+    REQUIRE(us_one_children.size() == 1);
+    REQUIRE(us_one_children.front().id == 11);
+
+    // Same code, different tenant: matching only the second key part would
+    // return this parent's sibling instead.
+    const auto eu_two_children = parents.has_many<cr_child>(eu_two, &cr_child::tenant_id, &cr_child::parent_code);
+    REQUIRE(eu_two_children.size() == 1);
+    REQUIRE(eu_two_children.front().id == 12);
+
+    const auto eu_one_child = parents.has_one<cr_child>(eu_one, &cr_child::tenant_id, &cr_child::parent_code);
+    REQUIRE(eu_one_child.has_value());
+    REQUIRE(eu_one_child->id == 10);
+
+    REQUIRE_FALSE(parents.has_one<cr_child>(empty, &cr_child::tenant_id, &cr_child::parent_code).has_value());
+
+    const auto first = children.find(std::int64_t{10});
+    REQUIRE(first.has_value());
+
+    const auto first_parent = children.belongs_to<cr_parent>(*first, &cr_child::tenant_id, &cr_child::parent_code);
+    REQUIRE(first_parent.has_value());
+    REQUIRE(first_parent->tenant_id == 1);
+    REQUIRE(first_parent->code == "eu");
+
+    const auto third = children.find(std::int64_t{12});
+    REQUIRE(third.has_value());
+
+    const auto third_parent = children.belongs_to<cr_parent>(*third, &cr_child::tenant_id, &cr_child::parent_code);
+    REQUIRE(third_parent.has_value());
+    REQUIRE(third_parent->tenant_id == 2);
+    REQUIRE(third_parent->code == "eu");
+
+    // A pointer count that does not match the parent key must not fall back to
+    // a partial match; it names the operation and the expected column count.
+    const auto has_many_message = rejection_message([&] {
+        (void)parents.has_many<cr_child>(eu_one, &cr_child::tenant_id, &cr_child::parent_code, &cr_child::id);
+    });
+    INFO(has_many_message);
+    REQUIRE(has_many_message.find("has_many") != std::string::npos);
+    REQUIRE(has_many_message.find("expects 2") != std::string::npos);
+
+    const auto has_one_message = rejection_message([&] {
+        (void)parents.has_one<cr_child>(eu_one, &cr_child::tenant_id, &cr_child::parent_code, &cr_child::id);
+    });
+    INFO(has_one_message);
+    REQUIRE(has_one_message.find("has_one") != std::string::npos);
+    REQUIRE(has_one_message.find("expects 2") != std::string::npos);
+
+    const auto belongs_to_message = rejection_message([&] {
+        (void)children.belongs_to<cr_parent>(*first, &cr_child::tenant_id, &cr_child::parent_code, &cr_child::id);
+    });
+    INFO(belongs_to_message);
+    REQUIRE(belongs_to_message.find("belongs_to") != std::string::npos);
+    REQUIRE(belongs_to_message.find("expects 2") != std::string::npos);
+}
+
 } // namespace
 
 TEST_CASE("a composite reference group produces one relation with ordered column lists", "[relations][composite]")
@@ -407,6 +500,15 @@ TEST_CASE("sqlite introspection keeps a single-column foreign key as one entry",
     REQUIRE(validation.valid());
 }
 
+TEST_CASE("sqlite composite relationship helpers match every key part", "[relations][composite][sqlite]")
+{
+    entityfy::client db{"sqlite://:memory:"};
+    db.migrate<cr_parent>();
+    db.migrate<cr_child>();
+
+    require_composite_relationship_navigation(db);
+}
+
 #ifdef ENTITYFY_ENABLE_POSTGRESQL
 
 TEST_CASE("postgres enforces a composite foreign key and cascades the whole key", "[relations][composite][postgresql]")
@@ -512,6 +614,26 @@ TEST_CASE("postgres introspection folds a composite key into one foreign key", "
     INFO(entityfy::format_schema_issues(note_validation));
     REQUIRE(note_validation.valid());
 
+    drop_composite_reference_tables(db);
+}
+
+TEST_CASE("postgres composite relationship helpers match every key part", "[relations][composite][postgresql]")
+{
+    const auto uri = postgres_uri();
+    if(uri.empty())
+    {
+        SKIP("ENTITYFY_PG_URI is not set");
+    }
+
+    entityfy::client db{uri};
+    drop_composite_reference_tables(db);
+
+    db.migrate<cr_parent>();
+    db.migrate<cr_child>();
+
+    require_composite_relationship_navigation(db);
+
+    // The migration suite inspects this database; leave no table behind.
     drop_composite_reference_tables(db);
 }
 

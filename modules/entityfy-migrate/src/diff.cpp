@@ -9,6 +9,47 @@ namespace entityfy::migrate
 namespace
 {
 
+bool foreign_keys_equal(const foreign_key& left, const foreign_key& right)
+{
+    return foreign_key_columns(left) == foreign_key_columns(right) &&
+           foreign_key_ref_columns(left) == foreign_key_ref_columns(right) &&
+           left.ref_table == right.ref_table &&
+           normalize_sql(left.on_delete) == normalize_sql(right.on_delete) &&
+           normalize_sql(left.on_update) == normalize_sql(right.on_update);
+}
+
+std::string describe_foreign_key(const table& value, const foreign_key& key)
+{
+    std::string output = value.name + " (";
+
+    const auto columns = foreign_key_columns(key);
+    for(std::size_t index = 0; index < columns.size(); ++index)
+    {
+        if(index != 0)
+        {
+            output += ", ";
+        }
+
+        output += columns[index];
+    }
+
+    output += ") -> " + key.ref_table + " (";
+
+    const auto referenced = foreign_key_ref_columns(key);
+    for(std::size_t index = 0; index < referenced.size(); ++index)
+    {
+        if(index != 0)
+        {
+            output += ", ";
+        }
+
+        output += referenced[index];
+    }
+
+    output += ")";
+    return output;
+}
+
 bool references_equal(const column& left, const column& right)
 {
     if(left.references.has_value() != right.references.has_value())
@@ -215,10 +256,7 @@ std::vector<operation> diff_schemas(const schema& desired, const schema& actual,
         for(const auto& desired_fk: desired_table.foreign_keys)
         {
             const auto found = std::ranges::find_if(actual_table->foreign_keys, [&](const foreign_key& candidate) {
-                return candidate.column == desired_fk.column && candidate.ref_table == desired_fk.ref_table &&
-                       candidate.ref_column == desired_fk.ref_column &&
-                       normalize_sql(candidate.on_delete) == normalize_sql(desired_fk.on_delete) &&
-                       normalize_sql(candidate.on_update) == normalize_sql(desired_fk.on_update);
+                return foreign_keys_equal(candidate, desired_fk);
             });
 
             if(found == actual_table->foreign_keys.end())
@@ -227,8 +265,7 @@ std::vector<operation> diff_schemas(const schema& desired, const schema& actual,
                 value.kind = op_kind::add_foreign_key;
                 value.table = desired_table.name;
                 value.fk_spec = desired_fk;
-                value.detail = "add foreign key " + desired_table.name + "." + desired_fk.column + " -> " +
-                               desired_fk.ref_table + "." + desired_fk.ref_column;
+                value.detail = "add foreign key " + describe_foreign_key(desired_table, desired_fk);
                 operations.emplace_back(std::move(value));
             }
         }
@@ -236,10 +273,7 @@ std::vector<operation> diff_schemas(const schema& desired, const schema& actual,
         for(const auto& actual_fk: actual_table->foreign_keys)
         {
             const auto found = std::ranges::find_if(desired_table.foreign_keys, [&](const foreign_key& candidate) {
-                return candidate.column == actual_fk.column && candidate.ref_table == actual_fk.ref_table &&
-                       candidate.ref_column == actual_fk.ref_column &&
-                       normalize_sql(candidate.on_delete) == normalize_sql(actual_fk.on_delete) &&
-                       normalize_sql(candidate.on_update) == normalize_sql(actual_fk.on_update);
+                return foreign_keys_equal(candidate, actual_fk);
             });
 
             if(found == desired_table.foreign_keys.end())
@@ -248,7 +282,7 @@ std::vector<operation> diff_schemas(const schema& desired, const schema& actual,
                 value.kind = op_kind::drop_foreign_key;
                 value.table = desired_table.name;
                 value.fk_spec = actual_fk;
-                value.detail = "drop foreign key " + desired_table.name + "." + actual_fk.column;
+                value.detail = "drop foreign key " + describe_foreign_key(desired_table, actual_fk);
                 operations.emplace_back(std::move(value));
             }
         }

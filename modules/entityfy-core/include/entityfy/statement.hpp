@@ -152,19 +152,35 @@ inline std::string excluded_column_reference(const column_descriptor& column)
     return "excluded." + quote_identifier(column.name);
 }
 
+// The single generated key column T-SQL can return with OUTPUT INSERTED, or an
+// empty list: a composite key cannot be returned, and a model without an
+// identity column has nothing generated to report.
+template <typename Model>
+[[nodiscard]] inline std::vector<column_descriptor> output_inserted_key(const model_descriptor<Model>& model)
+{
+    if(model.target != dialect::sqlserver)
+    {
+        return {};
+    }
+
+    const auto key_columns = primary_key_columns(model);
+    if(key_columns.size() != 1 || !key_columns.front().flags.auto_increment)
+    {
+        return {};
+    }
+
+    return key_columns;
+}
+
 // T-SQL returns generated keys with OUTPUT INSERTED.<key>, placed after the
 // column list and before VALUES. Only a single generated key column can be
 // returned, so composite keys never emit OUTPUT.
 template <typename Model>
 inline void append_output_inserted_id(std::string& sql, const model_descriptor<Model>& model)
 {
-    if(model.target != dialect::sqlserver)
-    {
-        return;
-    }
+    const auto key_columns = output_inserted_key(model);
 
-    const auto key_columns = primary_key_columns(model);
-    if(key_columns.size() != 1 || !key_columns.front().flags.auto_increment)
+    if(key_columns.empty())
     {
         return;
     }
@@ -745,6 +761,7 @@ template <typename Model>
         {
             output.sql = "INSERT INTO ";
             output.sql.append(detail::quote_identifier(model.table_name));
+            detail::append_output_inserted_id(output.sql, model);
             output.sql.append(" DEFAULT VALUES");
             return output;
         }
@@ -828,7 +845,17 @@ template <typename Model>
             output.sql.append(detail::quote_identifier(merge_inserts[index].name));
         }
 
-        output.sql.append(");");
+        // OUTPUT belongs to the INSERT clause of the MERGE and has to precede
+        // the statement terminator. A MERGE that only updated still returns the
+        // existing key, so last_insert_id is the row's key either way.
+        const auto generated_key = detail::output_inserted_key(model);
+        if(!generated_key.empty())
+        {
+            output.sql.append(" OUTPUT INSERTED.");
+            output.sql.append(detail::quote_identifier(generated_key.front().name));
+        }
+
+        output.sql.append(";");
 
         std::size_t descriptor_index = 0;
         detail::for_each_leaf_field(object, [&](std::string_view, std::string_view, const auto& value) {
