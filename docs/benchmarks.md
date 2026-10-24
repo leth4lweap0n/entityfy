@@ -283,6 +283,21 @@ with an explicit-key model (no generated key, no token), 2.000 rows, median of t
 | bulk update (2.000 rows) | 21.456 rows/s | 18.116 rows/s | 0,84x |
 | 200 one-row saves | 3.777 saves/s | 1.177 saves/s | 0,31x |
 
+### Composite keys and lazy loading
+
+The same harness also measures the tracked composite-key lookup and cold lazy handles on SQLite
+in-memory (2.000 rows, median of the harness run):
+
+| Path | Result |
+|---|---:|
+| composite key `find` (two parts, tracked identity map) | ~63 ns/call |
+| lazy collection load (2.000 parents × 5 posts, handle reset each time) | ~4.676 ns/parent |
+| lazy reference load (10.000 posts) | ~749 ns/post |
+
+The lazy rows reset the handle before each access, so the number is the actual query plus
+materialization, not a cached second read. The benchmark validates that every child and every
+parent was loaded before reporting.
+
 The native path issues `BEGIN`, one statement per row and `COMMIT` through libpq's nonblocking
 API; the offload path batches inserts inside one synchronous transaction. On a single connection
 the native path is therefore **slower for bulk work**; its benefit is freeing the caller thread

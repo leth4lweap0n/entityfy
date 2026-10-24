@@ -45,6 +45,47 @@ struct [[= entityfy::table{"bench_users"}]] bench_user
     std::string name;
 };
 
+struct bench_lazy_user;
+
+struct [[= entityfy::table{"bench_lazy_posts"}]] bench_lazy_post
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::indexed, = entityfy::not_null, = entityfy::references{"bench_lazy_users"}]]
+    std::int64_t user_id = 0;
+
+    [[= entityfy::not_null, = entityfy::varchar{120}]]
+    std::string title;
+
+    [[= entityfy::ignore]]
+    entityfy::lazy<bench_lazy_user> author;
+};
+
+struct [[= entityfy::table{"bench_lazy_users"}]] bench_lazy_user
+{
+    [[= entityfy::primary_key, = entityfy::auto_increment]]
+    std::int64_t id = 0;
+
+    [[= entityfy::not_null, = entityfy::varchar{120}]]
+    std::string name;
+
+    [[= entityfy::ignore]]
+    entityfy::lazy<std::vector<bench_lazy_post>> posts;
+};
+
+struct [[= entityfy::table{"bench_pairs"}]] bench_pair
+{
+    [[= entityfy::primary_key]]
+    std::int64_t left_id = 0;
+
+    [[= entityfy::primary_key]]
+    std::int64_t right_id = 0;
+
+    [[= entityfy::not_null, = entityfy::varchar{80}]]
+    std::string label;
+};
+
 struct [[= entityfy::table{"bench_async_rows"}]] bench_async_row
 {
     [[= entityfy::primary_key]]
@@ -141,6 +182,151 @@ timing measure(Function&& function, std::size_t iterations, std::size_t repetiti
 // run against an in-memory database so they are comparable with the core
 // numbers; only the cold (not yet tracked) lookup needs a file database and a
 // second connection.
+void run_lazy_bench(std::size_t users_count, std::size_t posts_per_user)
+{
+    entityfy::db_context ctx{"sqlite://:memory:"};
+    ctx.migrate<bench_lazy_user>();
+    ctx.migrate<bench_lazy_post>();
+
+    auto users = ctx.set<bench_lazy_user>();
+    auto posts = ctx.set<bench_lazy_post>();
+
+    std::vector<bench_lazy_user*> tracked_users;
+    tracked_users.reserve(users_count);
+    for(std::size_t index = 0; index < users_count; ++index)
+    {
+        tracked_users.push_back(&users.add(bench_lazy_user{.name = "user " + std::to_string(index)}));
+    }
+    ctx.save_changes();
+
+    for(std::size_t index = 0; index < users_count; ++index)
+    {
+        for(std::size_t post = 0; post < posts_per_user; ++post)
+        {
+            posts.add(bench_lazy_post{
+                .user_id = tracked_users[index]->id,
+                .title = "post " + std::to_string(index) + "/" + std::to_string(post),
+            });
+        }
+    }
+    ctx.save_changes();
+
+    std::size_t loaded_children = 0;
+    for(auto* user : users.query().to_list())
+    {
+        user->posts.reset();
+        loaded_children += user->posts.get().size();
+    }
+    if(loaded_children != users_count * posts_per_user)
+    {
+        throw std::runtime_error{"lazy benchmark did not load every child"};
+    }
+
+    std::size_t loaded_parents = 0;
+    for(auto* post : posts.query().to_list())
+    {
+        post->author.reset();
+        loaded_parents += post->author.get() != nullptr ? 1 : 0;
+    }
+    if(loaded_parents != users_count * posts_per_user)
+    {
+        throw std::runtime_error{"lazy benchmark did not resolve every parent"};
+    }
+
+    const auto measure = [&](bool collection) {
+        std::vector<double> samples;
+        samples.reserve(5);
+
+        for(int sample = 0; sample < 5; ++sample)
+        {
+            volatile std::size_t sink = 0;
+            const auto started = clock_type::now();
+
+            if(collection)
+            {
+                for(auto* user : users.query().to_list())
+                {
+                    user->posts.reset();
+                    sink += user->posts.get().size();
+                }
+            }
+            else
+            {
+                for(auto* post : posts.query().to_list())
+                {
+                    post->author.reset();
+                    if(post->author.get() != nullptr)
+                    {
+                        ++sink;
+                    }
+                }
+            }
+
+            const auto finished = clock_type::now();
+            (void)sink;
+            samples.push_back(static_cast<double>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count()) /
+                static_cast<double>(collection ? users_count : users_count * posts_per_user));
+        }
+
+        std::ranges::sort(samples);
+        return samples[2];
+    };
+
+    std::cout << std::format("lazy collection load         {:>8.0f} ns/parent ({} parents, {} posts each)\n",
+                             measure(true), users_count, posts_per_user);
+    std::cout << std::format("lazy reference load          {:>8.0f} ns/post\n", measure(false));
+}
+
+void run_composite_key_bench(std::size_t rows)
+{
+    entityfy::db_context ctx{"sqlite://:memory:"};
+    ctx.migrate<bench_pair>();
+    auto pairs = ctx.set<bench_pair>();
+
+    for(std::size_t index = 0; index < rows; ++index)
+    {
+        pairs.add(bench_pair{
+            .left_id = static_cast<std::int64_t>(index % 100),
+            .right_id = static_cast<std::int64_t>(index / 100),
+            .label = "pair " + std::to_string(index),
+        });
+    }
+
+    ctx.save_changes();
+
+    std::vector<double> samples;
+    samples.reserve(7);
+    constexpr std::size_t lookups = 2000;
+
+    for(int sample = 0; sample < 7; ++sample)
+    {
+        volatile std::size_t sink = 0;
+        const auto started = clock_type::now();
+
+        for(std::size_t index = 0; index < lookups; ++index)
+        {
+            const auto key = entityfy::row_key{
+                entityfy::sql_value{static_cast<std::int64_t>(index % 100)},
+                entityfy::sql_value{static_cast<std::int64_t>((index * 37) % std::max<std::size_t>(1, (rows + 99) / 100))},
+            };
+            if(const auto* found = pairs.find(key); found != nullptr)
+            {
+                sink += found->label.size();
+            }
+        }
+
+        const auto finished = clock_type::now();
+        (void)sink;
+        samples.push_back(static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count()) /
+            static_cast<double>(lookups));
+    }
+
+    std::ranges::sort(samples);
+    std::cout << std::format("composite key find (2 parts)  {:>8.0f} ns/call (rows={})\n", samples[3], rows);
+}
+
 void run_context_bench(const std::vector<std::string>& emails,
                        const std::vector<std::string>& names,
                        std::size_t rows,
@@ -1672,6 +1858,8 @@ int main(int argc, char** argv)
     std::cout << std::format("[ok] measurement sink (optimization barrier): {}\n", static_cast<std::uint64_t>(g_sink));
 
     run_context_bench(emails, names, rows, repetitions);
+    run_composite_key_bench(std::min<std::size_t>(rows, 20000));
+    run_lazy_bench(std::min<std::size_t>(rows, 2000), 5);
 
     std::cout << "\nNote: raw cached = a single prepared statement; raw prep-each = prepare/finalize on every call.\n";
     std::cout << "Note: entityfy timings include typed materialization (std::string copies).\n";

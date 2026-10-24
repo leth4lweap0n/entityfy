@@ -386,7 +386,9 @@ the exception the save raised).
 batches inserts and reaches ~275.000 rows/s; the current native path executes one statement per
 row and reaches ~22.000 rows/s. Native wins only when the caller needs the connection's reactor
 without occupying a worker thread; bulk saves remain faster on the offload path. See
-[benchmarks.md](benchmarks.md#async-save-offload-vs-native).
+[benchmarks.md](benchmarks.md#async-save-offload-vs-native). The same run measures a tracked
+two-part composite key (`~63 ns/call`) and cold lazy loads (`~4.7 µs/parent` for a collection,
+`~0.75 µs/post` for a reference).
 
 ## Context pool
 
