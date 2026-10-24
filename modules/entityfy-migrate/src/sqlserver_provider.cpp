@@ -1353,7 +1353,7 @@ public:
         // BACKUP DATABASE writes on the server, so the caller supplies a path
         // that exists there and is writable by the SQL Server service account.
         const std::string sql = "BACKUP DATABASE " + quote_ident(connection_.database()) + " TO DISK = " +
-                                sqlserver_string_literal(server_path) + " WITH COPY_ONLY, INIT, CHECKSUM";
+                                sqlserver_string_literal(server_path) + " WITH COPY_ONLY, FORMAT, CHECKSUM";
         connection_.exec(sql);
     }
 
