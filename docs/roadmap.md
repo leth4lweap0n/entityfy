@@ -58,6 +58,10 @@
 **Repository**
 
 - `entityfy` monorepo: `modules/` + `cmake/Dependencies.cmake` + `CMakePresets.json`
+- **Installable CMake package**: `cmake --install` exports `entityfy::core`, `entityfy::db_context`,
+  `entityfy::migrate` and `entityfy::sqlite`; `find_package(entityfy CONFIG)` resolves the enabled
+  backend dependencies, and CI builds a standalone consumer for SQLite, PostgreSQL, MySQL and SQL
+  Server
 - A single SQLite dependency (sl3); the duplicated `third_party/sqlite` copy was removed
 - Unified test registration under CTest (core + migration + context)
 - `entityfy_bench`: SQLite comparative benchmark + PostgreSQL mode (libpq baseline)
