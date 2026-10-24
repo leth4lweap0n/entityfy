@@ -368,10 +368,21 @@ entityfy_test::status test_sqlserver()
     // portable dump the engine uses for its own pre-destructive snapshots.
     require(backend->supports_native_backup(), "sqlserver advertises native backup support");
 
-    // The SQL Server service writes its error log under /var/opt/mssql/log, so
-    // that directory is known to exist and be writable by the service account.
-    // The backup path is resolved on the server, not in this process.
-    const std::string server_backup_path = "/var/opt/mssql/log/entityfy_native_backup_test.bak";
+    // The directory that already holds the database's primary data file is
+    // writable by the SQL Server service account by definition. The backup path
+    // is resolved on the server, not in this process.
+    const auto data_file_rows = backend->query(
+        "SELECT physical_name FROM sys.master_files WHERE database_id = DB_ID() AND type = 0");
+    require(!data_file_rows.empty() && !data_file_rows.front().empty(),
+            "sqlserver reports the primary data file path");
+
+    std::string data_file = data_file_rows.front().front();
+    const auto last_separator = data_file.find_last_of("/\\");
+    std::string data_directory =
+        last_separator == std::string::npos ? std::string{} : data_file.substr(0, last_separator + 1);
+    require(!data_directory.empty(), "sqlserver data file path has a directory");
+
+    const std::string server_backup_path = data_directory + "entityfy_native_backup_test.bak";
     const auto quote_literal = [](std::string_view value) {
         std::string output{value};
         std::string escaped;
