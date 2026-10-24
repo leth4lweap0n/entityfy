@@ -368,9 +368,10 @@ entityfy_test::status test_sqlserver()
     // portable dump the engine uses for its own pre-destructive snapshots.
     require(backend->supports_native_backup(), "sqlserver advertises native backup support");
 
-    // /tmp exists in the SQL Server container and is writable by the service
-    // account; the backup path is resolved on the server, not in this process.
-    const std::string server_backup_path = "/tmp/entityfy_native_backup_test.bak";
+    // The SQL Server service writes its error log under /var/opt/mssql/log, so
+    // that directory is known to exist and be writable by the service account.
+    // The backup path is resolved on the server, not in this process.
+    const std::string server_backup_path = "/var/opt/mssql/log/entityfy_native_backup_test.bak";
     const auto quote_literal = [](std::string_view value) {
         std::string output{value};
         std::string escaped;
