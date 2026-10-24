@@ -7,9 +7,11 @@
 #include "models.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -379,30 +381,58 @@ entityfy_test::status test_sqlserver()
     }
     require(rejected_empty_path, "sqlserver rejects an empty native backup path");
 
-    // A writable server-side volume is the deployment contract for a native
-    // backup; the CI SQL Server service mounts /var/opt/mssql/backup as tmpfs.
-    const std::string server_backup_path = "/var/opt/mssql/backup/entityfy_native_backup_test.bak";
-    const auto quote_literal = [](std::string_view value) {
-        std::string output{value};
-        std::string escaped;
-        for(const char current: output)
+    const char* backup_directory = std::getenv("ENTITYFY_SQLSERVER_BACKUP_DIR");
+    if(backup_directory == nullptr || std::string_view{backup_directory}.empty())
+    {
+        std::cout << "sqlserver native backup skipped: ENTITYFY_SQLSERVER_BACKUP_DIR is not set\n";
+    }
+    else
+    {
+        // A writable server-side directory is the deployment contract for a
+        // native backup; the CI SQL Server service mounts /var/opt/mssql/backup
+        // as tmpfs. A fresh file per run prevents a stale backup from being
+        // mistaken for the one this run produced.
+        std::string server_directory{backup_directory};
+        if(server_directory.back() != '/' && server_directory.back() != '\\')
         {
-            if(current == '\'')
-            {
-                escaped += "''";
-            }
-            else
-            {
-                escaped.push_back(current);
-            }
+            server_directory.push_back('/');
         }
-        return escaped;
-    };
 
-    backend->backup_native(server_backup_path);
-    const auto headers = backend->query("RESTORE HEADERONLY FROM DISK = N'" +
-                                        quote_literal(server_backup_path) + "'");
-    require(!headers.empty(), "sqlserver native backup is readable with RESTORE HEADERONLY");
+        std::random_device entropy;
+        const auto run_id = std::to_string(
+                                std::chrono::steady_clock::now().time_since_epoch().count()) +
+                            "_" + std::to_string(entropy());
+        const std::string server_backup_path =
+            server_directory + "entityfy_native_backup_" + run_id + ".bak";
+
+        const auto quote_literal = [](std::string_view value) {
+            std::string output{value};
+            std::string escaped;
+            for(const char current: output)
+            {
+                if(current == '\'')
+                {
+                    escaped += "''";
+                }
+                else
+                {
+                    escaped.push_back(current);
+                }
+            }
+            return escaped;
+        };
+        const auto quoted_path = "N'" + quote_literal(server_backup_path) + "'";
+
+        backend->backup_native(server_backup_path);
+        backend->execute_sql("RESTORE VERIFYONLY FROM DISK = " + quoted_path + " WITH CHECKSUM");
+
+        const auto headers = backend->query("RESTORE HEADERONLY FROM DISK = " + quoted_path);
+        require(!headers.empty(), "sqlserver native backup is readable with RESTORE HEADERONLY");
+        require(
+            std::ranges::any_of(headers.front(), [](const std::string& cell) { return cell == "entityfy_test"; }),
+            "sqlserver native backup header names the database"
+        );
+    }
 
     cleanup(*backend);
 

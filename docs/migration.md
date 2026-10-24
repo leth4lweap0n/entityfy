@@ -122,4 +122,7 @@ and check the pending migrations.
 
 `entityfy_migrate_tests` runs the following suites: `schema`, `diff`, `json`, `sqlite`,
 `engine`, `scaffold`, `history_table`, `rename_table`, `owned_model`, and `postgres`
-(enabled with `ENTITYFY_PG_URI`).
+(enabled with `ENTITYFY_PG_URI`). The SQL Server native-backup check runs only when
+`ENTITYFY_SQLSERVER_BACKUP_DIR` names a writable server-side directory; it creates a unique
+`.bak` per run and validates it with `RESTORE VERIFYONLY ... WITH CHECKSUM` and
+`RESTORE HEADERONLY`.

@@ -222,6 +222,7 @@ jobs:
         env:
           ENTITYFY_SQLSERVER_URI: mssql://sa:Str0ng%3BPassw0rd@mssql:1433/entityfy_test
           ENTITYFY_REQUIRE_SQLSERVER: "1"
+          ENTITYFY_SQLSERVER_BACKUP_DIR: /var/opt/mssql/backup
         run: ctest --test-dir build --output-on-failure --no-tests=error
 
   windows-sqlite:
