@@ -231,6 +231,7 @@ public:
     explicit sqlserver_connection(std::string_view uri)
     {
         const auto options = entityfy::detail::parse_sqlserver_uri(uri);
+        database_ = options.database;
 
         if(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &environment_) != SQL_SUCCESS)
         {
@@ -486,9 +487,15 @@ public:
         return output;
     }
 
+    [[nodiscard]] const std::string& database() const noexcept
+    {
+        return database_;
+    }
+
 private:
-    SQLHENV environment_ = SQL_NULL_HENV;
-    SQLHDBC connection_ = SQL_NULL_HDBC;
+    SQLHENV     environment_ = SQL_NULL_HENV;
+    SQLHDBC     connection_ = SQL_NULL_HDBC;
+    std::string database_;
 };
 
 std::string normalize_sqlserver_type(std::string type)
@@ -715,7 +722,26 @@ std::vector<std::string> split_columns(std::string_view value)
     return base == "BINARY" || base == "VARBINARY";
 }
 
-[[nodiscard]] std::string dump_value(const dump_cell& cell, std::string_view type)
+[[nodiscard]] std::string sqlserver_string_literal(std::string_view value)
+{
+    std::string output{"N'"};
+    for(const char current: value)
+    {
+        if(current == '\'')
+        {
+            output += "''";
+        }
+        else
+        {
+            output.push_back(current);
+        }
+    }
+
+    output.push_back('\'');
+    return output;
+}
+
+std::string dump_value(const dump_cell& cell, std::string_view type)
 {
     if(cell.is_null)
     {
@@ -1308,15 +1334,31 @@ public:
         return ".sql";
     }
 
+    [[nodiscard]] bool supports_native_backup() const noexcept override
+    {
+        return true;
+    }
+
+    void backup_native(std::string_view server_path) override
+    {
+        if(server_path.empty())
+        {
+            throw std::invalid_argument{"entityfy/migrate:sqlserver: native backup path is empty"};
+        }
+
+        // BACKUP DATABASE writes on the server, so the caller supplies a path
+        // that exists there and is writable by the SQL Server service account.
+        const std::string sql = "BACKUP DATABASE " + quote_ident(connection_.database()) + " TO DISK = " +
+                                sqlserver_string_literal(server_path) + " WITH COPY_ONLY, INIT, CHECKSUM";
+        connection_.exec(sql);
+    }
+
     void backup(std::string_view path) override
     {
-        // This is a portable logical dump, not `BACKUP DATABASE ... TO DISK`.
-        // A native backup writes a server-side file: the path is resolved on
-        // the database host, not on the machine running the migration, and it
-        // needs bulk-admin/file permissions the migration login usually does
-        // not have. A .sql dump can be read, diffed and replayed through any
-        // provider, which is what rollback and restore_dump rely on, so the
-        // native statement stays out of this provider on purpose.
+        // This stays the portable logical dump the engine uses: it can be read,
+        // diffed and replayed through any provider, which is what rollback and
+        // restore_dump rely on. The opt-in backup_native() above writes a
+        // server-side .bak when an operator explicitly asks for it.
         const auto schema = introspect();
 
         std::vector<const table*> tables;

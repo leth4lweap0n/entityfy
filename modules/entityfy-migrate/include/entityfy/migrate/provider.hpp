@@ -5,6 +5,7 @@
 #include <entityfy/migrate/schema.hpp>
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -57,7 +58,22 @@ public:
         const std::vector<std::string>& params) = 0;
 
     // Backup taken before a destructive operation. Throws if unsupported.
+    // This is the portable, client-side dump the engine relies on.
     virtual void backup(std::string_view path) = 0;
+
+    // Some backends can also write their native backup format. The path is
+    // server-side (SQL Server BACKUP DATABASE cannot write a client path), so
+    // this stays an explicit provider API instead of changing backup().
+    [[nodiscard]] virtual bool supports_native_backup() const noexcept
+    {
+        return false;
+    }
+
+    virtual void backup_native(std::string_view server_path)
+    {
+        (void)server_path;
+        throw std::logic_error{"native backups are not supported by this provider"};
+    }
 
     // File extension for the dump produced by backup(); providers that write
     // SQL scripts override it.

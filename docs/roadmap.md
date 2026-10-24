@@ -133,10 +133,11 @@ are green.
    lifetimes) and P1.5 (composite foreign keys in include/lazy navigation).
 3. **P2 async I/O** — complete: task/executors, native nonblocking PostgreSQL, async
    client/table, SQLite thread-offload facade, task-based context save with a save gate, async
-   transactions and pool leases. Native async `saveable` internals remain a performance follow-up;
-   the context save is an honest offload.
-4. **P3 ODBC** — decided, no code: SQLite and PostgreSQL keep their native drivers; the frozen SQL
-   Server backend's gaps stay documented in the parity plan.
+   transactions and pool leases, and a native async `saveable` path for keyed/token-free models.
+   Generated-key/token models keep the offload path; the native path does not retry.
+4. **P3 ODBC** — hardened: SQLite and PostgreSQL keep their native drivers, and the SQL Server
+   core/migrate providers gained URI/alias parsing, braced credentials, opt-in MARS, isolation
+   levels, typed 1205/Azure errors and MERGE `OUTPUT` keys. Backups remain portable `.sql` dumps.
 
 ### Slice status
 
@@ -156,9 +157,9 @@ are green.
 | P2.2 | native nonblocking PostgreSQL | complete |
 | P2.3 | async client/table surface | complete |
 | P2.4 | SQLite thread-offload facade | complete |
-| P2.5 | task-based context save, save gate, async transactions and pool leases | complete; native async `saveable` internals open |
-| P2.6 | async tests and docs | complete for the shipped slices |
-| P3 | ODBC decision | decided: no new ODBC work |
+| P2.5 | task-based context save, save gate, async transactions and pool leases | complete; native path for keyed/token-free models, offload fallback |
+| P2.6 | async tests and docs | complete |
+| P3 | ODBC/provider hardening | complete for the documented gaps; native `.bak` intentionally not added |
 
 The other backends stay buildable and tested but get no new features for now (see
 [Deferred](#deferred-other-providers)).
@@ -171,7 +172,9 @@ picked up again.
 - **MySQL/MariaDB**: no transactional DDL (inherent), SQL-dump backups only (no `mysqldump`),
   `[[= entityfy::json]]` is `LONGTEXT` because MariaDB reports its alias that way.
 - **SQL Server / ODBC**: the migrate provider refuses primary-key/identity changes and rebuilds
-  dependent indexes around `ALTER COLUMN`; backups are SQL dumps (no `BACKUP DATABASE`).
+  dependent indexes around `ALTER COLUMN`; engine backups are portable SQL dumps, with
+  `provider::backup_native()` available for an explicit server-side `BACKUP DATABASE`; MARS is
+  opt-in because a transaction started in a MARS batch must finish in that batch.
 - **Concurrency parity P0/P1 above is provider-agnostic** (context/core), so it also applies to
   these backends; the `xmin` system-column token is PostgreSQL-only.
 
@@ -181,12 +184,14 @@ picked up again.
   collision with core's `entityfy::query_builder`.
 - The migration module uses its own providers and runs every statement once; the statement-cache
   decision was made against implementation by measurement (`docs/benchmarks.md`).
-- `save_changes_async()` is a thread offload, not I/O asynchrony (the drivers are synchronous).
+- `save_changes_async()` uses native `execute_async` statements on PostgreSQL for models without
+  a generated key or concurrency token; generated-key/token models and SQLite stay on the
+  thread-offload path. The native path does not retry, and its bulk throughput is lower than the
+  batching offload path (see [benchmarks.md](benchmarks.md)).
 - Migrations can add, drop and alter primary-key columns (including the key membership and a key
-  column's type). Composite foreign keys are created and navigated; the migrate providers still
+  column's type). Composite foreign keys are created and navigated as one constraint on
+  SQLite/PostgreSQL; MySQL/SQL Server reject them explicitly, and SQL Server migrations still
   describe them one column at a time.
-- `save_changes_async()` is an honest thread offload; a native async `saveable` path is a
-  performance follow-up, not a public API difference.
 - The `db_set<T>` members of a context must be declared by hand: C++26 reflection can inspect
   members but cannot synthesize them, so `ctx.users` cannot be generated from the entity type
   alone.

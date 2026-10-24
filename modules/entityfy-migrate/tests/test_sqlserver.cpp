@@ -364,6 +364,44 @@ entityfy_test::status test_sqlserver()
         "sqlserver engine backup restores the dependent row"
     );
 
+    // Native backup: an opt-in server-side .bak, while backup() stays the
+    // portable dump the engine uses for its own pre-destructive snapshots.
+    require(backend->supports_native_backup(), "sqlserver advertises native backup support");
+
+    const auto data_dir_rows = backend->query(
+        "SELECT CAST(SERVERPROPERTY('InstanceDefaultDataPath') AS NVARCHAR(4000))");
+    require(!data_dir_rows.empty() && !data_dir_rows.front().empty(),
+            "sqlserver reports its default data directory");
+
+    std::string data_dir = data_dir_rows.front().front();
+    if(!data_dir.empty() && data_dir.back() != '\\' && data_dir.back() != '/')
+    {
+        data_dir.push_back('/');
+    }
+
+    const std::string server_backup_path = data_dir + "entityfy_native_backup_test.bak";
+    const auto quote_literal = [](std::string_view value) {
+        std::string output{value};
+        std::string escaped;
+        for(const char current: output)
+        {
+            if(current == '\'')
+            {
+                escaped += "''";
+            }
+            else
+            {
+                escaped.push_back(current);
+            }
+        }
+        return escaped;
+    };
+
+    backend->backup_native(server_backup_path);
+    const auto headers = backend->query("RESTORE HEADERONLY FROM DISK = N'" +
+                                        quote_literal(server_backup_path) + "'");
+    require(!headers.empty(), "sqlserver native backup is readable with RESTORE HEADERONLY");
+
     cleanup(*backend);
 
     return entityfy_test::status::passed;

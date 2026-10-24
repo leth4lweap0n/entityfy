@@ -21,9 +21,8 @@ in [roadmap.md](roadmap.md)).
   both are equal.
 - **ODBC**: no new ODBC work for SQLite or PostgreSQL. Both already use their native drivers
   (sl3/libsqlite3 and libpq) and the native paths expose features ODBC would flatten (pipeline,
-  named plans, SQLSTATE, `xmin`, PRAGMA). ODBC stays an implementation detail of the frozen SQL
-  Server backend. Its known gaps are recorded at the end of this document instead of being fixed
-  opportunistically.
+  named plans, SQLSTATE, `xmin`, PRAGMA). ODBC stays an implementation detail of the opt-in SQL
+  Server backend; its documented gaps were hardened in the P3 slice at the end of this document.
 
 ## Phase 0 — composite and non-integral primary keys
 
@@ -61,7 +60,7 @@ Acceptance: unit tests for equality/order/hash, empty keys, mixed numeric/string
 
 ### P0.1 Models, DDL and statements
 
-**Status:** implemented for SQLite, PostgreSQL and the frozen backends (create/read/update/delete/upsert by composite and string keys).
+**Status:** implemented for SQLite, PostgreSQL and the opt-in MySQL/SQL Server backends (create/read/update/delete/upsert by composite and string keys).
 
 - `model_descriptor` gains `primary_key_indices`; `primary_key_columns(model)` returns the key
   columns in declaration order. `primary_key_column(model)` stays for the single-key fast path and
@@ -255,9 +254,11 @@ closed in the core client/provider:
   constraint errors.
 - `MERGE` emits one `OUTPUT INSERTED.<key>` for a single generated key; early `query_each` exits
   close the cursor; the key reader accepts `SQL_SUCCESS_WITH_INFO`.
-- Backups remain a portable logical `.sql` dump. `BACKUP DATABASE ... TO DISK` depends on a
-  server-side path and bulk-admin permissions, so it is intentionally not used; the engine's
-  rollback/restore path relies on the portable dump.
+- Backups stay portable `.sql` dumps for the engine's rollback/restore path.
+  `provider::backup_native()` is the explicit opt-in for a server-side
+  `BACKUP DATABASE ... TO DISK ... WITH COPY_ONLY, INIT, CHECKSUM` when an operator supplies a
+  path the SQL Server service account can write; the SQL Server live test verifies the file with
+  `RESTORE HEADERONLY`.
 
 ## Verification
 

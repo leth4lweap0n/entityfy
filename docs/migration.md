@@ -109,9 +109,11 @@ and check the pending migrations.
 - A backup is taken before a destructive operation (disabled with `--no-backup`). SQLite uses
   `VACUUM INTO` (`.db`), PostgreSQL needs none because its DDL is transactional, and the MySQL and
   SQL Server providers write a SQL dump (`.sql`) with `CREATE TABLE`/`INSERT` statements that can be
-  replayed on a clean database. A native `BACKUP DATABASE ... TO DISK` is not used: it needs a
-  server-side path and bulk-admin/file permissions that a client migration cannot assume. SQL
-  Server URIs accept `mssql://` as well as `sqlserver://`, and `?mars=1` enables MARS.
+  replayed on a clean database. The SQL Server provider also exposes an opt-in
+  `backup_native(server_path)` for `BACKUP DATABASE ... TO DISK`; the path is resolved on the
+  database host and needs server-side file permissions, so the engine keeps the portable dump as
+  its automatic backup. SQL Server URIs accept `mssql://` as well as `sqlserver://`, and
+  `?mars=1` enables MARS.
 - Before applying, the expected schema is compared with the database; a mismatch raises an error.
 - A migration file is protected by checksum; if the file is changed afterwards, applying stops.
 

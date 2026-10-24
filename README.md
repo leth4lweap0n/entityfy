@@ -498,8 +498,9 @@ through `sl3`, and there is no second copy of SQLite.
   reports its JSON alias that way; the SQL Server migrate provider rebuilds dependent indexes
   around `ALTER COLUMN` and refuses primary-key/identity changes. SQL Server accepts `mssql://`
   and `sqlserver://`, escapes braced credentials, supports opt-in MARS (`?mars=1`) and the five
-  isolation levels, and maps 1205/Azure-transient native errors to typed retryable errors; its
-  backup remains a portable `.sql` dump because `BACKUP DATABASE` needs a server-side path.
+  isolation levels, and maps 1205/Azure-transient native errors to typed retryable errors. The
+  engine's backup remains a portable `.sql` dump; `provider::backup_native()` is the opt-in
+  server-side `BACKUP DATABASE` for operators that supply a writable server path.
 - Row reading is costly through `vector<vector<sql_value>>`; single-row reads need a separate
   path.
 - No `install()` / `find_package()` export yet: consume the project with `add_subdirectory` or
