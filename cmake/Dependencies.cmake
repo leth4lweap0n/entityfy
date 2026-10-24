@@ -48,12 +48,14 @@ if(ENTITYFY_ENABLE_MYSQL)
     find_library(MYSQL_LIBRARY NAMES mariadb libmariadb mysqlclient HINTS ${MYSQL_ROOT} PATH_SUFFIXES lib lib/mariadb)
 
     if(MYSQL_INCLUDE_DIR AND MYSQL_LIBRARY)
-        add_library(entityfy_mysql UNKNOWN IMPORTED)
-        set_target_properties(entityfy_mysql PROPERTIES
+        # Keep the namespaced name as the imported target itself: an alias is
+        # canonicalised to its underlying target name when exported, which
+        # would turn the consumer link into -lentityfy_mysql.
+        add_library(entityfy::mysql UNKNOWN IMPORTED)
+        set_target_properties(entityfy::mysql PROPERTIES
             IMPORTED_LOCATION "${MYSQL_LIBRARY}"
             INTERFACE_INCLUDE_DIRECTORIES "${MYSQL_INCLUDE_DIR}"
         )
-        add_library(entityfy::mysql ALIAS entityfy_mysql)
     else()
         message(STATUS
             "MariaDB Connector/C not found: the MySQL backend stays disabled. "

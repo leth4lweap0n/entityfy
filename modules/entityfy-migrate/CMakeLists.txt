@@ -43,9 +43,7 @@ if(ENTITYFY_ENABLE_SQLITE)
 endif()
 
 if(ENTITYFY_ENABLE_MYSQL)
-    target_link_libraries(entityfy_migrate PRIVATE
-        $<BUILD_INTERFACE:entityfy::mysql>
-        $<INSTALL_INTERFACE:entityfy::mysql>)
+    target_link_libraries(entityfy_migrate PRIVATE entityfy::mysql)
     target_compile_definitions(entityfy_migrate PUBLIC ENTITYFY_ENABLE_MYSQL)
 endif()
 

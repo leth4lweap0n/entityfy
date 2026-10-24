@@ -44,9 +44,7 @@ if(ENTITYFY_ENABLE_POSTGRESQL)
 endif()
 
 if(ENTITYFY_ENABLE_MYSQL)
-    target_link_libraries(entityfy_core PRIVATE
-        $<BUILD_INTERFACE:entityfy::mysql>
-        $<INSTALL_INTERFACE:entityfy::mysql>)
+    target_link_libraries(entityfy_core PRIVATE entityfy::mysql)
     target_compile_definitions(entityfy_core PUBLIC ENTITYFY_ENABLE_MYSQL)
 endif()
 
